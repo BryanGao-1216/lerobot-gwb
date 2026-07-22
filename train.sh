@@ -1,0 +1,19 @@
+lerobot-train \
+ --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/pi0-base \
+ --policy.repo_id=pi0 \
+ --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/pi0-lora \
+ --dataset.repo_id=lqs \
+ --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/LIBERO \
+ --policy.output_features=null \
+ --policy.input_features=null \
+ --policy.optimizer_lr=1e-4 \
+ --policy.scheduler_decay_lr=1e-5 \
+ --eval_step=0 \
+ --steps=100000 \
+ --batch_size=4 \
+ --policy.gradient_checkpointing=true \
+ --policy.chunk_size=16 \
+ --policy.n_action_steps=16 \
+ --peft.method_type=LORA \
+ --policy.push_to_hub=false \
+ 

@@ -36,6 +36,7 @@ from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig as VLAJEPAConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
+from .actionmem.configuration_actionmem import ActionMemConfig as ActionMemConfig
 
 # NOTE: Policy modeling classes (e.g., GaussianActorPolicy) are intentionally NOT re-exported here.
 # They have heavy optional dependencies and are loaded lazily via get_policy_class().
@@ -62,6 +63,7 @@ __all__ = [
     "VQBeTConfig",
     "WallXConfig",
     "XVLAConfig",
+    "ActionMemConfig",
     # Base class
     "PreTrainedPolicy",
     # RTC utilities
