@@ -32,11 +32,11 @@ from lerobot.processor import (
     make_policy_processor_pipelines,
 )
 
-from .configuration_pi0 import PI0Config
+from .configuration_actionmem import ActionMemConfig
 
 
-@ProcessorStepRegistry.register(name="pi0_new_line_processor")
-class Pi0NewLineProcessor(ComplementaryDataProcessorStep):
+@ProcessorStepRegistry.register(name="actionmem_new_line_processor")
+class ActionMemNewLineProcessor(ComplementaryDataProcessorStep):
     """
     Ensures that the task description string ends with a newline character.
 
@@ -92,15 +92,15 @@ class Pi0NewLineProcessor(ComplementaryDataProcessorStep):
         return features
 
 
-def make_pi0_pre_post_processors(
-    config: PI0Config,
+def make_actionmem_pre_post_processors(
+    config: ActionMemConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """
-    Constructs pre-processor and post-processor pipelines for the PI0 policy.
+    Constructs pre-processor and post-processor pipelines for the ActionMem policy.
 
     The pre-processing pipeline prepares input data for the model by:
     1. Renaming features to match pretrained configurations.

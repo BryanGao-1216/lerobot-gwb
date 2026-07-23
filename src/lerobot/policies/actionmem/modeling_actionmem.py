@@ -401,8 +401,8 @@ class PaliGemmaWithExpertModel(
         return [prefix_output, suffix_output], prefix_past_key_values
 
 
-class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
-    """Core PI0 PyTorch model."""
+class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
+    """Core ActionMem PyTorch model."""
 
     def __init__(self, config: ActionMemConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
@@ -743,15 +743,15 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return self.action_out_proj(suffix_out)
 
 
-class PI0Policy(PreTrainedPolicy):
-    """PI0 OpenPI Policy for LeRobot."""
+class ActionMemPolicy(PreTrainedPolicy):
+    """ActionMem OpenPI Policy for LeRobot."""
 
-    config_class = PI0Config
-    name = "pi0"
+    config_class = ActionMemConfig
+    name = "actionmem"
 
     def __init__(
         self,
-        config: PI0Config,
+        config: ActionMemConfig,
         **kwargs,
     ):
         """
@@ -763,9 +763,9 @@ class PI0Policy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        # Initialize the core PI0 model
+        # Initialize the core ActionMem model
         self.init_rtc_processor()
-        self.model = PI0Pytorch(config, rtc_processor=self.rtc_processor)
+        self.model = ActionMemPytorch(config, rtc_processor=self.rtc_processor)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
