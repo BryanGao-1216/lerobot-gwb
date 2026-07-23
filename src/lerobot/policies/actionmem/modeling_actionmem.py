@@ -65,7 +65,7 @@ from ..common.vla_utils import (
 )
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
-from .configuration_pi0 import DEFAULT_IMAGE_SIZE, PI0Config
+from .configuration_actionmem import DEFAULT_IMAGE_SIZE, ActionMemConfig
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -404,7 +404,7 @@ class PaliGemmaWithExpertModel(
 class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI0 PyTorch model."""
 
-    def __init__(self, config: PI0Config, rtc_processor: RTCProcessor | None = None):
+    def __init__(self, config: ActionMemConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
         self.rtc_processor = rtc_processor
