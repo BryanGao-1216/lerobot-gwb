@@ -612,7 +612,7 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
+        # 增加一个 head 维度，对齐多头自注意力计算
         att_2d_masks_4d = prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
@@ -744,7 +744,7 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
 
 class ActionMemPolicy(PreTrainedPolicy):
-    """ActionMem OpenPI Policy for LeRobot."""
+    """ActionMem Policy for LeRobot."""
 
     config_class = ActionMemConfig
     name = "actionmem"
@@ -793,9 +793,9 @@ class ActionMemPolicy(PreTrainedPolicy):
     ) -> T:
         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
         print(
-            "The PI0 model is a direct port of the OpenPI implementation. \n"
-            "This implementation follows the original OpenPI structure for compatibility. \n"
-            "Original implementation: https://github.com/Physical-Intelligence/openpi"
+            "这是一个即将改变世界的模型❗️ \n"
+            "也许这次 \n"
+            "也许下次"
         )
         if pretrained_name_or_path is None:
             raise ValueError("pretrained_name_or_path is required")
