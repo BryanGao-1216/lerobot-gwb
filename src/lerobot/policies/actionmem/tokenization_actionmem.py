@@ -21,7 +21,7 @@ from pathlib import Path
 
 def default_action_token_map_path() -> Path:
     """Return the workspace-local ActionMem token-map path."""
-    return Path(__file__).resolve().parents[5] / "tokenizer" / "actionmem_token_map.json"
+    return Path(__file__).resolve().parents[6] / "models" / "actionmem-base" / "token_map.json"
 
 
 @dataclass(frozen=True)

@@ -1,7 +1,7 @@
 lerobot-train \
- --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/pi0-base \
- --policy.repo_id=pi0 \
- --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/pi0-lora \
+ --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/actionmem-base \
+ --policy.repo_id=actionmem \
+ --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/actionmem \
  --dataset.repo_id=lqs \
  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/LIBERO \
  --policy.output_features=null \
@@ -9,11 +9,12 @@ lerobot-train \
  --policy.optimizer_lr=1e-4 \
  --policy.scheduler_decay_lr=1e-5 \
  --eval_step=0 \
- --steps=100000 \
+ --steps=50000 \
  --batch_size=4 \
  --policy.gradient_checkpointing=true \
  --policy.chunk_size=16 \
  --policy.n_action_steps=16 \
  --peft.method_type=LORA \
+ --peft.target_modules='(.*\.paligemma_with_expert\.(paligemma\.model\.language_model\.layers\.[0-9]+\.self_attn\.(q|v)_proj|gemma_expert\.model\.layers\.[0-9]+\.self_attn\.(q|v)_proj|paligemma\.lm_head|paligemma\.model\.language_model\.embed_tokens)|model\.(state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out))' \
  --policy.push_to_hub=false \
  

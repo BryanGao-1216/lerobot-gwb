@@ -223,6 +223,7 @@ def make_actionmem_pre_post_processors(
     steps = make_default_policy_processor_steps(config, dataset_stats)
 
     # OpenPI order: raw → relative → normalize → model → unnormalize → absolute
+    print("ahahahahahahahahaha\n"*20)
     input_steps: list[ProcessorStep] = [
         steps.rename_observations,  # To mimic the same processor as pretrained one
         steps.add_batch_dim,

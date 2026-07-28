@@ -1478,7 +1478,8 @@ class ActionMemPolicy(PreTrainedPolicy):
         action_token_masks = batch.get(ACTION_TOKEN_MASK)
         if action_tokens is None or action_token_masks is None:
             raise ValueError(
-                f"ActionMem requires {ACTION_TOKENS} and {ACTION_TOKEN_MASK} in the processed batch."
+                f"ActionMem requires {ACTION_TOKENS} and {ACTION_TOKEN_MASK} in the processed batch.\n"
+                f"Got {batch.keys()}"
             )
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch)
