@@ -25,7 +25,7 @@ from lerobot.processor.converters import (
     transition_to_batch,
 )
 from lerobot.types import TransitionKey
-from lerobot.utils.constants import ACTION, DONE, OBS_STATE, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, ACTION_TOKEN, DONE, OBS_STATE, OBS_STR, REWARD
 
 
 # Tests for the unified to_tensor function
@@ -241,6 +241,20 @@ def test_batch_to_transition_with_index_fields():
     assert torch.equal(comp_data["index"], batch["index"])
     assert torch.equal(comp_data["task_index"], batch["task_index"])
     assert comp_data["task"] == batch["task"]
+
+
+def test_batch_to_transition_preserves_action_token():
+    batch = {
+        OBS_STATE: torch.randn(2, 7),
+        ACTION: torch.randn(2, 4),
+        "task": ["pick_cube", "place_cube"],
+        ACTION_TOKEN: torch.tensor([[0], [255]], dtype=torch.int64),
+    }
+
+    transition = batch_to_transition(batch)
+    comp_data = transition[TransitionKey.COMPLEMENTARY_DATA]
+
+    assert torch.equal(comp_data[ACTION_TOKEN], batch[ACTION_TOKEN])
 
 
 def testtransition_to_batch_with_index_fields():

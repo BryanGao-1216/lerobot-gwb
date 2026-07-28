@@ -159,6 +159,7 @@ _COMPLEMENTARY_KEYS = (
     "task_index",
     "episode_index",
     "timestamp",
+    "action_token",
     "language_persistent",
     "language_events",
     "messages",

@@ -101,6 +101,7 @@ class ActionMemConfig(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     tokenizer_max_length: int = 48  # see openpi `__post_init__`
+    action_token_map_path: str | None = None
 
     def __post_init__(self):
         super().__post_init__()
