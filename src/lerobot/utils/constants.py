@@ -32,6 +32,7 @@ OBS_LANGUAGE_SUBTASK_ATTENTION_MASK = OBS_LANGUAGE_SUBTASK + ".attention_mask"
 
 ACTION = "action"
 ACTION_PREFIX = ACTION + "."
+ACTION_TOKEN = "action_token"
 ACTION_TOKENS = ACTION + ".tokens"
 ACTION_TOKEN_MASK = ACTION + ".token_mask"
 REWARD = "next.reward"

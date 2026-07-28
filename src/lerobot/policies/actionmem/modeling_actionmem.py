@@ -46,9 +46,11 @@ else:
     PaliGemmaForConditionalGenerationWithPiGemma = None
 
 
-from lerobot.configs import PreTrainedConfig
+from lerobot.configs import NormalizationMode, PreTrainedConfig
 from lerobot.utils.constants import (
     ACTION,
+    ACTION_TOKEN_MASK,
+    ACTION_TOKENS,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
@@ -65,13 +67,117 @@ from ..common.vla_utils import (
 )
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
+from .action_vqvae import ActionVQVAEQ0Decoder, load_action_vqvae_q0_decoder
 from .configuration_actionmem import DEFAULT_IMAGE_SIZE, ActionMemConfig
+from .tokenization_actionmem import ActionMemTokenMap
 
 
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+
+
+def _configure_action_vqvae_flow_normalization(
+    config: ActionMemConfig,
+    dataset_stats: dict[str, dict[str, Tensor]] | None,
+) -> None:
+    """Persist the stats needed to normalize raw VQ-VAE action reconstructions."""
+    action_normalization = NormalizationMode(config.normalization_mapping["ACTION"])
+    if action_normalization is NormalizationMode.IDENTITY:
+        config.action_vqvae_flow_mean = None
+        config.action_vqvae_flow_std = None
+        return
+    if action_normalization is not NormalizationMode.MEAN_STD:
+        raise ValueError(
+            "ActionMem VQ-VAE flow-source normalization currently supports only ACTION "
+            f"normalization modes IDENTITY and MEAN_STD, got {action_normalization.value}."
+        )
+
+    runtime_action_stats = dataset_stats.get(ACTION) if dataset_stats is not None else None
+    if runtime_action_stats is not None:
+        mean = runtime_action_stats.get("mean")
+        std = runtime_action_stats.get("std")
+        source = "dataset_stats['action']"
+    else:
+        mean = config.action_vqvae_flow_mean
+        std = config.action_vqvae_flow_std
+        source = "the saved ActionMem config"
+
+    if mean is None or std is None:
+        raise ValueError(
+            "ActionMem uses MEAN_STD action normalization, but action mean/std are unavailable. "
+            "Construct the policy with dataset_stats during training, or load an ActionMem checkpoint "
+            "whose config contains action_vqvae_flow_mean/action_vqvae_flow_std."
+        )
+
+    mean_tensor = torch.as_tensor(mean, dtype=torch.float32).detach().cpu()
+    std_tensor = torch.as_tensor(std, dtype=torch.float32).detach().cpu()
+    if mean_tensor.ndim != 1 or std_tensor.ndim != 1:
+        raise ValueError(
+            f"Action mean/std from {source} must be one-dimensional, got "
+            f"{tuple(mean_tensor.shape)} and {tuple(std_tensor.shape)}."
+        )
+    if mean_tensor.shape != std_tensor.shape:
+        raise ValueError(
+            f"Action mean/std from {source} must have the same shape, got "
+            f"{tuple(mean_tensor.shape)} and {tuple(std_tensor.shape)}."
+        )
+    if not torch.isfinite(mean_tensor).all() or not torch.isfinite(std_tensor).all():
+        raise ValueError(f"Action mean/std from {source} must contain only finite values.")
+    if torch.any(std_tensor < 0):
+        raise ValueError(f"Action std from {source} must be non-negative.")
+
+    # Runtime dataset stats intentionally take precedence when they are supplied.
+    # No equality check against previously serialized stats is performed, matching
+    # the existing PI0 processor behavior.
+    config.action_vqvae_flow_mean = mean_tensor.tolist()
+    config.action_vqvae_flow_std = std_tensor.tolist()
+
+
+def _masked_action_token_cross_entropy(
+    logits: Tensor,
+    targets: Tensor,
+    target_mask: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Return per-sample CE, masked mean CE, and masked accuracy."""
+    if logits.ndim != 2:
+        raise ValueError(f"Expected action-token logits with shape [B, V], got {tuple(logits.shape)}")
+    if targets.shape != target_mask.shape or targets.ndim != 1:
+        raise ValueError(
+            "Action-token targets and masks must both have shape [B], got "
+            f"{tuple(targets.shape)} and {tuple(target_mask.shape)}"
+        )
+    if logits.shape[0] != targets.shape[0]:
+        raise ValueError(
+            f"Action-token logits and targets have different batch sizes: {logits.shape[0]} != "
+            f"{targets.shape[0]}"
+        )
+
+    target_mask = target_mask.bool()
+    per_sample_loss = F.cross_entropy(logits.float(), targets.long(), reduction="none")
+    masked_per_sample_loss = per_sample_loss * target_mask.to(per_sample_loss.dtype)
+    valid_count = target_mask.sum().clamp(min=1)
+    mean_loss = masked_per_sample_loss.sum() / valid_count
+
+    predictions = logits.argmax(dim=-1)
+    accuracy = ((predictions == targets) & target_mask).sum().to(logits.dtype) / valid_count
+    return masked_per_sample_loss, mean_loss, accuracy
+
+
+def _select_action_token(
+    logits: Tensor,
+    token_id_min: int,
+    token_id_max: int,
+) -> Tensor:
+    """Greedily select one token while restricting decoding to the action-token range."""
+    if token_id_min < 0 or token_id_max < token_id_min or token_id_max >= logits.shape[-1]:
+        raise ValueError(
+            f"Invalid action-token range [{token_id_min}, {token_id_max}] for vocabulary size "
+            f"{logits.shape[-1]}."
+        )
+    allowed_logits = logits[:, token_id_min : token_id_max + 1]
+    return allowed_logits.argmax(dim=-1, keepdim=True) + token_id_min
 
 
 # Define the complete layer computation function for gradient checkpointing
@@ -408,6 +514,59 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         super().__init__()
         self.config = config
         self.rtc_processor = rtc_processor
+        self.action_token_map = ActionMemTokenMap.from_json(config.action_token_map_path)
+        if config.chunk_size != self.action_token_map.action_horizon:
+            raise ValueError(
+                f"ActionMem chunk_size ({config.chunk_size}) must match the VQ-VAE action horizon "
+                f"({self.action_token_map.action_horizon}) in {self.action_token_map.path}."
+            )
+        if config.max_action_dim < self.action_token_map.action_dim:
+            raise ValueError(
+                f"ActionMem max_action_dim ({config.max_action_dim}) must be at least the VQ-VAE "
+                f"action dimension ({self.action_token_map.action_dim})."
+            )
+
+        action_normalization = NormalizationMode(config.normalization_mapping["ACTION"])
+        self._normalize_action_vqvae_flow_source = action_normalization is NormalizationMode.MEAN_STD
+        if self._normalize_action_vqvae_flow_source:
+            if config.action_vqvae_flow_mean is None or config.action_vqvae_flow_std is None:
+                raise ValueError(
+                    "ActionMem MEAN_STD flow-source normalization requires "
+                    "action_vqvae_flow_mean/action_vqvae_flow_std in the config."
+                )
+            if len(config.action_vqvae_flow_mean) != self.action_token_map.action_dim:
+                raise ValueError(
+                    "ActionMem action normalization stats dimension "
+                    f"({len(config.action_vqvae_flow_mean)}) must match the VQ-VAE action dimension "
+                    f"({self.action_token_map.action_dim})."
+                )
+            self.register_buffer(
+                "_action_vqvae_flow_mean",
+                torch.tensor(config.action_vqvae_flow_mean, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_action_vqvae_flow_std",
+                torch.tensor(config.action_vqvae_flow_std, dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.register_buffer("_action_vqvae_flow_mean", None, persistent=False)
+            self.register_buffer("_action_vqvae_flow_std", None, persistent=False)
+
+        checkpoint_path = config.action_vqvae_checkpoint_path or self.action_token_map.vqvae_checkpoint_path
+        if checkpoint_path is None:
+            raise ValueError(
+                "Set action_vqvae_checkpoint_path in ActionMemConfig or "
+                "vqvae.checkpoint_path in the ActionMem token map."
+            )
+        resolved_checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+        if not resolved_checkpoint_path.is_file():
+            raise FileNotFoundError(f"Action VQ-VAE checkpoint does not exist: {resolved_checkpoint_path}")
+        self.action_vqvae_checkpoint_path = str(resolved_checkpoint_path)
+        # Keep the frozen VQ-VAE external to this module's state_dict. It is
+        # loaded lazily and reconstructed from the configured .pt checkpoint.
+        object.__setattr__(self, "_action_vqvae", None)
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
@@ -484,10 +643,114 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
             offset=self.config.time_sampling_offset,
         )
 
+    def _get_action_vqvae(self, device: torch.device) -> ActionVQVAEQ0Decoder:
+        action_vqvae = self.__dict__.get("_action_vqvae")
+        if action_vqvae is None:
+            action_vqvae = load_action_vqvae_q0_decoder(self.action_vqvae_checkpoint_path)
+            if action_vqvae.horizon != self.config.chunk_size:
+                raise ValueError(
+                    f"Action VQ-VAE horizon ({action_vqvae.horizon}) does not match "
+                    f"ActionMem chunk_size ({self.config.chunk_size})."
+                )
+            if action_vqvae.action_dim != self.action_token_map.action_dim:
+                raise ValueError(
+                    f"Action VQ-VAE action_dim ({action_vqvae.action_dim}) does not match "
+                    f"the token map ({self.action_token_map.action_dim})."
+                )
+            if action_vqvae.codebook_size != self.action_token_map.codebook_size:
+                raise ValueError(
+                    f"Action VQ-VAE codebook_size ({action_vqvae.codebook_size}) does not match "
+                    f"the token map ({self.action_token_map.codebook_size})."
+                )
+            object.__setattr__(self, "_action_vqvae", action_vqvae)
+
+        if action_vqvae.q0_codebook.device != device:
+            action_vqvae.to(device=device, dtype=torch.float32)
+        action_vqvae.eval()
+        return action_vqvae
+
+    @torch.no_grad()
+    def decode_action_tokens(self, action_tokens: Tensor) -> Tensor:
+        """Decode PaliGemma action-token IDs into padded q0 action chunks."""
+        action_tokens = action_tokens.reshape(-1)
+        invalid = (action_tokens < self.action_token_map.token_id_min) | (
+            action_tokens > self.action_token_map.token_id_max
+        )
+        if torch.any(invalid):
+            invalid_ids = action_tokens[invalid].detach().cpu().tolist()
+            raise ValueError(
+                "Action token IDs to decode must be in "
+                f"[{self.action_token_map.token_id_min}, "
+                f"{self.action_token_map.token_id_max}], got {invalid_ids}."
+            )
+
+        q0_codes = self.action_token_map.anchor_token_id - action_tokens
+        action_vqvae = self._get_action_vqvae(action_tokens.device)
+        decoded_actions = action_vqvae(q0_codes)
+        if self._normalize_action_vqvae_flow_source:
+            decoded_actions = (decoded_actions - self._action_vqvae_flow_mean) / (
+                self._action_vqvae_flow_std + self.config.action_vqvae_flow_normalization_eps
+            )
+        return pad_vector(decoded_actions, self.config.max_action_dim)
+
+    @torch.no_grad()
+    def _make_training_flow_source(
+        self,
+        action_tokens: Tensor,
+        action_token_masks: Tensor,
+        actions: Tensor,
+    ) -> Tensor:
+        """Use q0 reconstruction as source, with Gaussian fallback for invalid targets."""
+        valid_targets = action_token_masks[:, -1].bool()
+        source_actions = self.sample_noise(actions.shape, actions.device)
+        if torch.any(valid_targets):
+            decoded_actions = self.decode_action_tokens(action_tokens[valid_targets, -1])
+            source_actions[valid_targets] = decoded_actions.to(source_actions.dtype)
+        return source_actions
+
+    def _validate_action_token_sequence(self, action_tokens, action_token_masks) -> None:
+        if action_tokens is None or action_token_masks is None:
+            raise ValueError("ActionMem requires action_tokens and action_token_masks.")
+        if action_tokens.shape != action_token_masks.shape or action_tokens.ndim != 2:
+            raise ValueError(
+                "action_tokens and action_token_masks must have shape [B, T], got "
+                f"{tuple(action_tokens.shape)} and {tuple(action_token_masks.shape)}"
+            )
+        if action_tokens.shape[1] < 2:
+            raise ValueError("ActionMem requires ACTION_QUERY plus a reserved action-token target.")
+
+        query_tokens = action_tokens[:, -2]
+        query_masks = action_token_masks[:, -2].bool()
+        invalid_query = (~query_masks) | (query_tokens != self.action_token_map.action_query_token_id)
+        if torch.any(invalid_query):
+            raise ValueError(
+                "The penultimate ActionMem token must be the valid ACTION_QUERY token "
+                f"{self.action_token_map.action_query_token_id}."
+            )
+
+        targets = action_tokens[:, -1]
+        target_masks = action_token_masks[:, -1].bool()
+        invalid_targets = target_masks & (
+            (targets < self.action_token_map.token_id_min) | (targets > self.action_token_map.token_id_max)
+        )
+        if torch.any(invalid_targets):
+            invalid_ids = targets[invalid_targets].detach().cpu().tolist()
+            raise ValueError(
+                "Action-token targets must be in "
+                f"[{self.action_token_map.token_id_min}, {self.action_token_map.token_id_max}], "
+                f"got {invalid_ids}."
+            )
+
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        action_tokens=None,
+        action_token_masks=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer."""
+        """Embed images, task tokens, then the causal ActionMem token segment."""
         embs = []
         pad_masks = []
         att_masks = []
@@ -516,6 +779,25 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        if action_tokens is not None:
+            if action_token_masks is None or action_tokens.shape != action_token_masks.shape:
+                raise ValueError(
+                    "action_tokens and action_token_masks must have the same shape, got "
+                    f"{tuple(action_tokens.shape)} and "
+                    f"{None if action_token_masks is None else tuple(action_token_masks.shape)}"
+                )
+
+            def action_token_embed_func(action_tokens):
+                return self.paligemma_with_expert.embed_language_tokens(action_tokens)
+
+            action_token_emb = self._apply_checkpoint(action_token_embed_func, action_tokens)
+            embs.append(action_token_emb)
+            pad_masks.append(action_token_masks.bool())
+
+            # Each valid action-side token opens a new causal block. Consequently,
+            # ACTION_QUERY cannot attend to the current action-token target.
+            att_masks += [1] * action_token_emb.shape[1]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -589,14 +871,39 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, lang_tokens, lang_masks, state, actions, noise, time) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
+    def forward(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        action_tokens,
+        action_token_masks,
+        state,
+        actions,
+        noise,
+        time,
+    ) -> dict[str, Tensor]:
+        """Compute flow matching and query-to-action-token training losses."""
+        self._validate_action_token_sequence(action_tokens, action_token_masks)
+        if noise is None:
+            noise = self._make_training_flow_source(
+                action_tokens,
+                action_token_masks,
+                actions,
+            )
+
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            action_tokens,
+            action_token_masks,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
 
@@ -616,7 +923,7 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -624,9 +931,9 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return prefix_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_out, suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
@@ -637,8 +944,28 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        flow_losses = F.mse_loss(u_t, v_t, reduction="none")
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        # The target is the final token and ACTION_QUERY is immediately before
+        # it. Causal ActionMem attention prevents this hidden state from seeing
+        # the target token.
+        query_hidden = prefix_out[:, -2, :]
+        action_token_logits = self.paligemma_with_expert.paligemma.lm_head(query_hidden)
+        action_token_loss_per_sample, action_token_ce_loss, action_token_accuracy = (
+            _masked_action_token_cross_entropy(
+                action_token_logits,
+                action_tokens[:, -1],
+                action_token_masks[:, -1],
+            )
+        )
+
+        return {
+            "flow_losses": flow_losses,
+            "action_token_loss_per_sample": action_token_loss_per_sample,
+            "action_token_target_mask": action_token_masks[:, -1].bool(),
+            "action_token_ce_loss": action_token_ce_loss,
+            "action_token_accuracy": action_token_accuracy,
+        }
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -647,6 +974,8 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         img_masks,
         lang_tokens,
         lang_masks,
+        action_tokens,
+        action_token_masks,
         state,
         noise=None,
         num_steps=None,
@@ -656,20 +985,22 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
+        self._validate_action_token_sequence(action_tokens, action_token_masks)
+
         bsize = state.shape[0]
         device = state.device
 
-        if noise is None:
-            # Sample noise with padded dimension as expected by action_in_proj
-            actions_shape = (
-                bsize,
-                self.config.chunk_size,
-                self.config.max_action_dim,
-            )  # Use config max_action_dim for internal processing
-            noise = self.sample_noise(actions_shape, device)
-
+        # The processor reserves the final position for the current action-token
+        # target. At inference it is padding, so prefill only through ACTION_QUERY.
+        action_prompt_tokens = action_tokens[:, :-1]
+        action_prompt_masks = action_token_masks[:, :-1]
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            action_prompt_tokens,
+            action_prompt_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -677,13 +1008,44 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+
+        action_token_logits = self.paligemma_with_expert.paligemma.lm_head(prefix_out[:, -1, :])
+        generated_action_token = _select_action_token(
+            action_token_logits,
+            self.action_token_map.token_id_min,
+            self.action_token_map.token_id_max,
+        )
+
+        # Add the generated token to the prefix cache. Flow matching therefore
+        # conditions on the generated token rather than the padded target slot.
+        generated_action_token_emb = self.paligemma_with_expert.embed_language_tokens(generated_action_token)
+        if prefix_embs.dtype == torch.bfloat16:
+            generated_action_token_emb = generated_action_token_emb.to(dtype=torch.bfloat16)
+
+        generated_mask = torch.ones((bsize, 1), dtype=torch.bool, device=device)
+        prefix_pad_masks = torch.cat([prefix_pad_masks, generated_mask], dim=1)
+        generated_position_ids = (prefix_pad_masks.sum(dim=1, keepdim=True) - 1).long()
+        generated_attention_mask = prepare_attention_masks_4d(
+            prefix_pad_masks.unsqueeze(1),
+            dtype=generated_action_token_emb.dtype,
+        )
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=generated_attention_mask,
+            position_ids=generated_position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[generated_action_token_emb, None],
+            use_cache=True,
+        )
+
+        if noise is None:
+            noise = self.decode_action_tokens(generated_action_token)
 
         return euler_integrate(
             lambda input_x_t, current_timestep: self.denoise_step(
@@ -761,6 +1123,7 @@ class ActionMemPolicy(PreTrainedPolicy):
         require_package("transformers", extra="pi")
         super().__init__(config)
         config.validate_features()
+        _configure_action_vqvae_flow_normalization(config, kwargs.get("dataset_stats"))
         self.config = config
 
         # Initialize the core ActionMem model
@@ -792,11 +1155,7 @@ class ActionMemPolicy(PreTrainedPolicy):
         **kwargs,
     ) -> T:
         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
-        print(
-            "这是一个即将改变世界的模型❗️ \n"
-            "也许这次 \n"
-            "也许下次"
-        )
+        print("这是一个即将改变世界的模型❗️ \n也许这次 \n也许下次")
         if pretrained_name_or_path is None:
             raise ValueError("pretrained_name_or_path is required")
 
@@ -1077,10 +1436,25 @@ class ActionMemPolicy(PreTrainedPolicy):
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        action_tokens = batch.get(ACTION_TOKENS)
+        action_token_masks = batch.get(ACTION_TOKEN_MASK)
+        if action_tokens is None or action_token_masks is None:
+            raise ValueError(
+                f"ActionMem requires {ACTION_TOKENS} and {ACTION_TOKEN_MASK} in the processed batch."
+            )
         state = self.prepare_state(batch)
 
         # Sample actions using the model (pass through RTC kwargs)
-        actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, **kwargs)
+        actions = self.model.sample_actions(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            action_tokens,
+            action_token_masks,
+            state,
+            **kwargs,
+        )
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1100,31 +1474,59 @@ class ActionMemPolicy(PreTrainedPolicy):
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        action_tokens = batch.get(ACTION_TOKENS)
+        action_token_masks = batch.get(ACTION_TOKEN_MASK)
+        if action_tokens is None or action_token_masks is None:
+            raise ValueError(
+                f"ActionMem requires {ACTION_TOKENS} and {ACTION_TOKEN_MASK} in the processed batch."
+            )
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch)
 
-        noise = self.model.sample_noise(actions.shape, actions.device)
         time = self.model.sample_time(actions.shape[0], actions.device)
 
         # Compute loss
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        model_output = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            action_tokens,
+            action_token_masks,
+            state,
+            actions,
+            None,
+            time,
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        flow_losses = model_output["flow_losses"][:, :, :original_action_dim]
+        flow_loss = flow_losses.mean()
+        action_token_ce_loss = model_output["action_token_ce_loss"]
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": flow_losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "flow_loss": flow_loss.item(),
+            "action_token_ce_loss": action_token_ce_loss.item(),
+            "action_token_accuracy": model_output["action_token_accuracy"].item(),
         }
 
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            # Normalize masked token losses so their batch mean matches the
+            # valid-target mean used by the scalar reduction.
+            target_mask = model_output["action_token_target_mask"]
+            valid_count = target_mask.sum().clamp(min=1)
+            token_loss_scale = target_mask.numel() / valid_count
+            per_sample_token_loss = model_output["action_token_loss_per_sample"] * token_loss_scale
+            per_sample_flow_loss = flow_losses.mean(dim=(1, 2))
+            per_sample_loss = (
+                per_sample_flow_loss + self.config.action_token_loss_weight * per_sample_token_loss
+            )
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = flow_loss + self.config.action_token_loss_weight * action_token_ce_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

@@ -33,8 +33,8 @@ class ActionMemConfig(PreTrainedConfig):
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
     n_obs_steps: int = 1
-    chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
-    n_action_steps: int = 50  # Number of action steps to execute
+    chunk_size: int = 16  # Must match the VQ-VAE action horizon in the token map
+    n_action_steps: int = 16  # Number of action steps to execute
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -102,6 +102,17 @@ class ActionMemConfig(PreTrainedConfig):
 
     tokenizer_max_length: int = 48  # see openpi `__post_init__`
     action_token_map_path: str | None = None
+    # Frozen action VQ-VAE used to decode q0 into the flow-matching source chunk.
+    # When omitted, ActionMem falls back to vqvae.checkpoint_path in the token map.
+    action_vqvae_checkpoint_path: str | None = None
+    # LeRobot action statistics used to map the raw VQ-VAE reconstruction into
+    # the same normalized action space as the flow-matching target. These are
+    # populated from dataset_stats at policy construction time and serialized
+    # with the policy config for inference without dataset metadata.
+    action_vqvae_flow_mean: list[float] | None = None
+    action_vqvae_flow_std: list[float] | None = None
+    action_vqvae_flow_normalization_eps: float = 1e-8
+    action_token_loss_weight: float = 1.0
 
     def __post_init__(self):
         super().__post_init__()
@@ -120,6 +131,33 @@ class ActionMemConfig(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.action_token_loss_weight < 0:
+            raise ValueError(
+                f"action_token_loss_weight must be non-negative, got {self.action_token_loss_weight}"
+            )
+
+        if (self.action_vqvae_flow_mean is None) != (self.action_vqvae_flow_std is None):
+            raise ValueError(
+                "action_vqvae_flow_mean and action_vqvae_flow_std must either both be set or both be None."
+            )
+        if self.action_vqvae_flow_mean is not None and len(self.action_vqvae_flow_mean) != len(
+            self.action_vqvae_flow_std
+        ):
+            raise ValueError(
+                "action_vqvae_flow_mean and action_vqvae_flow_std must have the same length."
+            )
+        if self.action_vqvae_flow_normalization_eps <= 0:
+            raise ValueError(
+                "action_vqvae_flow_normalization_eps must be positive, got "
+                f"{self.action_vqvae_flow_normalization_eps}."
+            )
+
+        if self.train_expert_only and self.action_token_loss_weight > 0:
+            raise ValueError(
+                "train_expert_only=True freezes the PaliGemma VLM, so it cannot learn action-token "
+                "generation. Set train_expert_only=False or action_token_loss_weight=0."
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

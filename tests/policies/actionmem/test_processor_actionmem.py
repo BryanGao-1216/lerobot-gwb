@@ -24,13 +24,19 @@ def _write_token_map(tmp_path):
                     "code_id_min": 0,
                     "code_id_max": 255,
                     "invalid_value": -1,
+                    "action_horizon": 16,
+                    "action_dim": 7,
                 },
                 "action_tokens": {
                     "anchor_token_id": 257023,
                     "token_id_min": 256768,
                     "token_id_max": 257023,
                 },
-                "control_tokens": {"action_query": {"token_id": 9}},
+                "control_tokens": {
+                    "action_memory_start": {"token_id": 7},
+                    "action_memory_end": {"token_id": 8},
+                    "action_query": {"token_id": 9},
+                },
                 "padding": {"token_id": 0},
             }
         ),
@@ -58,11 +64,11 @@ def test_actionmem_action_token_processor_maps_q0(tmp_path):
 
     assert torch.equal(
         complementary_data[ACTION_TOKENS],
-        torch.tensor([[9, 257023], [9, 256768]], dtype=torch.long),
+        torch.tensor([[7, 8, 9, 257023], [7, 8, 9, 256768]], dtype=torch.long),
     )
     assert torch.equal(
         complementary_data[ACTION_TOKEN_MASK],
-        torch.tensor([[True, True], [True, True]]),
+        torch.tensor([[True, True, True, True], [True, True, True, True]]),
     )
 
 
@@ -73,22 +79,22 @@ def test_actionmem_action_token_processor_masks_invalid_and_inference_targets(tm
     invalid_data = invalid_output[TransitionKey.COMPLEMENTARY_DATA]
     assert torch.equal(
         invalid_data[ACTION_TOKENS],
-        torch.tensor([[9, 0], [9, 256981]], dtype=torch.long),
+        torch.tensor([[7, 8, 9, 0], [7, 8, 9, 256981]], dtype=torch.long),
     )
     assert torch.equal(
         invalid_data[ACTION_TOKEN_MASK],
-        torch.tensor([[True, False], [True, True]]),
+        torch.tensor([[True, True, True, False], [True, True, True, True]]),
     )
 
     inference_output = step(_make_transition(q0=None))
     inference_data = inference_output[TransitionKey.COMPLEMENTARY_DATA]
     assert torch.equal(
         inference_data[ACTION_TOKENS],
-        torch.tensor([[9, 0], [9, 0]], dtype=torch.long),
+        torch.tensor([[7, 8, 9, 0], [7, 8, 9, 0]], dtype=torch.long),
     )
     assert torch.equal(
         inference_data[ACTION_TOKEN_MASK],
-        torch.tensor([[True, False], [True, False]]),
+        torch.tensor([[True, True, True, False], [True, True, True, False]]),
     )
 
 

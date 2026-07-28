@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 from lerobot.types import EnvTransition, PolicyAction, RobotAction, RobotObservation, TransitionKey
-from lerobot.utils.constants import ACTION, DONE, INFO, OBS_PREFIX, REWARD, TRUNCATED
+from lerobot.utils.constants import ACTION, ACTION_TOKEN, DONE, INFO, OBS_PREFIX, REWARD, TRUNCATED
 
 
 @singledispatch
@@ -159,7 +159,7 @@ _COMPLEMENTARY_KEYS = (
     "task_index",
     "episode_index",
     "timestamp",
-    "action_token",
+    ACTION_TOKEN,
     "language_persistent",
     "language_events",
     "messages",
