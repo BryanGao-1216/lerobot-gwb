@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
+from transformers.models.gemma.configuration_gemma import GemmaConfig
 
 import lerobot.policies.actionmem.modeling_actionmem as modeling_actionmem
 from lerobot.configs import NormalizationMode
@@ -33,6 +34,7 @@ from lerobot.policies.actionmem.modeling_actionmem import (
     _masked_action_token_cross_entropy,
     _select_action_token,
 )
+from lerobot.policies.pi_gemma import PiGemmaModel
 from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN_MASK,
@@ -307,6 +309,61 @@ def test_vlm_only_core_forward_skips_flow_source_and_expert_inputs():
     assert output is expected
 
 
+def test_gradient_checkpointing_configures_paligemma_decoder_layers():
+    model = ActionMemPytorch.__new__(ActionMemPytorch)
+    nn.Module.__init__(model)
+    language_model = PiGemmaModel(
+        GemmaConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+    )
+    vision_tower = type("VisionTower", (), {"gradient_checkpointing": False})()
+    expert_model = type("ExpertModel", (), {"gradient_checkpointing": False})()
+    model.paligemma_with_expert = type(
+        "PaliGemmaWithExpert",
+        (),
+        {
+            "paligemma": type(
+                "PaliGemma",
+                (),
+                {
+                    "model": type(
+                        "PaliGemmaModel",
+                        (),
+                        {
+                            "language_model": language_model,
+                            "vision_tower": vision_tower,
+                        },
+                    )()
+                },
+            )(),
+            "gemma_expert": type("GemmaExpert", (), {"model": expert_model})(),
+        },
+    )()
+
+    model.gradient_checkpointing_enable()
+
+    assert model.gradient_checkpointing_enabled
+    assert language_model.gradient_checkpointing
+    assert all(layer.gradient_checkpointing for layer in language_model.layers)
+    assert vision_tower.gradient_checkpointing
+    assert expert_model.gradient_checkpointing
+
+    model.gradient_checkpointing_disable()
+
+    assert not model.gradient_checkpointing_enabled
+    assert not language_model.gradient_checkpointing
+    assert not any(layer.gradient_checkpointing for layer in language_model.layers)
+    assert not vision_tower.gradient_checkpointing
+    assert not expert_model.gradient_checkpointing
+
+
 class _DummyTrainingCore(nn.Module):
     def __init__(self):
         super().__init__()
@@ -527,6 +584,26 @@ class _DummyInferencePaliGemma(nn.Module):
         self.forward_inputs.append(inputs_embeds[0].detach().clone())
         cache = "prefill" if past_key_values is None else "with_generated_token"
         return [inputs_embeds[0], None], cache
+
+
+def test_vlm_only_uses_layer_checkpointing_without_a_whole_model_checkpoint():
+    model = ActionMemPytorch.__new__(ActionMemPytorch)
+    nn.Module.__init__(model)
+    model.paligemma_with_expert = _DummyInferencePaliGemma()
+    model._apply_checkpoint = lambda *_args, **_kwargs: pytest.fail(
+        "VLM-only must not checkpoint the whole PaliGemma forward"
+    )
+
+    output = model._forward_action_token_only(
+        prefix_embs=torch.ones(2, 4, 2),
+        prefix_pad_masks=torch.ones(2, 4, dtype=torch.bool),
+        prefix_att_masks=torch.zeros(2, 4, dtype=torch.bool),
+        action_tokens=torch.tensor([[1, 2, 3, 7], [1, 2, 3, 7]]),
+        action_token_masks=torch.ones(2, 4, dtype=torch.bool),
+    )
+
+    assert len(model.paligemma_with_expert.forward_inputs) == 1
+    assert output["action_token_ce_loss"].ndim == 0
 
 
 def test_inference_generates_restricted_token_and_adds_it_to_prefix_cache(monkeypatch):

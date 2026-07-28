@@ -639,18 +639,28 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = True
+        # PiGemma decoder layers inherit Transformers' GradientCheckpointingLayer.
+        # Use the public API so every decoder layer receives both the flag and
+        # checkpoint function. Setting only `language_model.gradient_checkpointing`
+        # leaves its layers uncheckpointed and makes the VLM-only backward
+        # recompute the whole 2B model in one memory-heavy graph.
+        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": False,
+                "preserve_rng_state": False,
+            }
+        )
         self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
-        logging.info("Enabled gradient checkpointing for PI0Pytorch model")
+        logging.info("Enabled gradient checkpointing for ActionMemPytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = False
+        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing_disable()
         self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
-        logging.info("Disabled gradient checkpointing for PI0Pytorch model")
+        logging.info("Disabled gradient checkpointing for ActionMemPytorch model")
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
@@ -1038,8 +1048,12 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
             return prefix_out
 
-        prefix_out = self._apply_checkpoint(
-            forward_func,
+        # Do not wrap the entire PaliGemma forward in one checkpoint. When
+        # gradient checkpointing is enabled, gradient_checkpointing_enable()
+        # configures each PiGemma decoder layer independently. A whole-model
+        # checkpoint causes backward recomputation to build the complete VLM
+        # graph at once and can use more memory than the normal forward.
+        prefix_out = forward_func(
             prefix_embs,
             prefix_att_2d_masks_4d,
             prefix_position_ids,
