@@ -84,7 +84,14 @@ class ActionMemConfig(PreTrainedConfig):
 
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
-    train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    # One of:
+    # - "vlm_only": train action-token prediction without running the flow expert.
+    # - "action_expert_only": train flow matching while freezing the PaliGemma VLM.
+    # - "joint": train both objectives and both model branches.
+    training_stage: str = "joint"
+    # Deprecated compatibility alias for older PI0-style configs. When true it
+    # selects training_stage="action_expert_only".
+    train_expert_only: bool = False
 
     # Optimizer settings: see openpi `AdamW``
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
@@ -112,7 +119,21 @@ class ActionMemConfig(PreTrainedConfig):
     action_vqvae_flow_mean: list[float] | None = None
     action_vqvae_flow_std: list[float] | None = None
     action_vqvae_flow_normalization_eps: float = 1e-8
+    flow_loss_weight: float = 1.0
     action_token_loss_weight: float = 1.0
+
+    # TensorBoard settings. Logging is performed by lerobot-train on the main
+    # process, while these policy fields keep ActionMem runs self-contained and
+    # configurable through --policy.tensorboard_* CLI flags.
+    tensorboard_enable: bool = False
+    tensorboard_log_dir: str | None = None
+    tensorboard_log_freq: int = 100
+    tensorboard_flush_secs: int = 30
+    tensorboard_max_queue: int = 10
+    tensorboard_filename_suffix: str = ""
+    tensorboard_log_parameters: bool = False
+    tensorboard_log_gradients: bool = False
+    tensorboard_histogram_freq: int = 1_000
 
     def __post_init__(self):
         super().__post_init__()
@@ -132,10 +153,34 @@ class ActionMemConfig(PreTrainedConfig):
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
+        valid_training_stages = {"vlm_only", "action_expert_only", "joint"}
+        if self.train_expert_only:
+            if self.training_stage not in {"joint", "action_expert_only"}:
+                raise ValueError(
+                    f"train_expert_only=True conflicts with training_stage={self.training_stage!r}."
+                )
+            self.training_stage = "action_expert_only"
+        if self.training_stage not in valid_training_stages:
+            raise ValueError(
+                f"training_stage must be one of {sorted(valid_training_stages)}, got {self.training_stage!r}."
+            )
+
+        if self.flow_loss_weight < 0:
+            raise ValueError(f"flow_loss_weight must be non-negative, got {self.flow_loss_weight}")
         if self.action_token_loss_weight < 0:
             raise ValueError(
                 f"action_token_loss_weight must be non-negative, got {self.action_token_loss_weight}"
             )
+        if self.training_stage == "vlm_only" and self.action_token_loss_weight == 0:
+            raise ValueError("vlm_only training requires action_token_loss_weight > 0.")
+        if self.training_stage == "action_expert_only" and self.flow_loss_weight == 0:
+            raise ValueError("action_expert_only training requires flow_loss_weight > 0.")
+        if (
+            self.training_stage == "joint"
+            and self.flow_loss_weight == 0
+            and self.action_token_loss_weight == 0
+        ):
+            raise ValueError("joint training requires at least one non-zero loss weight.")
 
         if (self.action_vqvae_flow_mean is None) != (self.action_vqvae_flow_std is None):
             raise ValueError(
@@ -144,19 +189,22 @@ class ActionMemConfig(PreTrainedConfig):
         if self.action_vqvae_flow_mean is not None and len(self.action_vqvae_flow_mean) != len(
             self.action_vqvae_flow_std
         ):
-            raise ValueError(
-                "action_vqvae_flow_mean and action_vqvae_flow_std must have the same length."
-            )
+            raise ValueError("action_vqvae_flow_mean and action_vqvae_flow_std must have the same length.")
         if self.action_vqvae_flow_normalization_eps <= 0:
             raise ValueError(
                 "action_vqvae_flow_normalization_eps must be positive, got "
                 f"{self.action_vqvae_flow_normalization_eps}."
             )
 
-        if self.train_expert_only and self.action_token_loss_weight > 0:
+        if self.tensorboard_log_freq <= 0:
+            raise ValueError(f"tensorboard_log_freq must be positive, got {self.tensorboard_log_freq}.")
+        if self.tensorboard_flush_secs <= 0:
+            raise ValueError(f"tensorboard_flush_secs must be positive, got {self.tensorboard_flush_secs}.")
+        if self.tensorboard_max_queue <= 0:
+            raise ValueError(f"tensorboard_max_queue must be positive, got {self.tensorboard_max_queue}.")
+        if self.tensorboard_histogram_freq <= 0:
             raise ValueError(
-                "train_expert_only=True freezes the PaliGemma VLM, so it cannot learn action-token "
-                "generation. Set train_expert_only=False or action_token_loss_weight=0."
+                f"tensorboard_histogram_freq must be positive, got {self.tensorboard_histogram_freq}."
             )
 
     def validate_features(self) -> None:

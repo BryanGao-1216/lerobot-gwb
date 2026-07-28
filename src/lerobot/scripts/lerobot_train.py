@@ -34,6 +34,7 @@ from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
+from lerobot.common.tensorboard_utils import TensorBoardLogger
 from lerobot.common.train_utils import (
     gather_fsdp_state_dicts,
     get_step_checkpoint_dir,
@@ -81,6 +82,8 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    tensorboard_logger: TensorBoardLogger | None = None,
+    step: int | None = None,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -98,6 +101,8 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
+        tensorboard_logger: Optional logger used for parameter/gradient histograms.
+        step: The completed optimizer-step number used for TensorBoard histograms.
 
     Returns:
         A tuple containing:
@@ -151,6 +156,9 @@ def update_policy(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
 
+    if tensorboard_logger is not None and step is not None:
+        tensorboard_logger.log_model_histograms(policy, step)
+
     # Optimizer step
     with lock if lock is not None else nullcontext():
         optimizer.step()
@@ -175,6 +183,16 @@ def update_policy(
     if output_dict:
         train_metrics.update_metrics(output_dict)
     return train_metrics, output_dict
+
+
+def _reduce_scalar_metrics(metrics: dict[str, float], accelerator: "Accelerator") -> dict[str, float]:
+    """Mean-reduce a same-key scalar dictionary across training processes."""
+    if accelerator.num_processes <= 1 or not metrics:
+        return metrics
+    names = sorted(metrics)
+    values = torch.tensor([metrics[name] for name in names], dtype=torch.float32, device=accelerator.device)
+    reduced = accelerator.reduce(values, reduction="mean")
+    return dict(zip(names, reduced.tolist(), strict=True))
 
 
 @parser.wrap()
@@ -311,6 +329,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             peft_cli_overrides = dataclasses.asdict(cfg.peft)
             policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
+    configure_training_stage = getattr(policy, "configure_training_stage", None)
+    if callable(configure_training_stage):
+        configure_training_stage()
+
     # Wait for all processes to finish model creation before continuing
     accelerator.wait_for_everyone()
 
@@ -392,6 +414,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         step, optimizer, lr_scheduler = load_training_state(
             cfg.checkpoint_path, optimizer, lr_scheduler, load_optimizer=not is_fsdp
         )
+
+    tensorboard_enabled = bool(
+        not cfg.is_reward_model_training
+        and cfg.policy is not None
+        and getattr(cfg.policy, "tensorboard_enable", False)
+    )
+    tensorboard_log_freq = int(getattr(cfg.policy, "tensorboard_log_freq", 1))
+    tensorboard_logger = (
+        TensorBoardLogger(cfg, purge_step=step if cfg.resume else None)
+        if tensorboard_enabled and is_main_process
+        else None
+    )
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -575,7 +609,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        train_tracker, _ = update_policy(
+        train_tracker, output_dict = update_policy(
             train_tracker,
             policy,
             batch,
@@ -584,6 +618,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
+            tensorboard_logger=tensorboard_logger,
+            step=step + 1,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
@@ -596,6 +632,29 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
         is_eval_step = cfg.eval_steps > 0 and eval_dataloader is not None and step % cfg.eval_steps == 0
+        is_tensorboard_step = tensorboard_enabled and step % tensorboard_log_freq == 0
+
+        if is_tensorboard_step:
+            tensorboard_metrics = {
+                "loss": float(train_tracker.loss.val),
+                "grad_norm": float(train_tracker.grad_norm.val),
+                "lr": float(train_tracker.lr.val),
+                "update_s": float(train_tracker.update_s.val),
+                "dataloading_s": float(train_tracker.dataloading_s.val),
+            }
+            if torch.cuda.is_available():
+                tensorboard_metrics["gpu_mem_gb"] = float(train_tracker.gpu_mem_gb.val)
+            if output_dict:
+                tensorboard_metrics.update(
+                    {
+                        name: float(value)
+                        for name, value in output_dict.items()
+                        if name != "loss" and not isinstance(value, bool) and isinstance(value, (int, float))
+                    }
+                )
+            tensorboard_metrics = _reduce_scalar_metrics(tensorboard_metrics, accelerator)
+            if tensorboard_logger is not None:
+                tensorboard_logger.log_scalars(tensorboard_metrics, step, mode="train")
 
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
@@ -641,6 +700,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                if tensorboard_logger:
+                    tensorboard_logger.log_scalars({"loss": eval_loss}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
@@ -726,6 +787,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                if tensorboard_logger:
+                    tensorboard_logger.log_scalars(eval_tracker.to_dict(), step, mode="eval")
 
             accelerator.wait_for_everyone()
 
@@ -739,6 +802,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     model_state_dict = accelerator.get_state_dict(policy) if is_fsdp else None
     if is_main_process:
         logging.info("End of training")
+
+        if tensorboard_logger:
+            tensorboard_logger.flush()
+            tensorboard_logger.close()
 
         if getattr(active_cfg, "push_to_hub", False):
             unwrapped_model = accelerator.unwrap_model(policy)

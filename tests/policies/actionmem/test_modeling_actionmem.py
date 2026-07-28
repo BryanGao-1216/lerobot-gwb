@@ -25,6 +25,7 @@ from lerobot.policies.actionmem.action_vqvae import (
     VQVLALikeDecoder,
     load_action_vqvae_q0_decoder,
 )
+from lerobot.policies.actionmem.configuration_actionmem import ActionMemConfig
 from lerobot.policies.actionmem.modeling_actionmem import (
     ActionMemPolicy,
     ActionMemPytorch,
@@ -275,7 +276,42 @@ def test_training_flow_source_decodes_valid_targets_and_falls_back_for_invalid()
     assert torch.equal(source[2], torch.full((2, 2), -1.0))
 
 
+def test_vlm_only_core_forward_skips_flow_source_and_expert_inputs():
+    model = ActionMemPytorch.__new__(ActionMemPytorch)
+    nn.Module.__init__(model)
+    action_tokens = torch.tensor([[7, 9, 10], [7, 9, 8]])
+    action_token_masks = torch.ones_like(action_tokens, dtype=torch.bool)
+    prefix = (
+        torch.zeros(2, 3, 4),
+        torch.ones(2, 3, dtype=torch.bool),
+        torch.zeros(2, 3),
+    )
+    expected = {"action_token_ce_loss": torch.tensor(1.0)}
+
+    model._validate_action_token_sequence = lambda *_: None
+    model.embed_prefix = lambda *_: prefix
+    model._forward_action_token_only = lambda *args: expected
+    model._make_training_flow_source = lambda *_: pytest.fail("VLM-only must not build a flow source")
+
+    output = model.forward(
+        images=[],
+        img_masks=[],
+        lang_tokens=torch.zeros(2, 1, dtype=torch.long),
+        lang_masks=torch.ones(2, 1, dtype=torch.bool),
+        action_tokens=action_tokens,
+        action_token_masks=action_token_masks,
+        compute_flow=False,
+        compute_action_token=True,
+    )
+
+    assert output is expected
+
+
 class _DummyTrainingCore(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
     def sample_noise(self, shape, device):
         return torch.zeros(shape, device=device)
 
@@ -294,7 +330,12 @@ class _DummyTrainingCore(nn.Module):
         actions,
         noise,
         time,
+        *,
+        compute_flow,
+        compute_action_token,
     ):
+        self.calls.append((compute_flow, compute_action_token))
+        device = actions.device if actions is not None else action_tokens.device
         del (
             images,
             image_masks,
@@ -306,16 +347,35 @@ class _DummyTrainingCore(nn.Module):
             noise,
             time,
         )
-        return {
-            "flow_losses": torch.full_like(actions, 2.0),
-            "action_token_loss_per_sample": torch.tensor([3.0, 0.0], device=actions.device),
-            "action_token_target_mask": torch.tensor([True, False], device=actions.device),
-            "action_token_ce_loss": torch.tensor(3.0, device=actions.device),
-            "action_token_accuracy": torch.tensor(0.5, device=actions.device),
-        }
+        output = {}
+        if compute_flow:
+            output["flow_losses"] = torch.full_like(actions, 2.0)
+        if compute_action_token:
+            output.update(
+                {
+                    "action_token_loss_per_sample": torch.tensor([3.0, 0.0], device=device),
+                    "action_token_target_mask": torch.tensor([True, False], device=device),
+                    "action_token_ce_loss": torch.tensor(3.0, device=device),
+                    "action_token_accuracy": torch.tensor(0.5, device=device),
+                }
+            )
+        return output
 
 
-def test_policy_combines_flow_and_action_token_losses_for_both_reductions():
+@pytest.mark.parametrize(
+    ("training_stage", "expected_scalar", "expected_per_sample", "expected_call"),
+    [
+        ("vlm_only", 1.5, torch.tensor([3.0, 0.0]), (False, True)),
+        ("action_expert_only", 4.0, torch.tensor([4.0, 4.0]), (True, False)),
+        ("joint", 5.5, torch.tensor([7.0, 4.0]), (True, True)),
+    ],
+)
+def test_policy_training_stages_select_objectives_for_both_reductions(
+    training_stage,
+    expected_scalar,
+    expected_per_sample,
+    expected_call,
+):
     policy = ActionMemPolicy.__new__(ActionMemPolicy)
     nn.Module.__init__(policy)
     policy.model = _DummyTrainingCore()
@@ -323,6 +383,8 @@ def test_policy_combines_flow_and_action_token_losses_for_both_reductions():
         "Config",
         (),
         {
+            "training_stage": training_stage,
+            "flow_loss_weight": 2.0,
             "action_token_loss_weight": 0.5,
             "output_features": {ACTION: type("Feature", (), {"shape": (2,)})()},
         },
@@ -343,12 +405,71 @@ def test_policy_combines_flow_and_action_token_losses_for_both_reductions():
     scalar_loss, scalar_metrics = policy.forward(batch)
     per_sample_loss, per_sample_metrics = policy.forward(batch, reduction="none")
 
-    assert scalar_loss.item() == 3.5
-    assert torch.equal(per_sample_loss, torch.tensor([5.0, 2.0]))
-    assert scalar_metrics["flow_loss"] == 2.0
-    assert scalar_metrics["action_token_ce_loss"] == 3.0
-    assert scalar_metrics["action_token_accuracy"] == 0.5
+    assert scalar_loss.item() == expected_scalar
+    assert torch.equal(per_sample_loss, expected_per_sample)
+    assert policy.model.calls == [expected_call, expected_call]
+    if training_stage != "vlm_only":
+        assert scalar_metrics["flow_loss"] == 2.0
+    else:
+        assert "flow_loss" not in scalar_metrics
+    if training_stage != "action_expert_only":
+        assert scalar_metrics["action_token_ce_loss"] == 3.0
+        assert scalar_metrics["action_token_accuracy"] == 0.5
+    else:
+        assert "action_token_ce_loss" not in scalar_metrics
     assert per_sample_metrics["loss"] == scalar_metrics["loss"]
+
+
+def test_actionmem_config_validates_training_stages_and_legacy_alias():
+    assert ActionMemConfig(training_stage="vlm_only").training_stage == "vlm_only"
+    assert ActionMemConfig(train_expert_only=True).training_stage == "action_expert_only"
+
+    with pytest.raises(ValueError, match="training_stage must be one of"):
+        ActionMemConfig(training_stage="unknown")
+
+    with pytest.raises(ValueError, match="conflicts"):
+        ActionMemConfig(training_stage="vlm_only", train_expert_only=True)
+
+
+class _StageFreezeModel(ActionMemPytorch):
+    def __init__(self, training_stage):
+        nn.Module.__init__(self)
+        self.config = type("Config", (), {"training_stage": training_stage})()
+        self.paligemma_with_expert = nn.Module()
+        self.paligemma_with_expert.paligemma = nn.Linear(2, 2)
+        self.paligemma_with_expert.gemma_expert = nn.Linear(2, 2)
+        self.state_proj = nn.Linear(2, 2)
+        self.action_in_proj = nn.Linear(2, 2)
+        self.action_out_proj = nn.Linear(2, 2)
+        self.action_time_mlp_in = nn.Linear(2, 2)
+        self.action_time_mlp_out = nn.Linear(2, 2)
+
+
+@pytest.mark.parametrize(
+    ("training_stage", "vlm_trainable", "expert_trainable"),
+    [
+        ("vlm_only", True, False),
+        ("action_expert_only", False, True),
+        ("joint", True, True),
+    ],
+)
+def test_training_stage_freezes_the_inactive_branch(
+    training_stage,
+    vlm_trainable,
+    expert_trainable,
+):
+    model = _StageFreezeModel(training_stage)
+    model.configure_training_stage()
+
+    vlm_parameters = [
+        parameter for name, parameter in model.named_parameters() if model._is_vlm_parameter(name)
+    ]
+    expert_parameters = [
+        parameter for name, parameter in model.named_parameters() if model._is_action_expert_parameter(name)
+    ]
+    assert vlm_parameters and expert_parameters
+    assert all(parameter.requires_grad is vlm_trainable for parameter in vlm_parameters)
+    assert all(parameter.requires_grad is expert_trainable for parameter in expert_parameters)
 
 
 class _RestrictedHead(nn.Module):

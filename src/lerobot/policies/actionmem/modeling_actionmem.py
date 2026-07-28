@@ -583,7 +583,7 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
             precision=config.dtype,
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
-            train_expert_only=config.train_expert_only,
+            train_expert_only=config.training_stage == "action_expert_only",
         )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
@@ -592,6 +592,7 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
         self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
         self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        self.configure_training_stage()
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -602,6 +603,38 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
+
+    @staticmethod
+    def _is_vlm_parameter(name: str) -> bool:
+        return name.startswith("paligemma_with_expert.paligemma.")
+
+    @staticmethod
+    def _is_action_expert_parameter(name: str) -> bool:
+        return name.startswith("paligemma_with_expert.gemma_expert.") or name.startswith(
+            (
+                "state_proj.",
+                "action_in_proj.",
+                "action_out_proj.",
+                "action_time_mlp_in.",
+                "action_time_mlp_out.",
+            )
+        )
+
+    def configure_training_stage(self) -> int:
+        """Freeze the branch excluded by the configured training stage.
+
+        This is intentionally safe to call again after PEFT adapters have been
+        injected: adapter parameters inherit the same module-name prefixes and
+        are filtered along with the base parameters.
+        """
+        stage = self.config.training_stage
+        for name, parameter in self.named_parameters():
+            is_excluded = (stage == "vlm_only" and not self._is_vlm_parameter(name)) or (
+                stage == "action_expert_only" and not self._is_action_expert_parameter(name)
+            )
+            if is_excluded:
+                parameter.requires_grad_(False)
+        return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -879,13 +912,39 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         lang_masks,
         action_tokens,
         action_token_masks,
-        state,
-        actions,
-        noise,
-        time,
+        state=None,
+        actions=None,
+        noise=None,
+        time=None,
+        *,
+        compute_flow: bool = True,
+        compute_action_token: bool = True,
     ) -> dict[str, Tensor]:
-        """Compute flow matching and query-to-action-token training losses."""
+        """Compute the objectives required by the selected training stage."""
+        if not compute_flow and not compute_action_token:
+            raise ValueError("At least one ActionMem training objective must be enabled.")
         self._validate_action_token_sequence(action_tokens, action_token_masks)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            action_tokens,
+            action_token_masks,
+        )
+
+        if not compute_flow:
+            return self._forward_action_token_only(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+                action_tokens,
+                action_token_masks,
+            )
+
+        if state is None or actions is None or time is None:
+            raise ValueError("Flow training requires state, actions, and time tensors.")
         if noise is None:
             noise = self._make_training_flow_source(
                 action_tokens,
@@ -897,14 +956,6 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images,
-            img_masks,
-            lang_tokens,
-            lang_masks,
-            action_tokens,
-            action_token_masks,
-        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
 
         if (
@@ -946,6 +997,65 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
         flow_losses = F.mse_loss(u_t, v_t, reduction="none")
 
+        output = {"flow_losses": flow_losses}
+        if compute_action_token:
+            output.update(
+                self._compute_action_token_objective(
+                    prefix_out,
+                    action_tokens,
+                    action_token_masks,
+                )
+            )
+        return output
+
+    def _forward_action_token_only(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        action_tokens: Tensor,
+        action_token_masks: Tensor,
+    ) -> dict[str, Tensor]:
+        """Run only PaliGemma and the token head, skipping the flow branch."""
+        if (
+            self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        def forward_func(prefix_embs, attention_mask, position_ids):
+            (prefix_out, _), _ = self.paligemma_with_expert.forward(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=False,
+            )
+            return prefix_out
+
+        prefix_out = self._apply_checkpoint(
+            forward_func,
+            prefix_embs,
+            prefix_att_2d_masks_4d,
+            prefix_position_ids,
+        )
+        return self._compute_action_token_objective(
+            prefix_out,
+            action_tokens,
+            action_token_masks,
+        )
+
+    def _compute_action_token_objective(
+        self,
+        prefix_out: Tensor,
+        action_tokens: Tensor,
+        action_token_masks: Tensor,
+    ) -> dict[str, Tensor]:
         # The target is the final token and ACTION_QUERY is immediately before
         # it. Causal ActionMem attention prevents this hidden state from seeing
         # the target token.
@@ -960,7 +1070,6 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         return {
-            "flow_losses": flow_losses,
             "action_token_loss_per_sample": action_token_loss_per_sample,
             "action_token_target_mask": action_token_masks[:, -1].bool(),
             "action_token_ce_loss": action_token_ce_loss,
@@ -1138,6 +1247,21 @@ class ActionMemPolicy(PreTrainedPolicy):
 
         self.reset()
 
+    def configure_training_stage(self) -> int:
+        """Apply stage-specific freezing, including to injected PEFT adapters."""
+        num_trainable = self.model.configure_training_stage()
+        if num_trainable == 0:
+            raise RuntimeError(
+                f"ActionMem training_stage={self.config.training_stage!r} left no trainable parameters. "
+                "Check the PEFT target_modules for the selected branch."
+            )
+        logging.info(
+            "Configured ActionMem training_stage=%s with %d trainable parameters.",
+            self.config.training_stage,
+            num_trainable,
+        )
+        return num_trainable
+
     @classmethod
     def from_pretrained(
         cls: builtins.type[T],
@@ -1310,8 +1434,9 @@ class ActionMemPolicy(PreTrainedPolicy):
 
         return fixed_state_dict
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()
+    def get_optim_params(self):
+        self.configure_training_stage()
+        return (parameter for parameter in self.parameters() if parameter.requires_grad)
 
     def reset(self):
         """Reset internal state - called when environment resets."""
@@ -1471,6 +1596,9 @@ class ActionMemPolicy(PreTrainedPolicy):
                 - "mean": Return scalar mean loss (default, backward compatible)
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
+        if reduction not in {"mean", "none"}:
+            raise ValueError(f"Unsupported reduction {reduction!r}; expected 'mean' or 'none'.")
+
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
@@ -1481,10 +1609,13 @@ class ActionMemPolicy(PreTrainedPolicy):
                 f"ActionMem requires {ACTION_TOKENS} and {ACTION_TOKEN_MASK} in the processed batch.\n"
                 f"Got {batch.keys()}"
             )
-        state = self.prepare_state(batch)
-        actions = self.prepare_action(batch)
 
-        time = self.model.sample_time(actions.shape[0], actions.device)
+        stage = self.config.training_stage
+        compute_flow = stage in {"action_expert_only", "joint"}
+        compute_action_token = stage in {"vlm_only", "joint"}
+        state = self.prepare_state(batch) if compute_flow else None
+        actions = self.prepare_action(batch) if compute_flow else None
+        time = self.model.sample_time(actions.shape[0], actions.device) if compute_flow else None
 
         # Compute loss
         model_output = self.model.forward(
@@ -1498,45 +1629,78 @@ class ActionMemPolicy(PreTrainedPolicy):
             actions,
             None,
             time,
+            compute_flow=compute_flow,
+            compute_action_token=compute_action_token,
         )
 
-        # Truncate losses to actual action dimensions
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        flow_losses = model_output["flow_losses"][:, :, :original_action_dim]
-        flow_loss = flow_losses.mean()
-        action_token_ce_loss = model_output["action_token_ce_loss"]
+        scalar_terms: list[Tensor] = []
+        per_sample_terms: list[Tensor] = []
+        loss_dict: dict[str, float | list[float]] = {}
 
-        loss_dict = {
-            "loss_per_dim": flow_losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
-            "flow_loss": flow_loss.item(),
-            "action_token_ce_loss": action_token_ce_loss.item(),
-            "action_token_accuracy": model_output["action_token_accuracy"].item(),
-        }
+        if compute_flow:
+            # Truncate losses to actual action dimensions.
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            flow_losses = model_output["flow_losses"][:, :, :original_action_dim]
+            flow_loss = flow_losses.mean()
+            scalar_terms.append(self.config.flow_loss_weight * flow_loss)
+            per_sample_terms.append(self.config.flow_loss_weight * flow_losses.mean(dim=(1, 2)))
+            loss_dict.update(
+                {
+                    "loss_per_dim": flow_losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+                    "flow_loss": flow_loss.item(),
+                    "weighted_flow_loss": (self.config.flow_loss_weight * flow_loss).item(),
+                }
+            )
 
-        if reduction == "none":
+        if compute_action_token:
+            action_token_ce_loss = model_output["action_token_ce_loss"]
+            scalar_terms.append(self.config.action_token_loss_weight * action_token_ce_loss)
             # Normalize masked token losses so their batch mean matches the
             # valid-target mean used by the scalar reduction.
             target_mask = model_output["action_token_target_mask"]
             valid_count = target_mask.sum().clamp(min=1)
             token_loss_scale = target_mask.numel() / valid_count
             per_sample_token_loss = model_output["action_token_loss_per_sample"] * token_loss_scale
-            per_sample_flow_loss = flow_losses.mean(dim=(1, 2))
-            per_sample_loss = (
-                per_sample_flow_loss + self.config.action_token_loss_weight * per_sample_token_loss
+            per_sample_terms.append(self.config.action_token_loss_weight * per_sample_token_loss)
+            loss_dict.update(
+                {
+                    "action_token_ce_loss": action_token_ce_loss.item(),
+                    "weighted_action_token_ce_loss": (
+                        self.config.action_token_loss_weight * action_token_ce_loss
+                    ).item(),
+                    "action_token_accuracy": model_output["action_token_accuracy"].item(),
+                }
             )
+
+        if reduction == "none":
+            per_sample_loss = torch.stack(per_sample_terms, dim=0).sum(dim=0)
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
-        else:
-            loss = flow_loss + self.config.action_token_loss_weight * action_token_ce_loss
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+
+        loss = torch.stack(scalar_terms).sum()
+        loss_dict["loss"] = loss.item()
+        return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:
-        """Return default PEFT target modules for PI0 fine-tuning."""
+        """Return stage-aware default PEFT targets for ActionMem fine-tuning."""
+        vlm_targets = (
+            r".*\.paligemma_with_expert\."
+            r"(paligemma\.model\.language_model\.layers\.[0-9]+\.self_attn\.(q|v)_proj|"
+            r"paligemma\.lm_head|"
+            r"paligemma\.model\.language_model\.embed_tokens)"
+        )
         common_projections = (
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
-        target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
+        action_expert_targets = (
+            rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
+        )
+        if self.config.training_stage == "vlm_only":
+            target_modules = vlm_targets
+        elif self.config.training_stage == "action_expert_only":
+            target_modules = action_expert_targets
+        else:
+            target_modules = rf"({vlm_targets}|{action_expert_targets})"
         return {
             "target_modules": target_modules,
             "modules_to_save": [],
