@@ -1,5 +1,6 @@
 lerobot-train \
  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/actionmem-base \
+ --policy.training_stage=vlm_only \
  --policy.repo_id=actionmem \
  --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/actionmem \
  --dataset.repo_id=lqs \
@@ -9,7 +10,7 @@ lerobot-train \
  --policy.optimizer_lr=1e-4 \
  --policy.scheduler_decay_lr=1e-5 \
  --eval_step=0 \
- --steps=50000 \
+ --steps=80000 \
  --batch_size=4 \
  --policy.gradient_checkpointing=true \
  --policy.chunk_size=16 \
@@ -17,4 +18,13 @@ lerobot-train \
  --peft.method_type=LORA \
  --peft.target_modules='(.*\.paligemma_with_expert\.(paligemma\.model\.language_model\.layers\.[0-9]+\.self_attn\.(q|v)_proj|gemma_expert\.model\.layers\.[0-9]+\.self_attn\.(q|v)_proj|paligemma\.lm_head|paligemma\.model\.language_model\.embed_tokens)|model\.(state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out))' \
  --policy.push_to_hub=false \
+ --policy.tensorboard_enable=true \
+ --policy.tensorboard_log_dir=tensorboard \
+ --policy.tensorboard_log_freq=10 \
+ --policy.tensorboard_flush_secs=30 \
+ --policy.tensorboard_max_queue=10 \
+ --policy.tensorboard_filename_suffix=.actionmem \
+ --policy.tensorboard_log_parameters=false \
+ --policy.tensorboard_log_gradients=false \
+ --policy.tensorboard_histogram_freq=1000 \
  
