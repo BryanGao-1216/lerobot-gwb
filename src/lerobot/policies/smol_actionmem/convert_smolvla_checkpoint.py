@@ -42,7 +42,7 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 from .configuration_smol_actionmem import SmolActionMemConfig
 from .modeling_smol_actionmem import SmolActionMemPolicy
 from .processor_smol_actionmem import make_smol_actionmem_pre_post_processors
-from .tokenization_smol_actionmem import action_token_strings
+from .tokenization_smol_actionmem import select_low_frequency_token_ids
 
 
 def _parse_args() -> argparse.Namespace:
@@ -88,37 +88,39 @@ def _create_tokenizer_and_map(
 
     processor = AutoProcessor.from_pretrained(tokenizer_source)
     tokenizer = processor.tokenizer
-    tokens_to_add = action_token_strings(codebook_size)
-    tokenizer.add_tokens(tokens_to_add, special_tokens=True)
-
-    action_strings = tokens_to_add[:codebook_size]
-    action_ids = [int(tokenizer.convert_tokens_to_ids(token)) for token in action_strings]
+    action_ids, control_ids = select_low_frequency_token_ids(tokenizer, codebook_size)
+    action_strings = [str(tokenizer.convert_ids_to_tokens(token_id)) for token_id in action_ids]
     expected_ids = list(range(min(action_ids), min(action_ids) + codebook_size))
     if action_ids != expected_ids:
         raise ValueError(
-            "Action token IDs must form one new contiguous range; got "
+            "Action token IDs must form one existing contiguous range; got "
             f"{action_ids[:3]} ... {action_ids[-3:]}."
         )
 
-    control_strings = tokens_to_add[codebook_size:]
-    control_ids = [int(tokenizer.convert_tokens_to_ids(token)) for token in control_strings]
+    control_strings = [str(tokenizer.convert_ids_to_tokens(token_id)) for token_id in control_ids]
     if len(set(action_ids + control_ids)) != codebook_size + 3:
         raise ValueError("The tokenizer did not assign unique IDs to all Smol ActionMem tokens.")
 
     if vqvae_checkpoint is not None:
         vqvae["checkpoint_path"] = str(vqvae_checkpoint.expanduser().resolve())
 
-    # action_strings are added in q0=255..0 order. Therefore the last action
-    # ID is the reverse-mapping anchor for q0=0.
+    # q0 codes use the same reverse-contiguous formula as ActionMem: the
+    # highest selected action ID represents q0=0.
     token_map = {
         "format_version": 1,
-        "name": "smol_actionmem_q0_token_map",
-        "description": "Maps the first residual VQ codebook to an expanded SmolVLM vocabulary.",
+        "name": "smol_actionmem_q0_low_frequency_token_map",
+        "description": (
+            "Maps the first residual VQ codebook to existing high-rank, low-frequency "
+            "tokens in the SmolVLM base BPE vocabulary."
+        ),
         "vqvae": vqvae,
         "smolvlm": {
             "tokenizer_source": tokenizer_source,
-            "base_tokenizer_length": min(action_ids),
-            "expanded_tokenizer_length": len(tokenizer),
+            "base_vocab_size": int(tokenizer.vocab_size),
+            "tokenizer_length": len(tokenizer),
+            "vocabulary_strategy": "reuse_high_rank_base_bpe_tokens",
+            "reused_token_id_min": min(action_ids),
+            "reused_token_id_max": max(control_ids),
         },
         "action_tokens": {
             "count": codebook_size,
@@ -127,20 +129,20 @@ def _create_tokenizer_and_map(
             "anchor_token_id": max(action_ids),
             "token_id_min": min(action_ids),
             "token_id_max": max(action_ids),
-            "token_strings_by_ascending_id": action_strings,
+            "source_token_strings_by_ascending_id": action_strings,
         },
         "control_tokens": {
             "action_memory_start": {
                 "token_id": control_ids[0],
-                "token": control_strings[0],
+                "source_token": control_strings[0],
             },
             "action_memory_end": {
                 "token_id": control_ids[1],
-                "token": control_strings[1],
+                "source_token": control_strings[1],
             },
             "action_query": {
                 "token_id": control_ids[2],
-                "token": control_strings[2],
+                "source_token": control_strings[2],
             },
         },
         "padding": {

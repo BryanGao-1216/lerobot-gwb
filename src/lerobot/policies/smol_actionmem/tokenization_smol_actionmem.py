@@ -21,31 +21,43 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-
-ACTION_TOKEN_PREFIX = "<|action_"
-ACTION_MEMORY_START_TOKEN = "<|action_memory_start|>"
-ACTION_MEMORY_END_TOKEN = "<|action_memory_end|>"
-ACTION_QUERY_TOKEN = "<|action_query|>"
+from typing import Any
 
 
 def default_smol_action_token_map_path() -> Path:
     return Path(__file__).resolve().parents[6] / "models" / "smol_actionmem-base" / "token_map.json"
 
 
-def action_token_strings(codebook_size: int) -> list[str]:
-    """Return strings in the reverse-ID order used by the ActionMem mapping.
+def select_low_frequency_token_ids(tokenizer: Any, codebook_size: int) -> tuple[list[int], list[int]]:
+    """Reserve tail BPE IDs as action and control tokens without growing the vocabulary.
 
-    The first added ID represents the largest q0 code and the last action ID
-    represents q0 code 0, so ``token_id = anchor_token_id - q0_code`` remains
-    identical to the PaliGemma ActionMem protocol.
+    BPE token IDs are ordered by merge rank, so the tail of the base vocabulary
+    is a deterministic proxy for low-frequency tokens when corpus token counts
+    are unavailable. Added multimodal/special tokens live at IDs greater than
+    or equal to ``tokenizer.vocab_size`` and are intentionally excluded.
     """
-    width = max(3, len(str(codebook_size - 1)))
-    return [
-        *(f"{ACTION_TOKEN_PREFIX}{code:0{width}d}|>" for code in reversed(range(codebook_size))),
-        ACTION_MEMORY_START_TOKEN,
-        ACTION_MEMORY_END_TOKEN,
-        ACTION_QUERY_TOKEN,
-    ]
+    if codebook_size <= 0:
+        raise ValueError(f"codebook_size must be positive, got {codebook_size}.")
+
+    base_vocab_size = int(tokenizer.vocab_size)
+    required_count = codebook_size + 3
+    token_id_min = base_vocab_size - required_count
+    if token_id_min < 0:
+        raise ValueError(
+            f"Tokenizer base vocabulary ({base_vocab_size}) is too small to reserve "
+            f"{required_count} ActionMem tokens."
+        )
+
+    selected_ids = list(range(token_id_min, base_vocab_size))
+    special_ids = {int(token_id) for token_id in tokenizer.all_special_ids}
+    overlap = sorted(special_ids.intersection(selected_ids))
+    if overlap:
+        raise ValueError(
+            "The selected low-frequency BPE range overlaps tokenizer special tokens: "
+            f"{overlap}. Select an explicit non-special range instead."
+        )
+
+    return selected_ids[:codebook_size], selected_ids[codebook_size:]
 
 
 @dataclass(frozen=True)
@@ -156,5 +168,3 @@ class SmolActionMemTokenMap:
                 f"Action token ID must be in [{self.token_id_min}, {self.token_id_max}], got {token_id}."
             )
         return self.anchor_token_id - token_id
-
-

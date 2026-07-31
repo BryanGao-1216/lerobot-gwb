@@ -8,7 +8,7 @@ from lerobot.policies.smol_actionmem.processor_smol_actionmem import (
 )
 from lerobot.policies.smol_actionmem.tokenization_smol_actionmem import (
     SmolActionMemTokenMap,
-    action_token_strings,
+    select_low_frequency_token_ids,
 )
 from lerobot.processor.converters import create_transition
 from lerobot.types import TransitionKey
@@ -61,14 +61,18 @@ def _transition(q0=None, batch_size=2):
     )
 
 
-def test_action_token_strings_follow_reverse_mapping():
-    strings = action_token_strings(3)
-    assert strings[:3] == ["<|action_002|>", "<|action_001|>", "<|action_000|>"]
-    assert strings[-3:] == [
-        "<|action_memory_start|>",
-        "<|action_memory_end|>",
-        "<|action_query|>",
-    ]
+def test_select_low_frequency_token_ids_uses_tail_of_base_vocabulary():
+    tokenizer = type(
+        "Tokenizer",
+        (),
+        {
+            "vocab_size": 1000,
+            "all_special_ids": [0, 1, 2],
+        },
+    )()
+    action_ids, control_ids = select_low_frequency_token_ids(tokenizer, 256)
+    assert action_ids == list(range(741, 997))
+    assert control_ids == [997, 998, 999]
 
 
 def test_token_map_reports_required_vocabulary_size(tmp_path):
