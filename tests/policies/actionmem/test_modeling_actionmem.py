@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
+
 import pytest
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -163,12 +165,15 @@ class _DummyPaliGemma:
 class _DummyActionMem:
     def __init__(self):
         self.paligemma_with_expert = _DummyPaliGemma()
+        self.action_token_map = type("TokenMap", (), {"action_query_token_id": 9})()
+        self.state_token_proj = nn.Linear(2, 2, bias=False)
+        self.state_token_proj.weight.data.copy_(torch.eye(2))
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         return func(*args, **kwargs)
 
 
-def test_embed_prefix_places_causal_action_tokens_after_task_tokens():
+def test_embed_prefix_places_state_immediately_before_action_query():
     model = _DummyActionMem()
     images = [torch.tensor([[[1.0, 1.0], [2.0, 2.0]]])]
     image_masks = [torch.tensor([True])]
@@ -185,17 +190,20 @@ def test_embed_prefix_places_causal_action_tokens_after_task_tokens():
         language_masks,
         action_tokens,
         action_masks,
+        state=torch.tensor([[3.0, 4.0]]),
     )
 
-    assert embeddings.shape == (1, 9, 2)
-    assert torch.equal(embeddings[0, -4:, 0], action_tokens[0].float())
+    assert embeddings.shape == (1, 10, 2)
+    assert torch.equal(embeddings[0, 5:7, 0], torch.tensor([7.0, 8.0]))
+    assert torch.equal(embeddings[0, 7], torch.tensor([3.0, 4.0]))
+    assert torch.equal(embeddings[0, 8:, 0], torch.tensor([9.0, 256981.0]))
     assert torch.equal(
         pad_masks,
-        torch.tensor([[True, True, True, True, False, True, True, True, True]]),
+        torch.tensor([[True, True, True, True, False, True, True, True, True, True]]),
     )
     assert torch.equal(
         attention_blocks,
-        torch.tensor([[False, False, False, False, False, True, True, True, True]]),
+        torch.tensor([[False, False, False, False, False, True, True, True, True, True]]),
     )
 
 
@@ -278,7 +286,7 @@ def test_training_flow_source_decodes_valid_targets_and_falls_back_for_invalid()
     assert torch.equal(source[2], torch.full((2, 2), -1.0))
 
 
-def test_vlm_only_core_forward_skips_flow_source_and_expert_inputs():
+def test_vlm_only_core_forward_conditions_on_state_and_skips_flow_source():
     model = ActionMemPytorch.__new__(ActionMemPytorch)
     nn.Module.__init__(model)
     action_tokens = torch.tensor([[7, 9, 10], [7, 9, 8]])
@@ -291,7 +299,13 @@ def test_vlm_only_core_forward_skips_flow_source_and_expert_inputs():
     expected = {"action_token_ce_loss": torch.tensor(1.0)}
 
     model._validate_action_token_sequence = lambda *_: None
-    model.embed_prefix = lambda *_: prefix
+    captured = {}
+
+    def embed_prefix(*args, **kwargs):
+        captured["state"] = kwargs["state"]
+        return prefix
+
+    model.embed_prefix = embed_prefix
     model._forward_action_token_only = lambda *args: expected
     model._make_training_flow_source = lambda *_: pytest.fail("VLM-only must not build a flow source")
 
@@ -302,11 +316,13 @@ def test_vlm_only_core_forward_skips_flow_source_and_expert_inputs():
         lang_masks=torch.ones(2, 1, dtype=torch.bool),
         action_tokens=action_tokens,
         action_token_masks=action_token_masks,
+        state=torch.ones(2, 4),
         compute_flow=False,
         compute_action_token=True,
     )
 
     assert output is expected
+    assert torch.equal(captured["state"], torch.ones(2, 4))
 
 
 def test_gradient_checkpointing_configures_paligemma_decoder_layers():
@@ -368,6 +384,7 @@ class _DummyTrainingCore(nn.Module):
     def __init__(self):
         super().__init__()
         self.calls = []
+        self.states = []
 
     def sample_noise(self, shape, device):
         return torch.zeros(shape, device=device)
@@ -392,6 +409,7 @@ class _DummyTrainingCore(nn.Module):
         compute_action_token,
     ):
         self.calls.append((compute_flow, compute_action_token))
+        self.states.append(state)
         device = actions.device if actions is not None else action_tokens.device
         del (
             images,
@@ -400,7 +418,6 @@ class _DummyTrainingCore(nn.Module):
             language_masks,
             action_tokens,
             action_token_masks,
-            state,
             noise,
             time,
         )
@@ -465,6 +482,7 @@ def test_policy_training_stages_select_objectives_for_both_reductions(
     assert scalar_loss.item() == expected_scalar
     assert torch.equal(per_sample_loss, expected_per_sample)
     assert policy.model.calls == [expected_call, expected_call]
+    assert all(torch.equal(state, batch[OBS_STATE]) for state in policy.model.states)
     if training_stage != "vlm_only":
         assert scalar_metrics["flow_loss"] == 2.0
     else:
@@ -495,6 +513,7 @@ class _StageFreezeModel(ActionMemPytorch):
         self.paligemma_with_expert = nn.Module()
         self.paligemma_with_expert.paligemma = nn.Linear(2, 2)
         self.paligemma_with_expert.gemma_expert = nn.Linear(2, 2)
+        self.state_token_proj = nn.Linear(2, 2)
         self.state_proj = nn.Linear(2, 2)
         self.action_in_proj = nn.Linear(2, 2)
         self.action_out_proj = nn.Linear(2, 2)
@@ -527,6 +546,27 @@ def test_training_stage_freezes_the_inactive_branch(
     assert vlm_parameters and expert_parameters
     assert all(parameter.requires_grad is vlm_trainable for parameter in vlm_parameters)
     assert all(parameter.requires_grad is expert_trainable for parameter in expert_parameters)
+
+
+@pytest.mark.parametrize(
+    ("training_stage", "state_token_targeted", "expert_state_targeted"),
+    [
+        ("vlm_only", True, False),
+        ("action_expert_only", False, True),
+        ("joint", True, True),
+    ],
+)
+def test_default_peft_targets_cover_stage_specific_state_projections(
+    training_stage,
+    state_token_targeted,
+    expert_state_targeted,
+):
+    policy = ActionMemPolicy.__new__(ActionMemPolicy)
+    policy.config = type("Config", (), {"training_stage": training_stage})()
+    pattern = policy._get_default_peft_targets()["target_modules"]
+
+    assert bool(re.fullmatch(pattern, "model.state_token_proj")) is state_token_targeted
+    assert bool(re.fullmatch(pattern, "model.state_proj")) is expert_state_targeted
 
 
 class _RestrictedHead(nn.Module):
@@ -626,7 +666,7 @@ def test_inference_generates_restricted_token_and_adds_it_to_prefix_cache(monkey
     )()
     model.rtc_processor = None
     model.paligemma_with_expert = _DummyInferencePaliGemma()
-    model.embed_prefix = lambda *args: (
+    model.embed_prefix = lambda *args, **kwargs: (
         torch.ones(1, 5, 2),
         torch.ones(1, 5, dtype=torch.bool),
         torch.zeros(1, 5, dtype=torch.bool),

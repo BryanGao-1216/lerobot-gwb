@@ -589,6 +589,10 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
+        # PaliGemma and the action expert use different hidden widths (2048 vs
+        # 1024 by default), so state needs a dedicated projection when it is
+        # inserted into the VLM prefix before ACTION_QUERY.
+        self.state_token_proj = nn.Linear(config.max_state_dim, paligemma_config.width)
         self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
         self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
         self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -606,7 +610,7 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     @staticmethod
     def _is_vlm_parameter(name: str) -> bool:
-        return name.startswith("paligemma_with_expert.paligemma.")
+        return name.startswith(("paligemma_with_expert.paligemma.", "state_token_proj."))
 
     @staticmethod
     def _is_action_expert_parameter(name: str) -> bool:
@@ -792,8 +796,9 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         lang_masks,
         action_tokens=None,
         action_token_masks=None,
+        state=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images, task tokens, then the causal ActionMem token segment."""
+        """Embed images/task/memory/state/query/target in causal order."""
         embs = []
         pad_masks = []
         att_masks = []
@@ -823,7 +828,10 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        if action_tokens is not None:
+        if action_tokens is None:
+            if state is not None:
+                raise ValueError("ActionMem state prefix conditioning requires ACTION_QUERY.")
+        else:
             if action_token_masks is None or action_tokens.shape != action_token_masks.shape:
                 raise ValueError(
                     "action_tokens and action_token_masks must have the same shape, got "
@@ -835,12 +843,48 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
                 return self.paligemma_with_expert.embed_language_tokens(action_tokens)
 
             action_token_emb = self._apply_checkpoint(action_token_embed_func, action_tokens)
-            embs.append(action_token_emb)
-            pad_masks.append(action_token_masks.bool())
+            query_offsets = (
+                (action_tokens == self.action_token_map.action_query_token_id) & action_token_masks.bool()
+            ).to(torch.int64)
+            if not torch.all(query_offsets.sum(dim=1) == 1):
+                raise ValueError("Each ActionMem prefix must contain exactly one valid ACTION_QUERY.")
+            query_indices = query_offsets.argmax(dim=1)
+            if not torch.all(query_indices == query_indices[0]):
+                raise ValueError("ACTION_QUERY must have the same sequence position across a batch.")
+            query_index = int(query_indices[0].item())
 
-            # Each valid action-side token opens a new causal block. Consequently,
-            # ACTION_QUERY cannot attend to the current action-token target.
-            att_masks += [1] * action_token_emb.shape[1]
+            # Keep memory/history tokens immediately after the instruction.
+            if query_index > 0:
+                embs.append(action_token_emb[:, :query_index])
+                pad_masks.append(action_token_masks[:, :query_index].bool())
+                att_masks += [1] * query_index
+
+            # Insert current proprioception immediately before ACTION_QUERY.
+            if state is None:
+                raise ValueError("ActionMem requires state before ACTION_QUERY.")
+            if self.state_token_proj.weight.dtype == torch.float32:
+                state = state.to(torch.float32)
+
+            def state_token_proj_func(state):
+                return self.state_token_proj(state)
+
+            state_token_emb = self._apply_checkpoint(state_token_proj_func, state)
+            state_token_emb = state_token_emb.to(dtype=lang_emb.dtype)
+            embs.append(state_token_emb[:, None, :])
+            state_token_mask = torch.ones(
+                state_token_emb.shape[0],
+                1,
+                dtype=torch.bool,
+                device=state_token_emb.device,
+            )
+            pad_masks.append(state_token_mask)
+            att_masks += [1]
+
+            # ACTION_QUERY and its training target remain causal. The query can
+            # attend to memory and state but not to the target appended after it.
+            embs.append(action_token_emb[:, query_index:])
+            pad_masks.append(action_token_masks[:, query_index:].bool())
+            att_masks += [1] * (action_token_emb.shape[1] - query_index)
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -934,6 +978,8 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         if not compute_flow and not compute_action_token:
             raise ValueError("At least one ActionMem training objective must be enabled.")
         self._validate_action_token_sequence(action_tokens, action_token_masks)
+        if state is None:
+            raise ValueError("ActionMem requires state for action-token and flow conditioning.")
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images,
@@ -942,6 +988,7 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
             lang_masks,
             action_tokens,
             action_token_masks,
+            state=state,
         )
 
         if not compute_flow:
@@ -1124,6 +1171,7 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
             lang_masks,
             action_prompt_tokens,
             action_prompt_masks,
+            state=state,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -1358,6 +1406,24 @@ class ActionMemPolicy(PreTrainedPolicy):
 
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
+
+            # PI0/older ActionMem checkpoints predate VLM-side state
+            # conditioning. Preserve this model's initialized projection so
+            # strict loading remains backward compatible.
+            initialized_keys = []
+            initialized_state_projection = {
+                "model.state_token_proj.weight": model.model.state_token_proj.weight.detach().clone(),
+                "model.state_token_proj.bias": model.model.state_token_proj.bias.detach().clone(),
+            }
+            for key, value in initialized_state_projection.items():
+                if key not in remapped_state_dict:
+                    remapped_state_dict[key] = value
+                    initialized_keys.append(key)
+            if initialized_keys:
+                print(
+                    "Initialized new ActionMem VLM state projection absent from checkpoint: "
+                    + ", ".join(initialized_keys)
+                )
 
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
@@ -1627,7 +1693,7 @@ class ActionMemPolicy(PreTrainedPolicy):
         stage = self.config.training_stage
         compute_flow = stage in {"action_expert_only", "joint"}
         compute_action_token = stage in {"vlm_only", "joint"}
-        state = self.prepare_state(batch) if compute_flow else None
+        state = self.prepare_state(batch)
         actions = self.prepare_action(batch) if compute_flow else None
         time = self.model.sample_time(actions.shape[0], actions.device) if compute_flow else None
 
@@ -1697,12 +1763,13 @@ class ActionMemPolicy(PreTrainedPolicy):
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return stage-aware default PEFT targets for ActionMem fine-tuning."""
-        vlm_targets = (
+        paligemma_targets = (
             r".*\.paligemma_with_expert\."
             r"(paligemma\.model\.language_model\.layers\.[0-9]+\.self_attn\.(q|v)_proj|"
             r"paligemma\.lm_head|"
             r"paligemma\.model\.language_model\.embed_tokens)"
         )
+        vlm_targets = rf"({paligemma_targets}|model\.state_token_proj)"
         common_projections = (
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )

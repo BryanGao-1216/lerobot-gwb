@@ -198,7 +198,9 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
 
     @staticmethod
     def _is_vlm_parameter(name: str) -> bool:
-        return name.startswith("vlm_with_expert.vlm.")
+        # state_proj is shared: it conditions both action-token generation and
+        # the flow expert, so it must remain trainable in vlm_only as well.
+        return name.startswith(("vlm_with_expert.vlm.", "state_proj."))
 
     @staticmethod
     def _is_action_expert_parameter(name: str) -> bool:
@@ -366,10 +368,11 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         action_token_masks,
         state=None,
     ):
-        """Embed image/task/action tokens/state in that order.
+        """Embed image/task/action-memory/state/query/target in that order.
 
         ACTION_QUERY is causal and therefore cannot observe the current target
-        or the state token appended after it.
+        appended after it, but it can observe action memory and the current
+        robot state placed immediately before it.
         """
         embs = []
         pad_masks = []
@@ -413,16 +416,22 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
 
         action_token_emb = self.vlm_with_expert.embed_language_tokens(action_tokens)
         action_token_emb = action_token_emb * math.sqrt(action_token_emb.shape[-1])
-        action_base_position = sum(embedding.shape[1] for embedding in embs)
         query_offsets = (
             (action_tokens == self.action_token_map.action_query_token_id) & action_token_masks.bool()
         ).to(torch.int64)
         if not torch.all(query_offsets.sum(dim=1) == 1):
             raise ValueError("Each Smol ActionMem prefix must contain exactly one valid ACTION_QUERY.")
-        query_positions = query_offsets.argmax(dim=1) + action_base_position
-        embs.append(action_token_emb)
-        pad_masks.append(action_token_masks.bool())
-        att_masks += [1] * action_token_emb.shape[1]
+        query_indices = query_offsets.argmax(dim=1)
+        if not torch.all(query_indices == query_indices[0]):
+            raise ValueError("ACTION_QUERY must have the same sequence position across a batch.")
+        query_index = int(query_indices[0].item())
+
+        # Keep memory/control tokens after the task, then insert the current
+        # state immediately before ACTION_QUERY.
+        if query_index > 0:
+            embs.append(action_token_emb[:, :query_index])
+            pad_masks.append(action_token_masks[:, :query_index].bool())
+            att_masks += [1] * query_index
 
         if state is not None:
             state = state.to(dtype=self.state_proj.weight.dtype)
@@ -438,6 +447,12 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
                 )
             )
             att_masks += [1] * state_emb.shape[1]
+
+        action_base_position = sum(embedding.shape[1] for embedding in embs)
+        query_positions = torch.full_like(query_indices, action_base_position)
+        embs.append(action_token_emb[:, query_index:])
+        pad_masks.append(action_token_masks[:, query_index:].bool())
+        att_masks += [1] * (action_token_emb.shape[1] - query_index)
 
         embeddings = torch.cat(embs, dim=1)
         padding_masks = torch.cat(pad_masks, dim=1)
@@ -494,6 +509,8 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         if not compute_flow and not compute_action_token:
             raise ValueError("At least one Smol ActionMem objective must be enabled.")
         self._validate_action_token_sequence(action_tokens, action_token_masks)
+        if state is None:
+            raise ValueError("Smol ActionMem requires state for action-token and flow conditioning.")
 
         if not compute_flow:
             prefix_embs, prefix_pad_masks, prefix_att_masks, query_positions = self.embed_prefix(
@@ -503,6 +520,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
                 lang_masks,
                 action_tokens,
                 action_token_masks,
+                state=state,
             )
             prefix_attention = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
             position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -584,7 +602,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         self._validate_action_token_sequence(action_tokens, action_token_masks)
         num_steps = num_steps or self.config.num_inference_steps
 
-        # First pass: generate from ACTION_QUERY without putting state after it.
+        # First pass: generate from ACTION_QUERY conditioned on the current state.
         action_prompt_tokens = action_tokens[:, :-1]
         action_prompt_masks = action_token_masks[:, :-1]
         prefix_embs, prefix_pad_masks, prefix_att_masks, query_positions = self.embed_prefix(
@@ -594,6 +612,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             lang_masks,
             action_prompt_tokens,
             action_prompt_masks,
+            state=state,
         )
         prefix_attention = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_positions = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -615,9 +634,9 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             self.action_token_map.token_id_max,
         )
 
-        # SmolVLA's mixed self/cross cache does not support inserting a new VLM
-        # token in the middle of an existing prefix. Rebuild once with the
-        # generated token followed by state, then cache that complete prefix.
+        # SmolVLA's mixed self/cross cache does not support appending a generated
+        # VLM token to the existing mixed prefix. Rebuild once with the same
+        # memory/state/query ordering and cache that complete prefix.
         generated_sequence = torch.cat([action_prompt_tokens, generated_action_token], dim=1)
         generated_masks = torch.cat(
             [
@@ -754,7 +773,7 @@ class SmolActionMemPolicy(SmolVLAPolicy):
         stage = self.config.training_stage
         compute_flow = stage in {"action_expert_only", "joint"}
         compute_action_token = stage in {"vlm_only", "joint"}
-        state = self.prepare_state(batch) if compute_flow else None
+        state = self.prepare_state(batch)
         actions = self.prepare_action(batch) if compute_flow else None
         if compute_flow and time is None:
             time = self.model.sample_time(actions.shape[0], actions.device)

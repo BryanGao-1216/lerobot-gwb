@@ -16,7 +16,7 @@ lerobot-train \
  --policy.chunk_size=16 \
  --policy.n_action_steps=16 \
  --peft.method_type=LORA \
- --peft.target_modules='(.*\.paligemma_with_expert\.(paligemma\.(model\.language_model\.(layers\.[0-9]+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)|embed_tokens)|lm_head)|gemma_expert\.model\.layers\.[0-9]+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj))|model\.(state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out))' \
+ --peft.target_modules='(.*\.paligemma_with_expert\.(paligemma\.(model\.language_model\.(layers\.[0-9]+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)|embed_tokens)|lm_head)|gemma_expert\.model\.layers\.[0-9]+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj))|model\.(state_token_proj|state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out))' \
  --policy.push_to_hub=false \
  --policy.tensorboard_enable=true \
  --policy.tensorboard_log_dir=tensorboard \

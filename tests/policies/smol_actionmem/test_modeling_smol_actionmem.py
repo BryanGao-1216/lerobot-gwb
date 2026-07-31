@@ -28,7 +28,7 @@ class _DummyVLM:
         return tokens.float().unsqueeze(-1).expand(-1, -1, 4)
 
 
-def test_embed_prefix_orders_action_tokens_after_task_and_before_state():
+def test_embed_prefix_orders_state_before_action_tokens():
     model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
     model.vlm_with_expert = _DummyVLM()
@@ -49,8 +49,10 @@ def test_embed_prefix_orders_action_tokens_after_task_and_before_state():
     )
 
     assert embeddings.shape == (1, 10, 4)
-    assert torch.equal(embeddings[0, 5:9, 0] / 2, torch.tensor([356.0, 357.0, 358.0, 355.0]))
-    assert query_positions.item() == 7
+    assert torch.equal(embeddings[0, 5:7, 0] / 2, torch.tensor([356.0, 357.0]))
+    assert torch.equal(embeddings[0, 7], torch.tensor([1.0, 2.0, 0.0, 0.0]))
+    assert torch.equal(embeddings[0, 8:10, 0] / 2, torch.tensor([358.0, 355.0]))
+    assert query_positions.item() == 8
     assert torch.equal(
         padding,
         torch.tensor([[True, True, True, True, False, True, True, True, True, True]]),
@@ -87,19 +89,28 @@ class _StageModel(SmolActionMemFlowMatching):
 def test_training_stage_selects_branch(stage, vlm_trainable, expert_trainable):
     model = _StageModel(stage)
     model.configure_training_stage()
-    vlm = [parameter for name, parameter in model.named_parameters() if model._is_vlm_parameter(name)]
-    expert = [
-        parameter for name, parameter in model.named_parameters() if model._is_action_expert_parameter(name)
+    vlm = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if name.startswith("vlm_with_expert.vlm.")
     ]
+    expert = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if model._is_action_expert_parameter(name) and not name.startswith("state_proj.")
+    ]
+    state_projection = [parameter for name, parameter in model.named_parameters() if name.startswith("state_proj.")]
     assert vlm and expert
     assert all(parameter.requires_grad is vlm_trainable for parameter in vlm)
     assert all(parameter.requires_grad is expert_trainable for parameter in expert)
+    assert state_projection and all(parameter.requires_grad for parameter in state_projection)
 
 
 class _DummyCore(nn.Module):
     def __init__(self):
         super().__init__()
         self.calls = []
+        self.states = []
 
     def sample_time(self, batch_size, device):
         return torch.zeros(batch_size, device=device)
@@ -127,11 +138,11 @@ class _DummyCore(nn.Module):
             language_masks,
             action_tokens,
             action_token_masks,
-            state,
             noise,
             time,
         )
         self.calls.append((compute_flow, compute_action_token))
+        self.states.append(state)
         device = actions.device if actions is not None else torch.device("cpu")
         output = {}
         if compute_flow:
@@ -186,6 +197,7 @@ def test_policy_training_stages_select_losses(stage, expected, call):
     loss, metrics = policy.forward(batch)
     assert loss.item() == expected
     assert policy.model.calls == [call]
+    assert torch.equal(policy.model.states[0], batch[OBS_STATE])
     assert metrics["loss"] == expected
 
 
