@@ -8,9 +8,9 @@ lerobot-train \
   --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/LIBERO-90 \
   --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-0731 \
   --steps=100000 \
-  --policy.optimizer_grad_clip_norm=20 \
+  --policy.optimizer_grad_clip_norm=5 \
   --batch_size=16 \
   --eval_step=0 \
-  --policy.gradient_checkpointing=true \
+  --policy.gradient_checkpointing=false \
   --policy.tensorboard_enable=true \
   --policy.push_to_hub=false
