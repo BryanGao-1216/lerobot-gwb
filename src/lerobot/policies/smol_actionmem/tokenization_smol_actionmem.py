@@ -156,3 +156,5 @@ class SmolActionMemTokenMap:
                 f"Action token ID must be in [{self.token_id_min}, {self.token_id_max}], got {token_id}."
             )
         return self.anchor_token_id - token_id
+
+

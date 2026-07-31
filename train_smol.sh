@@ -1,0 +1,15 @@
+lerobot-train \
+  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-base \
+  --policy.train_expert_only=false \
+  --policy.training_stage=vlm_only \
+  --policy.input_features=null \
+  --policy.output_features=null \
+  --dataset.repo_id=lqs \
+  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/LIBERO-90 \
+  --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem \
+  --steps=10 \
+  --batch_size=1 \
+  --eval_step=0 \
+  --policy.gradient_checkpointing=true \
+  --policy.tensorboard_enable=true \
+  --policy.push_to_hub=false
