@@ -30,6 +30,7 @@ class SmolActionMemConfig(SmolVLAConfig):
 
     chunk_size: int = 16
     n_action_steps: int = 16
+    drop_n_last_frames: int = 15
     num_inference_steps: int = 10
     time_sampling_beta_alpha: float = 1.5
     time_sampling_beta_beta: float = 1.0
