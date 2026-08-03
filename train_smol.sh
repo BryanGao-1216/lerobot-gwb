@@ -1,15 +1,15 @@
 lerobot-train \
-  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-base \
+  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-0803-L-90/checkpoints/last/pretrained_model \
   --policy.train_expert_only=false \
   --policy.training_stage=vlm_only \
   --policy.input_features=null \
   --policy.output_features=null \
   --dataset.repo_id=lqs \
-  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/LIBERO-90 \
-  --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-0731 \
+  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/MANISKILL \
+  --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-0803-MS \
   --steps=100000 \
   --policy.optimizer_grad_clip_norm=5 \
-  --batch_size=16 \
+  --batch_size=64 \
   --eval_step=0 \
   --policy.gradient_checkpointing=false \
   --policy.tensorboard_enable=true \
