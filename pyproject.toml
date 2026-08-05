@@ -119,6 +119,11 @@ training = [
     "wandb>=0.24.0,<0.28.0",
     "lerobot[accelerate-dep]",
 ]
+rlds = [
+    # Optional multi-RLDS/OXE input backend used by ActionMem policies.
+    "tensorflow>=2.18.0,<2.22.0",
+    "tensorflow-datasets>=4.9.3,<5.0.0",
+]
 hardware = [
     "lerobot[pynput-dep]",
     "lerobot[pyserial-dep]",
@@ -375,7 +380,11 @@ torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 
 [tool.setuptools.package-data]
-lerobot = ["envs/*.json", "annotations/steerable_pipeline/prompts/*.txt"]
+lerobot = [
+    "envs/*.json",
+    "annotations/steerable_pipeline/prompts/*.txt",
+    "datasets/rlds/VQ_VLA_LICENSE",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -38,6 +38,12 @@ def _choose_group_count(channels: int, requested_groups: int) -> int:
     return 1
 
 
+def _squared_distance(x: Tensor, codebook: Tensor) -> Tensor:
+    return (
+        x.pow(2).sum(dim=-1, keepdim=True) - 2 * x @ codebook.t() + codebook.pow(2).sum(dim=-1).unsqueeze(0)
+    )
+
+
 def _pixel_shuffle_2d(x: Tensor, time_factor: int = 2, action_factor: int = 2) -> Tensor:
     if time_factor == 1 and action_factor == 1:
         return x
@@ -140,6 +146,122 @@ class ResBlock2D(nn.Module):
         x = self.conv1(F.silu(self.norm1(x)))
         x = self.conv2(self.dropout(F.silu(self.norm2(x))))
         return x + residual
+
+
+class DownStage2D(nn.Module):
+    """Encoder down block used by the trained action VQ-VAE."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_layers: int,
+        downsample: bool,
+        norm_groups: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        current_channels = in_channels
+        for _ in range(num_layers):
+            layers.append(
+                ResBlock2D(
+                    current_channels,
+                    out_channels,
+                    norm_groups=norm_groups,
+                    dropout=dropout,
+                )
+            )
+            current_channels = out_channels
+        self.blocks = nn.Sequential(*layers)
+        self.downsample = (
+            CausalConv2d(out_channels, out_channels, kernel_size=3, stride=2) if downsample else nn.Identity()
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.downsample(self.blocks(x))
+
+
+class VQVLALikeEncoder(nn.Module):
+    """Encoder architecture matching the action VQ-VAE training implementation."""
+
+    def __init__(
+        self,
+        horizon: int,
+        action_dim: int,
+        in_channels: int,
+        latent_dim: int,
+        block_out_channels: tuple[int, ...],
+        layers_per_block: tuple[int, ...],
+        encoder_out_channels: int,
+        norm_groups: int,
+        dropout: float,
+        num_res_blocks: int,
+    ) -> None:
+        super().__init__()
+        if not block_out_channels:
+            raise ValueError("block_out_channels must not be empty")
+
+        self.horizon = horizon
+        self.action_dim = action_dim
+        self.in_channels = in_channels
+        self.conv_in = CausalConv2d(in_channels, block_out_channels[0], kernel_size=3)
+
+        stages: list[nn.Module] = []
+        current_channels = block_out_channels[0]
+        for index, out_channels in enumerate(block_out_channels):
+            stages.append(
+                DownStage2D(
+                    in_channels=current_channels,
+                    out_channels=out_channels,
+                    num_layers=_layer_count(layers_per_block, index),
+                    downsample=index < len(block_out_channels) - 1,
+                    norm_groups=norm_groups,
+                    dropout=dropout,
+                )
+            )
+            current_channels = out_channels
+        self.stages = nn.Sequential(*stages)
+        self.mid_blocks = nn.Sequential(
+            *[
+                ResBlock2D(
+                    block_out_channels[-1],
+                    block_out_channels[-1],
+                    norm_groups=norm_groups,
+                    dropout=dropout,
+                )
+                for _ in range(num_res_blocks)
+            ]
+        )
+        self.norm_out = CausalGroupNorm(
+            _choose_group_count(block_out_channels[-1], norm_groups),
+            block_out_channels[-1],
+            eps=1e-6,
+        )
+        self.conv_out = CausalConv2d(block_out_channels[-1], encoder_out_channels, kernel_size=3)
+
+        bottleneck_height = horizon
+        bottleneck_width = action_dim
+        for _ in range(len(block_out_channels) - 1):
+            bottleneck_height = _ceil_div_2(bottleneck_height)
+            bottleneck_width = _ceil_div_2(bottleneck_width)
+        flat_dim = encoder_out_channels * bottleneck_height * bottleneck_width
+        self.to_latent = nn.Identity() if flat_dim == latent_dim else nn.Linear(flat_dim, latent_dim)
+
+    def forward(self, action: Tensor) -> Tensor:
+        if action.ndim != 4:
+            raise ValueError(f"Expected encoded action input [B, C, T, A], got {tuple(action.shape)}")
+        if action.shape[1] != self.in_channels:
+            raise ValueError(f"Expected {self.in_channels} encoder channels, got {action.shape[1]}")
+        if action.shape[-2:] != (self.horizon, self.action_dim):
+            raise ValueError(
+                f"Expected action tail shape {(self.horizon, self.action_dim)}, got {tuple(action.shape[-2:])}"
+            )
+        x = self.conv_in(action)
+        x = self.stages(x)
+        x = self.mid_blocks(x)
+        x = self.conv_out(F.silu(self.norm_out(x)))
+        return self.to_latent(x.reshape(x.shape[0], -1))
 
 
 class OfficialLikeUpStage2D(nn.Module):
@@ -303,6 +425,71 @@ class ActionVQVAEQ0Decoder(nn.Module):
         return actions
 
 
+class ActionVQVAEQ0Encoder(nn.Module):
+    """Encode action chunks and return the nearest code from q0 only."""
+
+    def __init__(
+        self,
+        encoder: VQVLALikeEncoder,
+        q0_codebook: Tensor,
+        time_emb: Tensor | None,
+        xyz_emb: Tensor | None,
+        euler_emb: Tensor | None,
+        gripper_emb: Tensor | None,
+        action_mean: Tensor,
+        action_std: Tensor,
+        normalize_actions: bool,
+        use_action_type_pe: bool,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.register_buffer("q0_codebook", q0_codebook)
+        self.register_buffer("time_emb", time_emb)
+        self.register_buffer("xyz_emb", xyz_emb)
+        self.register_buffer("euler_emb", euler_emb)
+        self.register_buffer("gripper_emb", gripper_emb)
+        self.register_buffer("action_mean", action_mean)
+        self.register_buffer("action_std", action_std)
+        self.normalize_actions = normalize_actions
+        self.use_action_type_pe = use_action_type_pe
+        self.horizon = encoder.horizon
+        self.action_dim = encoder.action_dim
+        self.codebook_size = q0_codebook.shape[0]
+
+    def forward(self, actions: Tensor) -> Tensor:
+        actions = actions.to(device=self.q0_codebook.device, dtype=torch.float32)
+        if actions.ndim != 3 or actions.shape[1:] != (self.horizon, self.action_dim):
+            raise ValueError(
+                f"Expected action chunks [B, {self.horizon}, {self.action_dim}], got {tuple(actions.shape)}"
+            )
+        if self.normalize_actions:
+            actions = (actions - self.action_mean.view(1, 1, -1)) / self.action_std.clamp_min(1e-6).view(
+                1, 1, -1
+            )
+
+        encoder_input = actions.unsqueeze(1)
+        if self.encoder.in_channels == 1:
+            pass
+        elif self.time_emb is None:
+            raise ValueError("The VQ-VAE encoder expects positional channels, but time_emb is unavailable.")
+        elif self.use_action_type_pe:
+            if self.xyz_emb is None or self.euler_emb is None or self.gripper_emb is None:
+                raise ValueError("Action-type positional embeddings are enabled but unavailable.")
+            action_type_emb = torch.cat([self.xyz_emb, self.euler_emb, self.gripper_emb], dim=-1)
+            encoder_input = encoder_input + action_type_emb.to(
+                device=encoder_input.device, dtype=encoder_input.dtype
+            )
+        if self.encoder.in_channels != 1:
+            time_emb = self.time_emb.permute(0, 2, 1, 3)
+            encoder_input = encoder_input + time_emb.to(
+                device=encoder_input.device, dtype=encoder_input.dtype
+            )
+
+        latents = self.encoder(encoder_input)
+        distances = _squared_distance(latents.float(), self.q0_codebook.float())
+        return distances.argmin(dim=-1)
+
+
 def _load_checkpoint(path: Path) -> Mapping[str, Any]:
     try:
         checkpoint = torch.load(
@@ -403,6 +590,82 @@ def load_action_vqvae_q0_decoder(checkpoint_path: str | Path) -> ActionVQVAEQ0De
         action_mean=state_dict["action_mean"].detach(),
         action_std=state_dict["action_std"].detach(),
         normalize_actions=bool(config.get("normalize_actions", False)),
+    )
+    model.requires_grad_(False)
+    model.eval()
+    return model
+
+
+def load_action_vqvae_q0_encoder(checkpoint_path: str | Path) -> ActionVQVAEQ0Encoder:
+    """Load the frozen encoder, positional embeddings, and first codebook."""
+    resolved_path = Path(checkpoint_path).expanduser().resolve()
+    if not resolved_path.is_file():
+        raise FileNotFoundError(f"Action VQ-VAE checkpoint does not exist: {resolved_path}")
+
+    checkpoint = _load_checkpoint(resolved_path)
+    config = checkpoint.get("config")
+    state_dict = checkpoint.get("model")
+    if not isinstance(config, Mapping) or not isinstance(state_dict, Mapping):
+        raise ValueError(
+            f"Action VQ-VAE checkpoint {resolved_path} must contain 'config' and 'model' mappings."
+        )
+
+    horizon = int(config["horizon"])
+    action_dim = int(config["action_dim"])
+    latent_dim = int(config.get("latent_dim", 128))
+    block_out_channels = tuple(int(value) for value in config.get("block_out_channels", (128, 256, 256, 512)))
+    layers_per_block = tuple(int(value) for value in config.get("layers_per_block", (4, 4, 4, 4)))
+    encoder_out_channels = int(config.get("encoder_out_channels", 128))
+    encoder_conv_weight = state_dict.get("encoder.conv_in.conv.weight")
+    if not isinstance(encoder_conv_weight, Tensor):
+        raise ValueError(
+            f"Action VQ-VAE checkpoint {resolved_path} is missing 'encoder.conv_in.conv.weight'."
+        )
+    encoder_in_channels = int(encoder_conv_weight.shape[1])
+    time_emb = state_dict.get("time_emb")
+    if encoder_in_channels != 1 and not isinstance(time_emb, Tensor):
+        raise ValueError(f"Action VQ-VAE checkpoint {resolved_path} is missing 'time_emb'.")
+    encoder = VQVLALikeEncoder(
+        horizon=horizon,
+        action_dim=action_dim,
+        in_channels=encoder_in_channels,
+        latent_dim=latent_dim,
+        block_out_channels=block_out_channels,
+        layers_per_block=layers_per_block,
+        encoder_out_channels=encoder_out_channels,
+        norm_groups=int(config.get("norm_groups", 32)),
+        dropout=float(config.get("dropout", 0.0)),
+        num_res_blocks=int(config.get("num_res_blocks", 4)),
+    )
+    encoder_state = {
+        key.removeprefix("encoder."): value for key, value in state_dict.items() if key.startswith("encoder.")
+    }
+    if not encoder_state:
+        raise ValueError(f"No encoder weights found in Action VQ-VAE checkpoint {resolved_path}.")
+    try:
+        encoder.load_state_dict(encoder_state, strict=True, assign=True)
+    except TypeError:
+        encoder.load_state_dict(encoder_state, strict=True)
+
+    required_keys = ("quantizer.layers.0.codebook", "action_mean", "action_std")
+    if bool(config.get("use_action_type_pe", False)):
+        required_keys += ("xyz_emb", "euler_emb", "gripper_emb")
+    missing_keys = [key for key in required_keys if key not in state_dict]
+    if missing_keys:
+        raise ValueError(f"Action VQ-VAE checkpoint {resolved_path} is missing keys: {missing_keys}.")
+
+    q0_codebook = state_dict["quantizer.layers.0.codebook"].detach()
+    model = ActionVQVAEQ0Encoder(
+        encoder=encoder,
+        q0_codebook=q0_codebook,
+        time_emb=time_emb.detach() if isinstance(time_emb, Tensor) else None,
+        xyz_emb=state_dict["xyz_emb"].detach() if "xyz_emb" in state_dict else None,
+        euler_emb=state_dict["euler_emb"].detach() if "euler_emb" in state_dict else None,
+        gripper_emb=state_dict["gripper_emb"].detach() if "gripper_emb" in state_dict else None,
+        action_mean=state_dict["action_mean"].detach(),
+        action_std=state_dict["action_std"].detach(),
+        normalize_actions=bool(config.get("normalize_actions", False)),
+        use_action_type_pe=bool(config.get("use_action_type_pe", False)),
     )
     model.requires_grad_(False)
     model.eval()

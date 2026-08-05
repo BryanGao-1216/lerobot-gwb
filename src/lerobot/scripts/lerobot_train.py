@@ -447,8 +447,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    is_rlds_dataset = cfg.dataset_type == "rlds"
+
     # create dataloader for offline training
-    if not cfg.dataset.streaming:
+    if not is_rlds_dataset and not cfg.dataset.streaming:
         # All non-streaming (map-style) datasets use EpisodeAwareSampler.
         # The order is a pure function of (seed, epoch), so every rank independently produces the
         # same permutation. accelerate then shards it disjointly across ranks via BatchSamplerShard
@@ -497,18 +499,28 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Only swap in the language-aware collate when the dataset actually
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
-    collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+    collate_fn = (
+        dataset.collate_fn
+        if is_rlds_dataset
+        else (lerobot_collate_fn if dataset.meta.has_language_columns else None)
+    )
+    dataloader_num_workers = 0 if is_rlds_dataset else cfg.num_workers
+    if is_rlds_dataset and cfg.num_workers != 0 and is_main_process:
+        logging.info(
+            "dataset_type='rlds' forces DataLoader num_workers=0 because TensorFlow/dlimp manages "
+            "its own parallel input pipeline."
+        )
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=cfg.num_workers,
+        num_workers=dataloader_num_workers,
         batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
+        shuffle=shuffle and not cfg.dataset.streaming and not is_rlds_dataset,
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
         collate_fn=collate_fn,
-        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
-        persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+        prefetch_factor=cfg.prefetch_factor if dataloader_num_workers > 0 else None,
+        persistent_workers=cfg.persistent_workers and dataloader_num_workers > 0,
     )
 
     # Build eval dataloader if a held-out split exists
@@ -540,7 +552,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    if eval_dataloader is not None:
+    if is_rlds_dataset:
+        # The RLDS stream is explicitly sharded by distributed rank before
+        # interleaving. Preparing it with Accelerate would shard it a second
+        # time. Device placement is already handled by the policy preprocessor.
+        policy, optimizer, lr_scheduler = accelerator.prepare(policy, optimizer, lr_scheduler)
+    elif eval_dataloader is not None:
         policy, optimizer, dataloader, lr_scheduler, eval_dataloader = accelerator.prepare(
             policy, optimizer, dataloader, lr_scheduler, eval_dataloader
         )
@@ -554,7 +571,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if cfg.resume and accelerator.distributed_type == DistributedType.FSDP:
         load_fsdp_optimizer_state(policy, optimizer, cfg.checkpoint_path)
 
-    dl_iter = cycle(dataloader)
+    # itertools.cycle caches every yielded element until its input is
+    # exhausted. RLDS is an infinite iterable, so cycle would leak one batch
+    # per optimization step.
+    dl_iter = iter(dataloader) if is_rlds_dataset else cycle(dataloader)
 
     policy.train()
 
@@ -596,8 +616,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             position=0,
             leave=True,
         )
+        dataset_description = "an infinite weighted RLDS mixture" if is_rlds_dataset else "a fixed dataset"
         logging.info(
-            f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
+            f"Start offline training on {dataset_description}, with effective batch size: {effective_batch_size}"
         )
 
     for _ in range(step, cfg.steps):

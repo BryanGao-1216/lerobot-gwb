@@ -36,3 +36,27 @@ def test_dataset_config_none_episodes_ok():
 
 def test_dataset_config_empty_episodes_ok():
     DatasetConfig(repo_id="user/repo", episodes=[])
+
+
+def test_dataset_config_rlds_defaults_are_valid():
+    config = DatasetConfig(repo_id="actionmem_mix")
+
+    assert config.rlds_data_mix is None
+    assert config.rlds_camera_views == ("primary", "secondary", "wrist")
+    assert config.rlds_action_transform == "actionmem"
+    assert not hasattr(config, "rlds_backend_path")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"rlds_shuffle_buffer_size": 0}, "shuffle_buffer_size"),
+        ({"rlds_resize_size": (256, 0)}, "resize_size"),
+        ({"rlds_action_transform": "unknown"}, "action_transform"),
+        ({"rlds_q0_device": "mps"}, "q0_device"),
+        ({"rlds_camera_views": ("primary", "overhead")}, "camera_views"),
+    ],
+)
+def test_dataset_config_rejects_invalid_rlds_settings(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        DatasetConfig(repo_id="actionmem_mix", **kwargs)

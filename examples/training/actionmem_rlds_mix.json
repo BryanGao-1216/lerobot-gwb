@@ -1,0 +1,16 @@
+{
+  "datasets": [
+    {
+      "name": "droid",
+      "weight": 1.0
+    },
+    {
+      "name": "rl_bench",
+      "weight": 1.0
+    },
+    {
+      "name": "libero_spatial_no_noops",
+      "weight": 1.0
+    }
+  ]
+}

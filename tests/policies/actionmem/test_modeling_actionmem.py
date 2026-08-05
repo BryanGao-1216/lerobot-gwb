@@ -26,7 +26,9 @@ import lerobot.policies.actionmem.modeling_actionmem as modeling_actionmem
 from lerobot.configs import NormalizationMode
 from lerobot.policies.actionmem.action_vqvae import (
     VQVLALikeDecoder,
+    VQVLALikeEncoder,
     load_action_vqvae_q0_decoder,
+    load_action_vqvae_q0_encoder,
 )
 from lerobot.policies.actionmem.configuration_actionmem import ActionMemConfig
 from lerobot.policies.actionmem.modeling_actionmem import (
@@ -150,6 +152,56 @@ def test_vqvae_loader_decodes_only_the_q0_embedding(tmp_path):
         loaded(q0_codes),
         decoder(q0_codebook[q0_codes]),
     )
+    assert not any(parameter.requires_grad for parameter in loaded.parameters())
+
+
+def test_vqvae_q0_encoder_loader_matches_nearest_codebook_entry(tmp_path):
+    encoder = VQVLALikeEncoder(
+        horizon=2,
+        action_dim=1,
+        in_channels=1,
+        latent_dim=2,
+        block_out_channels=(2,),
+        layers_per_block=(0,),
+        encoder_out_channels=1,
+        norm_groups=1,
+        dropout=0.0,
+        num_res_blocks=0,
+    )
+    q0_codebook = torch.tensor([[-1.0, -1.0], [0.0, 0.0], [1.0, 1.0]])
+    checkpoint_path = tmp_path / "action_vqvae_encoder.pt"
+    torch.save(
+        {
+            "config": {
+                "horizon": 2,
+                "action_dim": 1,
+                "latent_dim": 2,
+                "codebook_size": 3,
+                "block_out_channels": (2,),
+                "layers_per_block": (0,),
+                "encoder_out_channels": 1,
+                "norm_groups": 1,
+                "dropout": 0.0,
+                "num_res_blocks": 0,
+                "normalize_actions": False,
+            },
+            "model": {
+                **{f"encoder.{key}": value for key, value in encoder.state_dict().items()},
+                "quantizer.layers.0.codebook": q0_codebook,
+                "action_mean": torch.zeros(1),
+                "action_std": torch.ones(1),
+            },
+        },
+        checkpoint_path,
+    )
+
+    loaded = load_action_vqvae_q0_encoder(checkpoint_path)
+    actions = torch.tensor([[[-0.5], [0.25]], [[0.5], [-0.25]]])
+    with torch.inference_mode():
+        latents = encoder(actions.unsqueeze(1))
+        expected = torch.cdist(latents, q0_codebook).argmin(dim=-1)
+
+    assert torch.equal(loaded(actions), expected)
     assert not any(parameter.requires_grad for parameter in loaded.parameters())
 
 

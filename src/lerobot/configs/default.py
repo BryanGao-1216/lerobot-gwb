@@ -47,6 +47,29 @@ class DatasetConfig:
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
 
+    # RLDS/Open-X settings. These fields are ignored unless the top-level
+    # TrainPipelineConfig.dataset_type is set to "rlds". ``repo_id`` remains
+    # required for backwards compatibility and is used as the RLDS data-mix
+    # name when ``rlds_data_mix`` is not provided.
+    rlds_data_mix: str | None = None
+    rlds_mixture_path: str | None = None
+    rlds_shuffle_buffer_size: int = 100_000
+    rlds_balance_weights: bool = True
+    rlds_camera_views: tuple[str, ...] = ("primary", "secondary", "wrist")
+    rlds_resize_size: tuple[int, int] = (256, 256)
+    rlds_skip_unlabeled: bool = True
+    rlds_num_parallel_calls: int = 16
+    # ActionMem-compatible source transforms restore the action convention
+    # used by the trained action VQ-VAE after the OXE standardizer runs.
+    rlds_action_transform: str = "actionmem"
+    rlds_action_vqvae_checkpoint_path: str | None = None
+    # q0 encoding runs inside the main-process collate function. CPU saves GPU
+    # memory; "cuda" is faster for SmolActionMem when memory permits.
+    rlds_q0_device: str = "cpu"
+    # If unset, the active policy's max_state_dim is used. RLDS proprio vectors
+    # are padded to this fixed size so heterogeneous datasets can be collated.
+    rlds_state_dim: int | None = None
+
     def __post_init__(self) -> None:
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
             raise ValueError(
@@ -54,6 +77,30 @@ class DatasetConfig:
             )
         if not (0.0 <= self.eval_split < 1.0):
             raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
+        if self.rlds_shuffle_buffer_size <= 0:
+            raise ValueError(
+                f"rlds_shuffle_buffer_size must be positive, got {self.rlds_shuffle_buffer_size}"
+            )
+        if len(self.rlds_resize_size) != 2 or any(size <= 0 for size in self.rlds_resize_size):
+            raise ValueError(
+                f"rlds_resize_size must contain two positive values, got {self.rlds_resize_size}"
+            )
+        if self.rlds_num_parallel_calls <= 0:
+            raise ValueError(f"rlds_num_parallel_calls must be positive, got {self.rlds_num_parallel_calls}")
+        if self.rlds_action_transform not in {"actionmem", "identity"}:
+            raise ValueError(
+                "rlds_action_transform must be either 'actionmem' or 'identity', got "
+                f"{self.rlds_action_transform!r}"
+            )
+        if self.rlds_q0_device != "cpu" and not self.rlds_q0_device.startswith("cuda"):
+            raise ValueError(f"rlds_q0_device must be 'cpu' or a CUDA device, got {self.rlds_q0_device!r}")
+        if self.rlds_state_dim is not None and self.rlds_state_dim <= 0:
+            raise ValueError(f"rlds_state_dim must be positive when set, got {self.rlds_state_dim}")
+        unknown_camera_views = set(self.rlds_camera_views) - {"primary", "secondary", "wrist"}
+        if unknown_camera_views:
+            raise ValueError(
+                f"rlds_camera_views only supports primary/secondary/wrist, got {sorted(unknown_camera_views)}"
+            )
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):
                 raise ValueError(
