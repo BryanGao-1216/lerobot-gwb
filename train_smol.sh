@@ -1,16 +1,18 @@
 lerobot-train \
-  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-0803-L-90/checkpoints/last/pretrained_model \
+  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-base \
+  --policy.action_vqvae_checkpoint_path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/MyStudy/myStudy/scripts/outputs/action_vqvae.pt \
   --policy.train_expert_only=false \
-  --policy.training_stage=vlm_only \
+  --policy.training_stage=joint \
   --policy.input_features=null \
   --policy.output_features=null \
-  --dataset.repo_id=lqs \
-  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/MANISKILL \
-  --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-0803-MS \
-  --steps=100000 \
+  --dataset.repo_id=libero_test_0805 \
+  --dataset_type=rlds \
+  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/Libero \
+  --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-50000 \
+  --steps=50000 \
   --policy.optimizer_grad_clip_norm=5 \
-  --batch_size=64 \
+  --batch_size=32 \
   --eval_step=0 \
   --policy.gradient_checkpointing=false \
   --policy.tensorboard_enable=true \
-  --policy.push_to_hub=false
+  --policy.push_to_hub=false 

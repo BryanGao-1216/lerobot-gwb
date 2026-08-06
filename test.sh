@@ -1,12 +1,11 @@
 lerobot-eval \
   --output_dir="./outputs/eval/libero_debug" \
-  --policy.path="/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/pi0-lora/checkpoints/last/pretrained_model" \
-  --policy.use_peft=true \
-  --rename_map='{"observation.images.image": "observation.images.base_0_rgb", "observation.images.image2": "observation.images.right_wrist_0_rgb"}' \
+  --policy.path="/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-Baseline-L/checkpoints/last/pretrained_model" \
+  --policy.use_peft=false \
   --env.type=libero \
   --env.task=libero_object,libero_spatial \
   --env.control_mode=relative \
   --env.max_parallel_tasks=1 \
   --eval.batch_size=1 \
   --eval.n_episodes=2 \
-  --policy.n_action_steps=10
+  --policy.n_action_steps=16

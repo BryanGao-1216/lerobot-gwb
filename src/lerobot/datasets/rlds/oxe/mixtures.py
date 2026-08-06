@@ -726,5 +726,10 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
         ("maniskill_dataset_converted_externally_to_rlds", 5.0),
         ("rl_bench", 5.0),
     ],
+    "libero_test_0805": [
+        ("libero_10_no_noops", 1.0),
+        ("libero_object_no_noops", 1.0),
+        ("libero_spatial_no_noops", 1.0),
+    ],
 }
 # fmt: on

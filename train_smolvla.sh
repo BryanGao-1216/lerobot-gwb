@@ -1,0 +1,13 @@
+lerobot-train \
+  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smolvla \
+  --policy.input_features=null \
+  --policy.output_features=null \
+  --dataset.repo_id=lqs \
+  --dataset_type=lerobot \
+  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/LIBERO \
+  --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-Baseline-L \
+  --steps=5000 \
+  --policy.optimizer_grad_clip_norm=5 \
+  --batch_size=64 \
+  --eval_step=0 \
+  --policy.push_to_hub=false 
