@@ -648,14 +648,27 @@ class ActionMemRLDSDataset(IterableDataset):
 
 def resolve_actionmem_token_metadata(policy_config: Any) -> SimpleNamespace:
     """Resolve the token map without importing the heavy policy model."""
+    token_map_path = getattr(policy_config, "action_token_map_path", None)
+    pretrained_path = getattr(policy_config, "pretrained_path", None)
+    companion_path = (
+        Path(pretrained_path).expanduser() / "token_map.json" if pretrained_path is not None else None
+    )
+    if companion_path is not None and companion_path.is_file():
+        token_map_path = str(companion_path.resolve())
+        policy_config.action_token_map_path = token_map_path
+
     if policy_config.type == "smol_actionmem":
         from lerobot.policies.smol_actionmem.tokenization_smol_actionmem import SmolActionMemTokenMap
 
-        return SmolActionMemTokenMap.from_json(policy_config.action_token_map_path)
+        return SmolActionMemTokenMap.from_json(token_map_path)
     if policy_config.type == "actionmem":
         from lerobot.policies.actionmem.tokenization_actionmem import ActionMemTokenMap
 
-        return ActionMemTokenMap.from_json(policy_config.action_token_map_path)
+        return ActionMemTokenMap.from_json(token_map_path)
+    if policy_config.type == "pi05_actionmem":
+        from lerobot.policies.pi05_actionmem.tokenization_pi05_actionmem import PI05ActionMemTokenMap
+
+        return PI05ActionMemTokenMap.from_json(token_map_path)
     raise ValueError(f"RLDS ActionMem backend does not support policy type {policy_config.type!r}.")
 
 

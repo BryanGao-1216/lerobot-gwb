@@ -29,6 +29,7 @@ from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as M
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
+from .pi05_actionmem.configuration_pi05_actionmem import PI05ActionMemConfig as PI05ActionMemConfig
 from .pretrained import PreTrainedPolicy as PreTrainedPolicy
 from .smol_actionmem.configuration_smol_actionmem import SmolActionMemConfig as SmolActionMemConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig

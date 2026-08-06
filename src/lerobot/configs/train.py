@@ -270,9 +270,13 @@ class TrainPipelineConfig(HubMixin):
                     "sample_weighting is not supported with dataset_type='rlds'; configure source weights in "
                     "dataset.rlds_mixture_path instead."
                 )
-            if self.trainable_config.type not in {"actionmem", "smol_actionmem"}:
+            if self.trainable_config.type not in {
+                "actionmem",
+                "pi05_actionmem",
+                "smol_actionmem",
+            }:
                 raise ValueError(
-                    "dataset_type='rlds' currently supports only actionmem and smol_actionmem policies, got "
+                    "dataset_type='rlds' currently supports only ActionMem-family policies, got "
                     f"{self.trainable_config.type!r}."
                 )
             if self.dataset.rlds_action_transform == "actionmem" and getattr(

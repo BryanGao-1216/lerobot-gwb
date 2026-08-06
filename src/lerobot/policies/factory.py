@@ -218,6 +218,14 @@ def make_pre_post_processors(
                 preprocessor,
                 postprocessor,
             )
+        if policy_cfg.type == "pi05_actionmem":
+            from .pi05_actionmem.processor_pi05_actionmem import reconcile_pi05_actionmem_processors
+
+            preprocessor, postprocessor = reconcile_pi05_actionmem_processors(
+                policy_cfg,
+                preprocessor,
+                postprocessor,
+            )
         return preprocessor, postprocessor
 
     # Create new processors from the policy config, resolving the per-policy factory
