@@ -42,8 +42,8 @@ def make_env_pre_post_processors(
     Create preprocessor and postprocessor pipelines for environment observations.
 
     Returns a tuple of (preprocessor, postprocessor). By default, delegates to
-    ``env_cfg.get_env_processors()``.  The XVLAConfig policy-specific override
-    stays here because it depends on the *policy* config, not the env config.
+    ``env_cfg.get_env_processors()``. Policy-specific adaptations stay here
+    when they depend on the policy config rather than the environment config.
     """
     from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 
@@ -52,7 +52,20 @@ def make_env_pre_post_processors(
 
         return make_xvla_libero_pre_post_processors()
 
-    return env_cfg.get_env_processors()
+    preprocessor, postprocessor = env_cfg.get_env_processors()
+
+    # SmolActionMem RLDS checkpoints normalize states that were padded to
+    # max_state_dim during dataset loading. Match that contract before the
+    # checkpoint's policy normalizer sees the raw 8-D LIBERO state. Keep the
+    # default LIBERO processor unchanged for every other policy.
+    if getattr(policy_cfg, "type", None) == "smol_actionmem":
+        from lerobot.processor import LiberoProcessorStep
+
+        for step in preprocessor.steps:
+            if isinstance(step, LiberoProcessorStep):
+                step.state_dim = policy_cfg.max_state_dim
+
+    return preprocessor, postprocessor
 
 
 def make_env(

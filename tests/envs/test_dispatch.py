@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import gymnasium as gym
 import pytest
@@ -87,6 +88,31 @@ def test_libero_processor_flattens_state_to_raw_8_dim():
     state = step.observation(observation)[OBS_STATE]
     assert state.shape == (1, 8)
     assert torch.allclose(state, torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 4.0, 5.0]]))
+
+
+def test_smol_actionmem_libero_processor_pads_state_before_policy_normalization():
+    cfg = LiberoEnv()
+    policy_cfg = SimpleNamespace(type="smol_actionmem", max_state_dim=32)
+    pre, _ = make_env_pre_post_processors(cfg, policy_cfg=policy_cfg)
+
+    step = pre.steps[0]
+    assert isinstance(step, LiberoProcessorStep)
+    assert step.state_dim == 32
+
+    observation = {
+        OBS_PREFIX + "robot_state": {
+            "eef": {
+                "pos": torch.tensor([[1.0, 2.0, 3.0]]),
+                "quat": torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            },
+            "gripper": {"qpos": torch.tensor([[4.0, 5.0]])},
+        }
+    }
+    state = step.observation(observation)[OBS_STATE]
+
+    assert state.shape == (1, 32)
+    assert torch.allclose(state[:, :8], torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 4.0, 5.0]]))
+    assert torch.count_nonzero(state[:, 8:]) == 0
 
 
 def test_base_create_envs():
