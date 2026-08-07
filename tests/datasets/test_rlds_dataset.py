@@ -27,17 +27,20 @@ from lerobot.datasets.rlds_dataset import (
     RLDSActionTokenCollator,
     _aggregate_weighted_stats,
     _attach_normalized_action_vqvae_input,
+    _filter_vqvla_action_chunk,
     _load_mixture_spec,
-    _make_actionmem_standardizer,
     _validate_statistics,
-    _wrap_standardizers,
+)
+from lerobot.utils.constants import (
+    ACTION_VQVAE_NORMALIZATION_MASK,
+    ACTION_VQVAE_Q01,
+    ACTION_VQVAE_Q99,
 )
 
 
 class _NumpyTensorFlow:
     float32 = np.float32
     bool = np.bool_
-    math = type("Math", (), {"floormod": staticmethod(np.mod)})
 
     @staticmethod
     def cast(value, dtype):
@@ -48,16 +51,8 @@ class _NumpyTensorFlow:
         return np.asarray(value, dtype=dtype)
 
     @staticmethod
-    def concat(values, axis):
-        return np.concatenate(values, axis=axis)
-
-    @staticmethod
     def where(condition, true_value, false_value):
         return np.where(condition, true_value, false_value)
-
-    @staticmethod
-    def ones_like(value):
-        return np.ones_like(value)
 
     @staticmethod
     def equal(left, right):
@@ -70,6 +65,14 @@ class _NumpyTensorFlow:
     @staticmethod
     def zeros_like(value):
         return np.zeros_like(value)
+
+    @staticmethod
+    def shape(value):
+        return np.asarray(value).shape
+
+    @staticmethod
+    def broadcast_to(value, shape):
+        return np.broadcast_to(value, shape)
 
 
 def test_load_explicit_rlds_mixture(tmp_path):
@@ -146,40 +149,42 @@ def test_weighted_stats_follow_effective_sampling_distribution_and_pad_state():
     assert result["count"].item() == 40
 
 
-def test_actionmem_transform_rejects_unverified_dataset():
-    kwargs = [{"name": "bridge_orig", "standardize_fn": lambda trajectory: trajectory}]
+def test_weighted_action_stats_preserve_oxe_normalization_mask():
+    statistics = [
+        {
+            "num_transitions": 10,
+            "action": {
+                "mean": np.array([0.0, 0.5]),
+                "std": np.array([1.0, 0.5]),
+                "min": np.array([-1.0, 0.0]),
+                "max": np.array([1.0, 1.0]),
+                "q01": np.array([-0.9, 0.0]),
+                "q99": np.array([0.9, 1.0]),
+                "mask": np.array([True, False]),
+            },
+        },
+        {
+            "num_transitions": 10,
+            "action": {
+                "mean": np.array([1.0, 0.25]),
+                "std": np.array([2.0, 0.4]),
+                "min": np.array([-2.0, 0.0]),
+                "max": np.array([2.0, 1.0]),
+                "q01": np.array([-1.8, 0.0]),
+                "q99": np.array([1.8, 1.0]),
+                "mask": np.array([True, False]),
+            },
+        },
+    ]
 
-    with pytest.raises(ValueError, match="only verified for DROID, RLBench, and LIBERO"):
-        _wrap_standardizers(kwargs, "actionmem", object())
-
-
-def test_droid_standardizer_matches_vqvae_relative_eef_extraction():
-    raw_action = np.array([[2.0, 3.0, 4.0, 3.2, -3.2, 0.2, 0.25]], dtype=np.float32)
-    state = np.array([[1.0, 1.0, 1.0, 0.0, 0.0, 0.1]], dtype=np.float32)
-    trajectory = {
-        "action": raw_action,
-        "observation": {"cartesian_position": state},
-    }
-
-    standardizer = _make_actionmem_standardizer(lambda value: value, "droid", _NumpyTensorFlow)
-    action = standardizer(trajectory)["action"]
-
-    expected_rotation = (raw_action[:, 3:6] - state[:, 3:6] + np.pi) % (2 * np.pi) - np.pi
-    expected = np.concatenate(
-        [raw_action[:, :3] - state[:, :3], expected_rotation, np.array([[-1.0]])], axis=-1
+    result = _aggregate_weighted_stats(
+        statistics,
+        weights=np.array([0.5, 0.5]),
+        feature="action",
+        size=2,
     )
-    assert np.allclose(action, expected)
 
-
-def test_rlbench_standardizer_matches_vqvae_relative_eef_extraction():
-    raw_action = np.array([[2.0, 3.0, 4.0, 0.1, 0.2, 0.3, 0.0]], dtype=np.float32)
-    state = np.array([[1.0, 1.0, 1.0, 0.0, 0.1, 0.2, 9.0]], dtype=np.float32)
-    trajectory = {"action": raw_action, "observation": {"state": state}}
-
-    standardizer = _make_actionmem_standardizer(lambda value: value, "rl_bench", _NumpyTensorFlow)
-    action = standardizer(trajectory)["action"]
-
-    assert np.allclose(action, [[1.0, 2.0, 3.0, 0.1, 0.1, 0.1, 1.0]])
+    assert torch.equal(result["mask"], torch.tensor([True, False]))
 
 
 def test_rlds_statistics_must_match_vqvae_action_dimension():
@@ -192,7 +197,7 @@ def test_rlds_statistics_must_match_vqvae_action_dimension():
         _validate_statistics("droid", statistics, action_dim=7, state_dim=32)
 
 
-def test_vqvae_action_input_uses_q01_q99_while_flow_action_stays_raw():
+def test_vqvae_action_input_matches_vqvla_q01_q99_and_preserves_gripper():
     raw_action = np.array(
         [[[0.0, 2.0, -3.0], [1.0, 3.0, 4.0]]],
         dtype=np.float32,
@@ -215,6 +220,9 @@ def test_vqvae_action_input_uses_q01_q99_while_flow_action_stays_raw():
         result[_ACTION_VQVAE_INPUT],
         [[[-0.0, 0.0, -3.0], [1.0, 1.0, 4.0]]],
     )
+    assert np.array_equal(result[ACTION_VQVAE_NORMALIZATION_MASK][0, 0], [True, True, False])
+    assert np.array_equal(result[ACTION_VQVAE_Q01][0, 0], [-1.0, 1.0, -1.0])
+    assert np.array_equal(result[ACTION_VQVAE_Q99][0, 0], [1.0, 3.0, 1.0])
 
 
 def test_rlds_collator_encodes_only_normalized_vqvae_action_input():
@@ -237,6 +245,9 @@ def test_rlds_collator_encodes_only_normalized_vqvae_action_input():
             {
                 "action": raw_action,
                 _ACTION_VQVAE_INPUT: normalized_action,
+                ACTION_VQVAE_Q01: torch.tensor([-1.0, 0.0, 0.0]),
+                ACTION_VQVAE_Q99: torch.tensor([1.0, 1.0, 1.0]),
+                ACTION_VQVAE_NORMALIZATION_MASK: torch.tensor([True, True, False]),
             }
         ]
     )
@@ -244,7 +255,24 @@ def test_rlds_collator_encodes_only_normalized_vqvae_action_input():
     assert torch.equal(collator.encoder.actions, normalized_action.unsqueeze(0))
     assert torch.equal(batch["action"], raw_action.unsqueeze(0))
     assert torch.equal(batch["action_token"], torch.tensor([17]))
+    assert torch.equal(batch[ACTION_VQVAE_NORMALIZATION_MASK], torch.tensor([[True, True, False]]))
     assert _ACTION_VQVAE_INPUT not in batch
+
+
+def test_vqvla_chunk_filter_reads_normalized_vqvae_action_without_overwriting_flow_action():
+    frame = {
+        "action": np.full((2, 2), 10.0, dtype=np.float32),
+        _ACTION_VQVAE_INPUT: np.full((2, 2), 0.25, dtype=np.float32),
+    }
+    observed = {}
+
+    def chunk_filter(candidate):
+        observed["action"] = candidate["action"].copy()
+        return True
+
+    assert _filter_vqvla_action_chunk(frame, chunk_filter)
+    assert np.all(observed["action"] == 0.25)
+    assert np.all(frame["action"] == 10.0)
 
 
 def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
@@ -258,6 +286,11 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
     frame = {
         "action": np.zeros((16, 7), dtype=np.float32),
         _ACTION_VQVAE_INPUT: np.full((16, 7), 0.25, dtype=np.float32),
+        ACTION_VQVAE_Q01: np.tile(np.arange(7, dtype=np.float32), (16, 1)),
+        ACTION_VQVAE_Q99: np.tile(np.arange(7, dtype=np.float32) + 1, (16, 1)),
+        ACTION_VQVAE_NORMALIZATION_MASK: np.tile(
+            np.array([True] * 6 + [False]), (16, 1)
+        ),
         "dataset_name": b"droid",
         "task": {"language_instruction": b"pick up the cup"},
         "observation": {
@@ -275,6 +308,8 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
 
     assert sample["action"].shape == (16, 7)
     assert torch.all(sample[_ACTION_VQVAE_INPUT] == 0.25)
+    assert torch.equal(sample[ACTION_VQVAE_Q01], torch.arange(7, dtype=torch.float32))
+    assert sample[ACTION_VQVAE_NORMALIZATION_MASK][-1].item() is False
     assert sample["observation.state"].shape == (10,)
     assert sample["observation.images.image"].shape == (3, 8, 8)
     assert sample["observation.images.image3_padding_mask"].item() is False

@@ -32,6 +32,9 @@ from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN_MASK,
     ACTION_TOKENS,
+    ACTION_VQVAE_NORMALIZATION_MASK,
+    ACTION_VQVAE_Q01,
+    ACTION_VQVAE_Q99,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
@@ -42,6 +45,7 @@ from ..actionmem.action_vqvae import ActionVQVAEQ0Decoder, load_action_vqvae_q0_
 from ..actionmem.modeling_actionmem import (
     _configure_action_vqvae_flow_normalization,
     _masked_action_token_cross_entropy,
+    _restore_vqvla_oxe_actions,
 )
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
 from ..pretrained import PreTrainedPolicy
@@ -159,6 +163,28 @@ class SmolActionMem2FlowMatching(VLAFlowMatching):
 
         action_normalization = NormalizationMode(config.normalization_mapping["ACTION"])
         self._normalize_action_vqvae_flow_source = action_normalization is NormalizationMode.MEAN_STD
+        q01 = config.action_vqvae_input_q01
+        q99 = config.action_vqvae_input_q99
+        input_mask = config.action_vqvae_input_mask
+        if q01 is not None and q99 is not None and input_mask is not None:
+            if len(q01) != self.action_code_map.action_dim or len(input_mask) != len(q01):
+                raise ValueError(
+                    "Smol ActionMem 2 VQ-VAE input statistics must match action dimension "
+                    f"{self.action_code_map.action_dim}."
+                )
+            self.register_buffer(
+                "_action_vqvae_input_q01", torch.tensor(q01, dtype=torch.float32), persistent=False
+            )
+            self.register_buffer(
+                "_action_vqvae_input_q99", torch.tensor(q99, dtype=torch.float32), persistent=False
+            )
+            self.register_buffer(
+                "_action_vqvae_input_mask", torch.tensor(input_mask, dtype=torch.bool), persistent=False
+            )
+        else:
+            self.register_buffer("_action_vqvae_input_q01", None, persistent=False)
+            self.register_buffer("_action_vqvae_input_q99", None, persistent=False)
+            self.register_buffer("_action_vqvae_input_mask", None, persistent=False)
         mean = config.action_vqvae_flow_mean
         std = config.action_vqvae_flow_std
         if self._normalize_action_vqvae_flow_source and mean is not None:
@@ -296,7 +322,13 @@ class SmolActionMem2FlowMatching(VLAFlowMatching):
         return action_vqvae
 
     @torch.no_grad()
-    def decode_action_classes(self, action_classes: Tensor) -> Tensor:
+    def decode_action_classes(
+        self,
+        action_classes: Tensor,
+        input_q01: Tensor | None = None,
+        input_q99: Tensor | None = None,
+        input_mask: Tensor | None = None,
+    ) -> Tensor:
         """Decode local classifier outputs, not SmolVLM vocabulary IDs."""
         action_classes = action_classes.reshape(-1)
         invalid = (action_classes < self.action_code_map.action_class_min) | (
@@ -311,6 +343,21 @@ class SmolActionMem2FlowMatching(VLAFlowMatching):
 
         q0_codes = action_classes + self.action_code_map.code_id_min
         decoded_actions = self._get_action_vqvae(action_classes.device)(q0_codes)
+        selected_q01 = self._action_vqvae_input_q01 if input_q01 is None else input_q01
+        selected_q99 = self._action_vqvae_input_q99 if input_q99 is None else input_q99
+        selected_mask = self._action_vqvae_input_mask if input_mask is None else input_mask
+        if selected_q01 is None or selected_q99 is None or selected_mask is None:
+            raise ValueError(
+                "Smol ActionMem 2 requires VQ-VLA q01/q99/mask statistics from the training dataset "
+                "or saved policy config before decoding action classes."
+            )
+        decoded_actions = _restore_vqvla_oxe_actions(
+            decoded_actions,
+            selected_q01,
+            selected_q99,
+            selected_mask,
+            self.config.action_vqvae_flow_normalization_eps,
+        )
         if self._normalize_action_vqvae_flow_source:
             if self._action_vqvae_flow_mean is None or self._action_vqvae_flow_std is None:
                 raise ValueError(
@@ -328,11 +375,19 @@ class SmolActionMem2FlowMatching(VLAFlowMatching):
         action_tokens: Tensor,
         action_token_masks: Tensor,
         actions: Tensor,
+        input_q01: Tensor | None = None,
+        input_q99: Tensor | None = None,
+        input_mask: Tensor | None = None,
     ) -> Tensor:
         valid_targets = action_token_masks[:, -1].bool()
         source_actions = self.sample_noise(actions.shape, actions.device)
         if torch.any(valid_targets):
-            decoded_actions = self.decode_action_classes(action_tokens[valid_targets, -1])
+            decoded_actions = self.decode_action_classes(
+                action_tokens[valid_targets, -1],
+                None if input_q01 is None else input_q01[valid_targets],
+                None if input_q99 is None else input_q99[valid_targets],
+                None if input_mask is None else input_mask[valid_targets],
+            )
             source_actions[valid_targets] = decoded_actions.to(source_actions.dtype)
         return source_actions
 
@@ -517,6 +572,9 @@ class SmolActionMem2FlowMatching(VLAFlowMatching):
         noise=None,
         time=None,
         *,
+        action_vqvae_input_q01: Tensor | None = None,
+        action_vqvae_input_q99: Tensor | None = None,
+        action_vqvae_input_mask: Tensor | None = None,
         compute_flow: bool = True,
         compute_action_token: bool = True,
     ) -> dict[str, Tensor]:
@@ -557,7 +615,14 @@ class SmolActionMem2FlowMatching(VLAFlowMatching):
         if state is None or actions is None or time is None:
             raise ValueError("Flow training requires state, actions, and time tensors.")
         if noise is None:
-            noise = self._make_training_flow_source(action_tokens, action_token_masks, actions)
+            noise = self._make_training_flow_source(
+                action_tokens,
+                action_token_masks,
+                actions,
+                action_vqvae_input_q01,
+                action_vqvae_input_q99,
+                action_vqvae_input_mask,
+            )
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -798,6 +863,9 @@ class SmolActionMem2Policy(SmolVLAPolicy):
             actions,
             noise,
             time,
+            action_vqvae_input_q01=batch.get(ACTION_VQVAE_Q01),
+            action_vqvae_input_q99=batch.get(ACTION_VQVAE_Q99),
+            action_vqvae_input_mask=batch.get(ACTION_VQVAE_NORMALIZATION_MASK),
             compute_flow=compute_flow,
             compute_action_token=compute_action_token,
         )

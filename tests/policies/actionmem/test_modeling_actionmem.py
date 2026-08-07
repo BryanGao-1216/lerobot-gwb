@@ -36,6 +36,7 @@ from lerobot.policies.actionmem.modeling_actionmem import (
     ActionMemPytorch,
     _configure_action_vqvae_flow_normalization,
     _masked_action_token_cross_entropy,
+    _restore_vqvla_oxe_actions,
     _select_action_token,
 )
 from lerobot.policies.pi_gemma import PiGemmaModel
@@ -55,12 +56,18 @@ def test_flow_source_normalization_uses_runtime_dataset_stats_and_persists_them(
         (),
         {
             "normalization_mapping": {"ACTION": NormalizationMode.MEAN_STD},
+            "action_vqvae_input_q01": None,
+            "action_vqvae_input_q99": None,
+            "action_vqvae_input_mask": None,
             "action_vqvae_flow_mean": [100.0, 100.0],
             "action_vqvae_flow_std": [100.0, 100.0],
         },
     )()
     dataset_stats = {
         ACTION: {
+            "q01": torch.tensor([-1.0, 0.0]),
+            "q99": torch.tensor([1.0, 1.0]),
+            "mask": torch.tensor([True, False]),
             "mean": torch.tensor([1.0, 2.0]),
             "std": torch.tensor([3.0, 4.0]),
         }
@@ -68,6 +75,9 @@ def test_flow_source_normalization_uses_runtime_dataset_stats_and_persists_them(
 
     _configure_action_vqvae_flow_normalization(config, dataset_stats)
 
+    assert config.action_vqvae_input_q01 == [-1.0, 0.0]
+    assert config.action_vqvae_input_q99 == [1.0, 1.0]
+    assert config.action_vqvae_input_mask == [True, False]
     assert config.action_vqvae_flow_mean == [1.0, 2.0]
     assert config.action_vqvae_flow_std == [3.0, 4.0]
 
@@ -78,6 +88,9 @@ def test_flow_source_normalization_reuses_saved_stats_without_dataset_metadata()
         (),
         {
             "normalization_mapping": {"ACTION": NormalizationMode.MEAN_STD},
+            "action_vqvae_input_q01": [-1.0],
+            "action_vqvae_input_q99": [1.0],
+            "action_vqvae_input_mask": [True],
             "action_vqvae_flow_mean": [1.0],
             "action_vqvae_flow_std": [2.0],
         },
@@ -95,6 +108,9 @@ def test_flow_source_normalization_requires_stats_for_mean_std():
         (),
         {
             "normalization_mapping": {"ACTION": NormalizationMode.MEAN_STD},
+            "action_vqvae_input_q01": [-1.0],
+            "action_vqvae_input_q99": [1.0],
+            "action_vqvae_input_mask": [True],
             "action_vqvae_flow_mean": None,
             "action_vqvae_flow_std": None,
         },
@@ -102,6 +118,20 @@ def test_flow_source_normalization_requires_stats_for_mean_std():
 
     with pytest.raises(ValueError, match="mean/std are unavailable"):
         _configure_action_vqvae_flow_normalization(config, dataset_stats=None)
+
+
+def test_restore_vqvla_actions_inverts_bounds_but_preserves_gripper():
+    normalized = torch.tensor([[0.0, 1.0]])
+
+    restored = _restore_vqvla_oxe_actions(
+        normalized,
+        q01=torch.tensor([1.0, 0.0]),
+        q99=torch.tensor([5.0, 1.0]),
+        normalization_mask=torch.tensor([True, False]),
+        eps=1e-8,
+    )
+
+    assert torch.allclose(restored, torch.tensor([[3.0, 1.0]]))
 
 
 def test_vqvae_loader_decodes_only_the_q0_embedding(tmp_path):
@@ -322,6 +352,9 @@ def test_training_flow_source_decodes_valid_targets_and_falls_back_for_invalid()
         },
     )()
     model._normalize_action_vqvae_flow_source = True
+    model.register_buffer("_action_vqvae_input_q01", torch.tensor([-1.0]), persistent=False)
+    model.register_buffer("_action_vqvae_input_q99", torch.tensor([1.0]), persistent=False)
+    model.register_buffer("_action_vqvae_input_mask", torch.tensor([True]), persistent=False)
     model.register_buffer("_action_vqvae_flow_mean", torch.tensor([1.0]), persistent=False)
     model.register_buffer("_action_vqvae_flow_std", torch.tensor([2.0]), persistent=False)
     object.__setattr__(model, "_action_vqvae", _DummyQ0Decoder())
@@ -331,10 +364,13 @@ def test_training_flow_source_decodes_valid_targets_and_falls_back_for_invalid()
         action_tokens=torch.tensor([[7, 9, 10], [7, 9, 8], [7, 9, 0]]),
         action_token_masks=torch.tensor([[True, True, True], [True, True, True], [True, True, False]]),
         actions=torch.zeros(3, 2, 2),
+        input_q01=torch.tensor([[-1.0], [0.0], [100.0]]),
+        input_q99=torch.tensor([[1.0], [2.0], [200.0]]),
+        input_mask=torch.tensor([[True], [True], [True]]),
     )
 
     assert torch.allclose(source[0], torch.tensor([[-0.5, 0.0], [-0.5, 0.0]]))
-    assert torch.allclose(source[1], torch.tensor([[0.5, 0.0], [0.5, 0.0]]))
+    assert torch.allclose(source[1], torch.tensor([[1.0, 0.0], [1.0, 0.0]]))
     assert torch.equal(source[2], torch.full((2, 2), -1.0))
 
 
@@ -457,6 +493,9 @@ class _DummyTrainingCore(nn.Module):
         noise,
         time,
         *,
+        action_vqvae_input_q01=None,
+        action_vqvae_input_q99=None,
+        action_vqvae_input_mask=None,
         compute_flow,
         compute_action_token,
     ):
@@ -472,6 +511,9 @@ class _DummyTrainingCore(nn.Module):
             action_token_masks,
             noise,
             time,
+            action_vqvae_input_q01,
+            action_vqvae_input_q99,
+            action_vqvae_input_mask,
         )
         output = {}
         if compute_flow:

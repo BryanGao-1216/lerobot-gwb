@@ -153,6 +153,9 @@ def test_quantile_flow_source_stats_use_runtime_dataset_stats():
         (),
         {
             "normalization_mapping": {"ACTION": NormalizationMode.QUANTILES},
+            "action_vqvae_input_q01": None,
+            "action_vqvae_input_q99": None,
+            "action_vqvae_input_mask": None,
             "action_vqvae_flow_mean": None,
             "action_vqvae_flow_std": None,
             "action_vqvae_flow_q01": [100.0, 100.0],
@@ -163,11 +166,15 @@ def test_quantile_flow_source_stats_use_runtime_dataset_stats():
         ACTION: {
             "q01": torch.tensor([1.0, 2.0]),
             "q99": torch.tensor([3.0, 6.0]),
+            "mask": torch.tensor([True, False]),
         }
     }
 
     _configure_action_vqvae_flow_normalization(config, dataset_stats)
 
+    assert config.action_vqvae_input_q01 == [1.0, 2.0]
+    assert config.action_vqvae_input_q99 == [3.0, 6.0]
+    assert config.action_vqvae_input_mask == [True, False]
     assert config.action_vqvae_flow_q01 == [1.0, 2.0]
     assert config.action_vqvae_flow_q99 == [3.0, 6.0]
     assert config.action_vqvae_flow_mean is None
@@ -188,9 +195,12 @@ def test_vqvae_flow_source_uses_pi05_quantile_normalization():
         {"token_id_min": 90, "token_id_max": 100, "anchor_token_id": 100},
     )()
     model._action_normalization = NormalizationMode.QUANTILES
+    model.register_buffer("_action_vqvae_input_q01", torch.tensor([0.0, 10.0]))
+    model.register_buffer("_action_vqvae_input_q99", torch.tensor([10.0, 20.0]))
+    model.register_buffer("_action_vqvae_input_mask", torch.tensor([True, True]))
     model.register_buffer("_action_vqvae_flow_stat_a", torch.tensor([0.0, 10.0]))
     model.register_buffer("_action_vqvae_flow_stat_b", torch.tensor([10.0, 20.0]))
-    decoded = torch.tensor([[[0.0, 15.0], [10.0, 20.0]]])
+    decoded = torch.tensor([[[-1.0, 0.0], [1.0, 1.0]]])
     model._get_action_vqvae = lambda device: lambda q0: decoded.to(device)
 
     result = model.decode_action_tokens(torch.tensor([100]))
@@ -255,6 +265,9 @@ class _DummyTrainingCore(nn.Module):
         noise,
         time,
         *,
+        action_vqvae_input_q01=None,
+        action_vqvae_input_q99=None,
+        action_vqvae_input_mask=None,
         compute_flow,
         compute_action_token,
     ):
@@ -267,6 +280,9 @@ class _DummyTrainingCore(nn.Module):
             action_token_masks,
             noise,
             time,
+            action_vqvae_input_q01,
+            action_vqvae_input_q99,
+            action_vqvae_input_mask,
         )
         self.calls.append((compute_flow, compute_action_token))
         device = actions.device if actions is not None else torch.device("cpu")

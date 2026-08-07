@@ -115,10 +115,11 @@ class PI05ActionMemConfig(PreTrainedConfig):
     # Frozen action VQ-VAE used to decode q0 into the flow-matching source chunk.
     # When omitted, PI05ActionMem falls back to vqvae.checkpoint_path in the token map.
     action_vqvae_checkpoint_path: str | None = None
-    # LeRobot action statistics used to map the raw VQ-VAE reconstruction into
-    # the same normalized action space as the flow-matching target. These are
-    # populated from dataset_stats at policy construction time and serialized
-    # with the policy config for inference without dataset metadata.
+    # VQ-VLA BOUNDS_Q99 input statistics and OXE normalization mask.
+    action_vqvae_input_q01: list[float] | None = None
+    action_vqvae_input_q99: list[float] | None = None
+    action_vqvae_input_mask: list[bool] | None = None
+    # LeRobot action statistics used after restoring the decoded OXE action.
     action_vqvae_flow_mean: list[float] | None = None
     action_vqvae_flow_std: list[float] | None = None
     action_vqvae_flow_q01: list[float] | None = None
@@ -187,6 +188,19 @@ class PI05ActionMemConfig(PreTrainedConfig):
         ):
             raise ValueError("joint training requires at least one non-zero loss weight.")
 
+        if (self.action_vqvae_input_q01 is None) != (self.action_vqvae_input_q99 is None):
+            raise ValueError(
+                "action_vqvae_input_q01 and action_vqvae_input_q99 must either both be set or both be None."
+            )
+        if self.action_vqvae_input_q01 is not None:
+            if len(self.action_vqvae_input_q01) != len(self.action_vqvae_input_q99):
+                raise ValueError("action_vqvae_input_q01 and action_vqvae_input_q99 must match in length.")
+            if self.action_vqvae_input_mask is None or len(self.action_vqvae_input_mask) != len(
+                self.action_vqvae_input_q01
+            ):
+                raise ValueError(
+                    "action_vqvae_input_mask must be set and match the q01/q99 dimension."
+                )
         if (self.action_vqvae_flow_mean is None) != (self.action_vqvae_flow_std is None):
             raise ValueError(
                 "action_vqvae_flow_mean and action_vqvae_flow_std must either both be set or both be None."

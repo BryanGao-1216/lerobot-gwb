@@ -130,6 +130,9 @@ class _DummyCore(nn.Module):
         *,
         compute_flow,
         compute_action_token,
+        action_vqvae_input_q01=None,
+        action_vqvae_input_q99=None,
+        action_vqvae_input_mask=None,
     ):
         del (
             images,
@@ -140,6 +143,9 @@ class _DummyCore(nn.Module):
             action_token_masks,
             noise,
             time,
+            action_vqvae_input_q01,
+            action_vqvae_input_q99,
+            action_vqvae_input_mask,
         )
         self.calls.append((compute_flow, compute_action_token))
         self.states.append(state)

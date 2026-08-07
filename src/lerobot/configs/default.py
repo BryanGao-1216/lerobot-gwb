@@ -59,9 +59,10 @@ class DatasetConfig:
     rlds_resize_size: tuple[int, int] = (256, 256)
     rlds_skip_unlabeled: bool = True
     rlds_num_parallel_calls: int = 16
-    # ActionMem-compatible source transforms restore the action convention
-    # used by the trained action VQ-VAE after the OXE standardizer runs.
-    rlds_action_transform: str = "actionmem"
+    # Keep the action convention produced by VQ-VLA's per-dataset OXE
+    # standardizers. ``identity`` is retained as a backwards-compatible alias
+    # for ``oxe``; neither value bypasses the OXE standardizer itself.
+    rlds_action_transform: str = "oxe"
     rlds_action_vqvae_checkpoint_path: str | None = None
     # q0 encoding runs inside the main-process collate function. CPU saves GPU
     # memory; "cuda" is faster for SmolActionMem when memory permits.
@@ -87,9 +88,9 @@ class DatasetConfig:
             )
         if self.rlds_num_parallel_calls <= 0:
             raise ValueError(f"rlds_num_parallel_calls must be positive, got {self.rlds_num_parallel_calls}")
-        if self.rlds_action_transform not in {"actionmem", "identity"}:
+        if self.rlds_action_transform not in {"oxe", "identity"}:
             raise ValueError(
-                "rlds_action_transform must be either 'actionmem' or 'identity', got "
+                "rlds_action_transform must be either 'oxe' or its legacy alias 'identity', got "
                 f"{self.rlds_action_transform!r}"
             )
         if self.rlds_q0_device != "cpu" and not self.rlds_q0_device.startswith("cuda"):

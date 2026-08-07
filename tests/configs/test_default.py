@@ -43,7 +43,7 @@ def test_dataset_config_rlds_defaults_are_valid():
 
     assert config.rlds_data_mix is None
     assert config.rlds_camera_views == ("primary", "secondary", "wrist")
-    assert config.rlds_action_transform == "actionmem"
+    assert config.rlds_action_transform == "oxe"
     assert not hasattr(config, "rlds_backend_path")
 
 

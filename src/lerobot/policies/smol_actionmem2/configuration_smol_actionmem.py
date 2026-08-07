@@ -46,8 +46,12 @@ class SmolActionMem2Config(SmolVLAConfig):
     # Initialization used only by the new action-code embedding and classifier.
     action_code_init_std: float = 0.02
 
-    # The raw VQ-VAE reconstruction must be mapped into the same normalized
-    # action space as the flow-matching target.
+    # The VQ-VAE reconstruction is in VQ-VLA's BOUNDS_Q99 space. Restore the
+    # OXE action first (while preserving masked gripper dimensions), then map
+    # it into the flow target's MEAN_STD space.
+    action_vqvae_input_q01: list[float] | None = None
+    action_vqvae_input_q99: list[float] | None = None
+    action_vqvae_input_mask: list[bool] | None = None
     action_vqvae_flow_mean: list[float] | None = None
     action_vqvae_flow_std: list[float] | None = None
     action_vqvae_flow_normalization_eps: float = 1e-8
@@ -111,6 +115,19 @@ class SmolActionMem2Config(SmolVLAConfig):
         ):
             raise ValueError("joint training requires at least one non-zero loss weight.")
 
+        if (self.action_vqvae_input_q01 is None) != (self.action_vqvae_input_q99 is None):
+            raise ValueError(
+                "action_vqvae_input_q01 and action_vqvae_input_q99 must either both be set or both be None."
+            )
+        if self.action_vqvae_input_q01 is not None:
+            if len(self.action_vqvae_input_q01) != len(self.action_vqvae_input_q99):
+                raise ValueError("action_vqvae_input_q01 and action_vqvae_input_q99 must match in length.")
+            if self.action_vqvae_input_mask is None or len(self.action_vqvae_input_mask) != len(
+                self.action_vqvae_input_q01
+            ):
+                raise ValueError(
+                    "action_vqvae_input_mask must be set and match the q01/q99 dimension."
+                )
         if (self.action_vqvae_flow_mean is None) != (self.action_vqvae_flow_std is None):
             raise ValueError(
                 "action_vqvae_flow_mean and action_vqvae_flow_std must either both be set or both be None."

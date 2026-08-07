@@ -58,15 +58,17 @@ keys that the existing ActionMem/SmolActionMem preprocessors consume. It forms c
 chunks, removes each episode's padded tail, and encodes q0 online in the collate function. The
 VQ-VAE is frozen and is not part of the policy optimizer or checkpoint.
 
+Action preprocessing follows VQ-VLA exactly: each source first uses its registered OXE
+standardizer, the non-gripper EEF dimensions are normalized with that source's q01/q99 statistics,
+and dimensions excluded by OXE's action normalization mask (the gripper for EEF actions) pass
+through unchanged. No legacy DROID/RLBench target-pose delta or LIBERO `0/1 -> -1/+1` conversion is
+applied. `rlds_action_transform=oxe` is the default; `identity` remains only as a backwards-compatible
+name for the same behavior.
+
 Camera keys are unified by OXE (missing views become masked padding), and proprio vectors are padded
 to `rlds_state_dim` before interleaving. Padding aligns tensor shapes; it does not change the native
 OXE state semantics (for example, quaternion versus Euler state encodings). If an experiment requires
 one shared semantic state representation, add a dataset-specific state conversion before mixing.
-
-`rlds_action_transform=actionmem` is intentionally restricted to DROID, RLBench, and LIBERO because
-those are the action conventions currently aligned to the trained VQ-VAE. A new dataset needs an
-explicit 7-D action conversion before adding it to the mixture. `identity` is available as an escape
-hatch only when the dataset has already been verified to use exactly the VQ-VAE's action convention.
 
 RLDS training is an infinite stream and currently has no LeRobot episode holdout. Keep
 `dataset.eval_split=0` and `eval_steps=0`. Checkpoint saving/resume, TensorBoard/W&B, PEFT, and the

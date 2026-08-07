@@ -51,6 +51,9 @@ from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN_MASK,
     ACTION_TOKENS,
+    ACTION_VQVAE_NORMALIZATION_MASK,
+    ACTION_VQVAE_Q01,
+    ACTION_VQVAE_Q99,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
@@ -82,13 +85,9 @@ def _configure_action_vqvae_flow_normalization(
     config: ActionMemConfig,
     dataset_stats: dict[str, dict[str, Tensor]] | None,
 ) -> None:
-    """Persist the stats needed to normalize raw VQ-VAE action reconstructions."""
+    """Persist the OXE and policy stats needed to place decoded q0 in flow space."""
     action_normalization = NormalizationMode(config.normalization_mapping["ACTION"])
-    if action_normalization is NormalizationMode.IDENTITY:
-        config.action_vqvae_flow_mean = None
-        config.action_vqvae_flow_std = None
-        return
-    if action_normalization is not NormalizationMode.MEAN_STD:
+    if action_normalization not in {NormalizationMode.IDENTITY, NormalizationMode.MEAN_STD}:
         raise ValueError(
             "ActionMem VQ-VAE flow-source normalization currently supports only ACTION "
             f"normalization modes IDENTITY and MEAN_STD, got {action_normalization.value}."
@@ -96,14 +95,61 @@ def _configure_action_vqvae_flow_normalization(
 
     runtime_action_stats = dataset_stats.get(ACTION) if dataset_stats is not None else None
     if runtime_action_stats is not None:
+        q01 = runtime_action_stats.get("q01")
+        q99 = runtime_action_stats.get("q99")
+        mask = runtime_action_stats.get("mask")
         mean = runtime_action_stats.get("mean")
         std = runtime_action_stats.get("std")
         source = "dataset_stats['action']"
     else:
+        q01 = getattr(config, "action_vqvae_input_q01", None)
+        q99 = getattr(config, "action_vqvae_input_q99", None)
+        mask = getattr(config, "action_vqvae_input_mask", None)
         mean = config.action_vqvae_flow_mean
         std = config.action_vqvae_flow_std
         source = "the saved ActionMem config"
 
+    if q01 is None or q99 is None:
+        raise ValueError(
+            "ActionMem uses a VQ-VLA BOUNDS_Q99 action VQ-VAE, but action q01/q99 are unavailable. "
+            "Construct the policy with dataset_stats during training, or load an ActionMem checkpoint "
+            "whose config contains action_vqvae_input_q01/action_vqvae_input_q99."
+        )
+    q01_tensor = torch.as_tensor(q01, dtype=torch.float32).detach().cpu()
+    q99_tensor = torch.as_tensor(q99, dtype=torch.float32).detach().cpu()
+    if q01_tensor.ndim != 1 or q99_tensor.ndim != 1 or q01_tensor.shape != q99_tensor.shape:
+        raise ValueError(
+            f"Action q01/q99 from {source} must be same-shaped 1D tensors, got "
+            f"{tuple(q01_tensor.shape)} and {tuple(q99_tensor.shape)}."
+        )
+    if not torch.isfinite(q01_tensor).all() or not torch.isfinite(q99_tensor).all():
+        raise ValueError(f"Action q01/q99 from {source} must contain only finite values.")
+    if torch.any(q99_tensor < q01_tensor):
+        raise ValueError(f"Action q99 from {source} must be greater than or equal to q01.")
+
+    # VQ-VLA's EEF contract excludes the final gripper dimension from bounds
+    # normalization. Infer that standard mask for older LeRobot stats that did
+    # not persist the OXE mask explicitly.
+    if mask is None:
+        mask_tensor = torch.ones_like(q01_tensor, dtype=torch.bool)
+        if mask_tensor.numel() > 0:
+            mask_tensor[-1] = False
+    else:
+        mask_tensor = torch.as_tensor(mask, dtype=torch.bool).detach().cpu()
+    if mask_tensor.ndim != 1 or mask_tensor.shape != q01_tensor.shape:
+        raise ValueError(
+            f"Action normalization mask from {source} must have shape {tuple(q01_tensor.shape)}, "
+            f"got {tuple(mask_tensor.shape)}."
+        )
+
+    config.action_vqvae_input_q01 = q01_tensor.tolist()
+    config.action_vqvae_input_q99 = q99_tensor.tolist()
+    config.action_vqvae_input_mask = mask_tensor.tolist()
+
+    if action_normalization is NormalizationMode.IDENTITY:
+        config.action_vqvae_flow_mean = None
+        config.action_vqvae_flow_std = None
+        return
     if mean is None or std is None:
         raise ValueError(
             "ActionMem uses MEAN_STD action normalization, but action mean/std are unavailable. "
@@ -133,6 +179,27 @@ def _configure_action_vqvae_flow_normalization(
     # the existing PI0 processor behavior.
     config.action_vqvae_flow_mean = mean_tensor.tolist()
     config.action_vqvae_flow_std = std_tensor.tolist()
+
+
+def _restore_vqvla_oxe_actions(
+    normalized_actions: Tensor,
+    q01: Tensor,
+    q99: Tensor,
+    normalization_mask: Tensor,
+    eps: float,
+) -> Tensor:
+    """Invert VQ-VLA BOUNDS_Q99 while preserving absolute OXE dimensions."""
+    q01 = q01.to(device=normalized_actions.device, dtype=normalized_actions.dtype)
+    q99 = q99.to(device=normalized_actions.device, dtype=normalized_actions.dtype)
+    normalization_mask = normalization_mask.to(device=normalized_actions.device, dtype=torch.bool)
+    while q01.ndim < normalized_actions.ndim:
+        q01 = q01.unsqueeze(-2)
+        q99 = q99.unsqueeze(-2)
+        normalization_mask = normalization_mask.unsqueeze(-2)
+    denominator = q99 - q01
+    denominator = torch.where(denominator == 0, torch.full_like(denominator, eps), denominator)
+    restored = 0.5 * (normalized_actions + 1.0) * denominator + q01
+    return torch.where(normalization_mask, restored, normalized_actions)
 
 
 def _masked_action_token_cross_entropy(
@@ -528,6 +595,28 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         action_normalization = NormalizationMode(config.normalization_mapping["ACTION"])
         self._normalize_action_vqvae_flow_source = action_normalization is NormalizationMode.MEAN_STD
+        q01 = config.action_vqvae_input_q01
+        q99 = config.action_vqvae_input_q99
+        input_mask = config.action_vqvae_input_mask
+        if q01 is None or q99 is None or input_mask is None:
+            raise ValueError(
+                "ActionMem requires action_vqvae_input_q01/action_vqvae_input_q99/"
+                "action_vqvae_input_mask for the VQ-VLA-trained action VQ-VAE."
+            )
+        if len(q01) != self.action_token_map.action_dim or len(input_mask) != len(q01):
+            raise ValueError(
+                "ActionMem VQ-VAE input statistics must match action dimension "
+                f"{self.action_token_map.action_dim}."
+            )
+        self.register_buffer(
+            "_action_vqvae_input_q01", torch.tensor(q01, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_action_vqvae_input_q99", torch.tensor(q99, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_action_vqvae_input_mask", torch.tensor(input_mask, dtype=torch.bool), persistent=False
+        )
         if self._normalize_action_vqvae_flow_source:
             if config.action_vqvae_flow_mean is None or config.action_vqvae_flow_std is None:
                 raise ValueError(
@@ -717,7 +806,13 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         return action_vqvae
 
     @torch.no_grad()
-    def decode_action_tokens(self, action_tokens: Tensor) -> Tensor:
+    def decode_action_tokens(
+        self,
+        action_tokens: Tensor,
+        input_q01: Tensor | None = None,
+        input_q99: Tensor | None = None,
+        input_mask: Tensor | None = None,
+    ) -> Tensor:
         """Decode PaliGemma action-token IDs into padded q0 action chunks."""
         action_tokens = action_tokens.reshape(-1)
         invalid = (action_tokens < self.action_token_map.token_id_min) | (
@@ -734,6 +829,13 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         q0_codes = self.action_token_map.anchor_token_id - action_tokens
         action_vqvae = self._get_action_vqvae(action_tokens.device)
         decoded_actions = action_vqvae(q0_codes)
+        decoded_actions = _restore_vqvla_oxe_actions(
+            decoded_actions,
+            self._action_vqvae_input_q01 if input_q01 is None else input_q01,
+            self._action_vqvae_input_q99 if input_q99 is None else input_q99,
+            self._action_vqvae_input_mask if input_mask is None else input_mask,
+            self.config.action_vqvae_flow_normalization_eps,
+        )
         if self._normalize_action_vqvae_flow_source:
             decoded_actions = (decoded_actions - self._action_vqvae_flow_mean) / (
                 self._action_vqvae_flow_std + self.config.action_vqvae_flow_normalization_eps
@@ -746,12 +848,20 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         action_tokens: Tensor,
         action_token_masks: Tensor,
         actions: Tensor,
+        input_q01: Tensor | None = None,
+        input_q99: Tensor | None = None,
+        input_mask: Tensor | None = None,
     ) -> Tensor:
         """Use q0 reconstruction as source, with Gaussian fallback for invalid targets."""
         valid_targets = action_token_masks[:, -1].bool()
         source_actions = self.sample_noise(actions.shape, actions.device)
         if torch.any(valid_targets):
-            decoded_actions = self.decode_action_tokens(action_tokens[valid_targets, -1])
+            decoded_actions = self.decode_action_tokens(
+                action_tokens[valid_targets, -1],
+                None if input_q01 is None else input_q01[valid_targets],
+                None if input_q99 is None else input_q99[valid_targets],
+                None if input_mask is None else input_mask[valid_targets],
+            )
             source_actions[valid_targets] = decoded_actions.to(source_actions.dtype)
         return source_actions
 
@@ -971,6 +1081,9 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise=None,
         time=None,
         *,
+        action_vqvae_input_q01: Tensor | None = None,
+        action_vqvae_input_q99: Tensor | None = None,
+        action_vqvae_input_mask: Tensor | None = None,
         compute_flow: bool = True,
         compute_action_token: bool = True,
     ) -> dict[str, Tensor]:
@@ -1007,6 +1120,9 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
                 action_tokens,
                 action_token_masks,
                 actions,
+                action_vqvae_input_q01,
+                action_vqvae_input_q99,
+                action_vqvae_input_mask,
             )
 
         time_expanded = time[:, None, None]
@@ -1709,6 +1825,9 @@ class ActionMemPolicy(PreTrainedPolicy):
             actions,
             None,
             time,
+            action_vqvae_input_q01=batch.get(ACTION_VQVAE_Q01),
+            action_vqvae_input_q99=batch.get(ACTION_VQVAE_Q99),
+            action_vqvae_input_mask=batch.get(ACTION_VQVAE_NORMALIZATION_MASK),
             compute_flow=compute_flow,
             compute_action_token=compute_action_token,
         )

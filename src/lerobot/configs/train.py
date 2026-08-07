@@ -280,12 +280,10 @@ class TrainPipelineConfig(HubMixin):
                     "dataset_type='rlds' currently supports only ActionMem-family policies, got "
                     f"{self.trainable_config.type!r}."
                 )
-            if self.dataset.rlds_action_transform == "actionmem" and getattr(
-                self.trainable_config, "use_relative_actions", False
-            ):
+            if getattr(self.trainable_config, "use_relative_actions", False):
                 raise ValueError(
-                    "The RLDS ActionMem transform already converts DROID/RLBench actions to relative EEF "
-                    "actions; set policy.use_relative_actions=false to avoid applying the delta transform twice."
+                    "The VQ-VLA OXE standardizers already emit relative EEF actions; set "
+                    "policy.use_relative_actions=false to avoid applying a second delta transform."
                 )
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):

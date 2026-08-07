@@ -35,6 +35,11 @@ ACTION_PREFIX = ACTION + "."
 ACTION_TOKEN = "action_token"
 ACTION_TOKENS = ACTION + ".tokens"
 ACTION_TOKEN_MASK = ACTION + ".token_mask"
+# Per-sample VQ-VLA normalization metadata used to map a q0 reconstruction
+# back through the source dataset's OXE action space during mixed-RLDS training.
+ACTION_VQVAE_Q01 = ACTION + ".vqvae_q01"
+ACTION_VQVAE_Q99 = ACTION + ".vqvae_q99"
+ACTION_VQVAE_NORMALIZATION_MASK = ACTION + ".vqvae_normalization_mask"
 REWARD = "next.reward"
 TRUNCATED = "next.truncated"
 DONE = "next.done"

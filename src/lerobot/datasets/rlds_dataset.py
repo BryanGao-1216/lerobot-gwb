@@ -16,11 +16,11 @@
 
 """Optional multi-RLDS input backend for ActionMem policies.
 
-This module deliberately does not import TensorFlow, dlimp, or VQ-VLA at module
-import time. Normal LeRobot dataset users therefore keep the existing dependency
-and startup behavior. The external VQ-VLA checkout is used only for its OXE
-schema registry and RLDS trajectory transforms; batches emitted here follow the
-normal LeRobot policy contract.
+This module deliberately does not import TensorFlow or dlimp at module import
+time. Normal LeRobot dataset users therefore keep the existing dependency and
+startup behavior. VQ-VLA's vendored OXE schema registry and RLDS trajectory
+transforms define the action contract; batches emitted here follow the normal
+LeRobot policy contract.
 """
 
 from __future__ import annotations
@@ -44,7 +44,14 @@ from lerobot.policies.actionmem.action_vqvae import (
     ActionVQVAEQ0Encoder,
     load_action_vqvae_q0_encoder,
 )
-from lerobot.utils.constants import ACTION, ACTION_TOKEN, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION,
+    ACTION_TOKEN,
+    ACTION_VQVAE_NORMALIZATION_MASK,
+    ACTION_VQVAE_Q01,
+    ACTION_VQVAE_Q99,
+    OBS_STATE,
+)
 
 _CAMERA_KEY_BY_VIEW = {
     "primary": "observation.images.image",
@@ -203,80 +210,6 @@ def _load_mixture_spec(
     return [(name, float(weight)) for name, weight in mixture]
 
 
-def _make_actionmem_standardizer(base_standardizer: Callable, dataset_name: str, tf: Any) -> Callable:
-    """Reproduce the action extraction used to train the ActionMem VQ-VAE."""
-
-    def standardize(trajectory: dict[str, Any]) -> dict[str, Any]:
-        # DROID/RLBench VQ-VAE inputs were extracted as a target EEF pose
-        # relative to the current EEF state. Preserve the raw tensors before
-        # the OXE standardizer replaces/restructures them.
-        raw_action = trajectory["action"]
-        raw_observation = trajectory["observation"]
-        if dataset_name == "rl_bench":
-            raw_state = raw_observation.get("state", raw_observation.get("EEF_state"))
-        else:
-            raw_state = raw_observation.get("cartesian_position")
-
-        trajectory = base_standardizer(trajectory)
-        if dataset_name == "droid" or dataset_name.startswith("droid_"):
-            if raw_state is None:
-                raise ValueError(f"DROID dataset {dataset_name!r} has no observation.cartesian_position.")
-            source_action = tf.cast(raw_action, tf.float32)
-            source_state = tf.cast(raw_state, tf.float32)
-            delta = source_action[..., :6] - source_state[..., :6]
-            wrapped_rotation = tf.math.floormod(delta[..., 3:6] + np.pi, 2 * np.pi) - np.pi
-            gripper = tf.where(
-                source_action[..., 6:7] < 0.5,
-                -tf.ones_like(source_action[..., 6:7]),
-                tf.ones_like(source_action[..., 6:7]),
-            )
-            action = tf.concat([delta[..., :3], wrapped_rotation, gripper], axis=-1)
-        elif dataset_name == "rl_bench":
-            if raw_state is None:
-                raise ValueError("RLBench has neither observation.state nor observation.EEF_state.")
-            source_action = tf.cast(raw_action, tf.float32)
-            source_state = tf.cast(raw_state, tf.float32)
-            delta = source_action[..., :6] - source_state[..., :6]
-            wrapped_rotation = tf.math.floormod(delta[..., 3:6] + np.pi, 2 * np.pi) - np.pi
-            gripper = tf.where(
-                tf.equal(source_action[..., 6:7], 0),
-                tf.ones_like(source_action[..., 6:7]),
-                -tf.ones_like(source_action[..., 6:7]),
-            )
-            action = tf.concat([delta[..., :3], wrapped_rotation, gripper], axis=-1)
-        else:
-            # OXE maps LIBERO open/close to 1/0; the VQ-VAE was trained on -1/+1.
-            action = tf.cast(trajectory["action"], tf.float32)
-            gripper = 1.0 - 2.0 * action[..., -1:]
-            action = tf.concat([action[..., :-1], gripper], axis=-1)
-        trajectory["action"] = action
-        return trajectory
-
-    return standardize
-
-
-def _wrap_standardizers(per_dataset_kwargs: list[dict[str, Any]], action_transform: str, tf: Any) -> None:
-    if action_transform == "identity":
-        return
-    for dataset_kwargs in per_dataset_kwargs:
-        dataset_name = dataset_kwargs["name"]
-        if not (
-            dataset_name == "rl_bench"
-            or dataset_name.startswith("droid")
-            or dataset_name.startswith("libero")
-        ):
-            raise ValueError(
-                "rlds_action_transform='actionmem' is only verified for DROID, RLBench, and LIBERO, "
-                f"but the mixture contains {dataset_name!r}. Add its action conversion before training, "
-                "or explicitly select --dataset.rlds_action_transform=identity after verifying that its "
-                "7-D action convention matches the VQ-VAE."
-            )
-        base_standardizer = dataset_kwargs.get("standardize_fn")
-        if base_standardizer is None:
-            raise ValueError(f"RLDS dataset {dataset_name!r} has no OXE standardization transform.")
-        dataset_kwargs["standardize_fn"] = _make_actionmem_standardizer(base_standardizer, dataset_name, tf)
-
-
 def _denormalize_trajectory(trajectory: dict[str, Any], statistics: Mapping[str, Any], tf: Any):
     action_stats = statistics["action"]
     action_mask = tf.convert_to_tensor(
@@ -321,7 +254,18 @@ def _attach_normalized_action_vqvae_input(trajectory: dict[str, Any], statistics
     maximum = tf.convert_to_tensor(action_stats["max"], dtype=tf.float32)
     normalized_action = tf.where(tf.equal(minimum, maximum), tf.zeros_like(action), normalized_action)
     trajectory[_ACTION_VQVAE_INPUT] = normalized_action
+    action_shape = tf.shape(action)
+    trajectory[ACTION_VQVAE_Q01] = tf.broadcast_to(low, action_shape)
+    trajectory[ACTION_VQVAE_Q99] = tf.broadcast_to(high, action_shape)
+    trajectory[ACTION_VQVAE_NORMALIZATION_MASK] = tf.broadcast_to(mask, action_shape)
     return trajectory
+
+
+def _filter_vqvla_action_chunk(frame: Mapping[str, Any], chunk_filter_fn: Callable) -> Any:
+    """Run VQ-VLA's source filter against its expected BOUNDS_Q99 action."""
+    filter_frame = dict(frame)
+    filter_frame["action"] = frame[_ACTION_VQVAE_INPUT]
+    return chunk_filter_fn(filter_frame)
 
 
 def _trim_invalid_chunk_targets(trajectory: dict[str, Any], horizon: int, tf: Any):
@@ -401,7 +345,7 @@ def _aggregate_weighted_stats(
         axis=0,
     )
     count = sum(int(stats.get("num_transitions", 0)) for stats in statistics)
-    return {
+    result = {
         "mean": torch.from_numpy(mean.astype(np.float32)),
         "std": torch.from_numpy(np.sqrt(variance).astype(np.float32)),
         "min": torch.from_numpy(minimum.astype(np.float32)),
@@ -410,6 +354,24 @@ def _aggregate_weighted_stats(
         "q99": torch.from_numpy(q99.astype(np.float32)),
         "count": torch.tensor([count], dtype=torch.long),
     }
+    source_masks = [stats[feature].get("mask") for stats in statistics]
+    if any(mask is not None for mask in source_masks):
+        padded_masks = []
+        for stats, mask in zip(statistics, source_masks, strict=True):
+            source_size = np.asarray(stats[feature]["mean"]).size
+            source_mask = (
+                np.ones(source_size, dtype=bool) if mask is None else np.asarray(mask, dtype=bool).reshape(-1)
+            )
+            if source_mask.size != source_size:
+                raise ValueError(
+                    f"RLDS {feature} normalization mask has size {source_mask.size}, expected {source_size}."
+                )
+            padded_masks.append(np.pad(source_mask, (0, size - source_size), constant_values=False))
+        stacked_masks = np.stack(padded_masks)
+        if feature == "action" and not np.all(stacked_masks == stacked_masks[0]):
+            raise ValueError("All mixed OXE datasets must use the same action normalization mask.")
+        result["mask"] = torch.from_numpy(np.all(stacked_masks, axis=0))
+    return result
 
 
 def _image_stats() -> dict[str, torch.Tensor]:
@@ -478,8 +440,6 @@ class ActionMemRLDSDataset(IterableDataset):
                 "The VQ-VLA OXE registry returned a different number of weights and datasets: "
                 f"{len(base_weights)} weights for {len(per_dataset_kwargs)} datasets."
             )
-        _wrap_standardizers(per_dataset_kwargs, dataset_config.rlds_action_transform, self.backend.tf)
-
         self._dataset, all_statistics, effective_weights, valid_sizes = self._build_interleaved_dataset(
             per_dataset_kwargs,
             np.asarray(base_weights, dtype=np.float64),
@@ -584,9 +544,7 @@ class ActionMemRLDSDataset(IterableDataset):
         for kwargs, statistics in zip(per_dataset_kwargs, all_statistics, strict=True):
             source_kwargs = copy.deepcopy(kwargs)
             frame_transform_kwargs = source_kwargs.pop("dataset_frame_transform_kwargs", {})
-            # DROID's original zero-action filter assumes normalized actions.
-            # This backend explicitly restores raw actions before chunking.
-            frame_transform_kwargs.pop("chunk_filter_fn", None)
+            chunk_filter_fn = frame_transform_kwargs.pop("chunk_filter_fn", None)
             source, _ = self.backend.make_dataset_from_rlds(
                 **source_kwargs,
                 train=True,
@@ -625,6 +583,10 @@ class ActionMemRLDSDataset(IterableDataset):
                 partial(_trim_invalid_chunk_targets, horizon=self.action_horizon, tf=self.backend.tf),
                 threads_per_dataset,
             ).flatten(num_parallel_calls=threads_per_dataset)
+            if chunk_filter_fn is not None:
+                source = source.filter(
+                    partial(_filter_vqvla_action_chunk, chunk_filter_fn=chunk_filter_fn)
+                )
             source = self.backend.apply_per_dataset_frame_transforms(source, **frame_transform_kwargs)
             datasets.append(source)
 
@@ -658,10 +620,25 @@ class ActionMemRLDSDataset(IterableDataset):
                 "Expected q01/q99-normalized RLDS VQ-VAE action chunk "
                 f"{(self.action_horizon, self.action_dim)}, got {action_vqvae_input.shape}."
             )
+        action_vqvae_q01 = np.asarray(frame[ACTION_VQVAE_Q01], dtype=np.float32)[0]
+        action_vqvae_q99 = np.asarray(frame[ACTION_VQVAE_Q99], dtype=np.float32)[0]
+        action_vqvae_mask = np.asarray(frame[ACTION_VQVAE_NORMALIZATION_MASK], dtype=bool)[0]
+        for name, value in (
+            (ACTION_VQVAE_Q01, action_vqvae_q01),
+            (ACTION_VQVAE_Q99, action_vqvae_q99),
+            (ACTION_VQVAE_NORMALIZATION_MASK, action_vqvae_mask),
+        ):
+            if value.shape != (self.action_dim,):
+                raise ValueError(
+                    f"Expected {name} shape {(self.action_dim,)}, got {value.shape}."
+                )
         sample: dict[str, Any] = {
             OBS_STATE: torch.from_numpy(state),
             ACTION: torch.from_numpy(action.copy()),
             _ACTION_VQVAE_INPUT: torch.from_numpy(action_vqvae_input.copy()),
+            ACTION_VQVAE_Q01: torch.from_numpy(action_vqvae_q01.copy()),
+            ACTION_VQVAE_Q99: torch.from_numpy(action_vqvae_q99.copy()),
+            ACTION_VQVAE_NORMALIZATION_MASK: torch.from_numpy(action_vqvae_mask.copy()),
             "action_is_pad": torch.zeros(self.action_horizon, dtype=torch.bool),
             "task": _decode_text(frame["task"]["language_instruction"]),
             "dataset_name": _decode_text(frame["dataset_name"]),
