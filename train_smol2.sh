@@ -1,0 +1,18 @@
+lerobot-train \
+  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-base \
+  --policy.action_vqvae_checkpoint_path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/MyStudy/myStudy/scripts/outputs/action_vqvae.pt \
+  --policy.train_expert_only=false \
+  --policy.training_stage=vlm_only \
+  --policy.input_features=null \
+  --policy.output_features=null \
+  --dataset.repo_id=libero_test_0805 \
+  --dataset_type=rlds \
+  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/Libero \
+  --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem2-20000 \
+  --steps=20000 \
+  --policy.optimizer_grad_clip_norm=5 \
+  --batch_size=32 \
+  --eval_step=0 \
+  --policy.gradient_checkpointing=false \
+  --policy.tensorboard_enable=true \
+  --policy.push_to_hub=false 
