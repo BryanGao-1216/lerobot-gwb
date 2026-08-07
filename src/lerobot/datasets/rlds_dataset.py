@@ -52,6 +52,7 @@ _CAMERA_KEY_BY_VIEW = {
     "wrist": "observation.images.image3",
 }
 _ACTION_NAMES = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
+_ACTION_VQVAE_INPUT = "_action_vqvae_input"
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,7 @@ class RLDSDatasetMetadata:
 
 
 class RLDSActionTokenCollator:
-    """Default-collate an RLDS batch, then encode its raw action chunks to q0."""
+    """Default-collate an RLDS batch, then encode its q01/q99-normalized action chunks to q0."""
 
     def __init__(self, checkpoint_path: str | Path, device: str = "cpu") -> None:
         self.checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
@@ -116,7 +117,9 @@ class RLDSActionTokenCollator:
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
         batch = default_collate(samples)
-        actions = batch[ACTION].to(device=self.device, dtype=torch.float32, non_blocking=True)
+        actions = batch.pop(_ACTION_VQVAE_INPUT).to(
+            device=self.device, dtype=torch.float32, non_blocking=True
+        )
         with torch.inference_mode():
             q0_codes = self.encoder(actions)
         batch[ACTION_TOKEN] = q0_codes.to(device="cpu", dtype=torch.long)
@@ -293,6 +296,31 @@ def _denormalize_trajectory(trajectory: dict[str, Any], statistics: Mapping[str,
         proprio_mean = tf.convert_to_tensor(proprio_stats["mean"], dtype=tf.float32)
         proprio_std = tf.convert_to_tensor(proprio_stats["std"], dtype=tf.float32)
         observation["proprio"] = observation["proprio"] * (proprio_std + 1e-8) + proprio_mean
+    return trajectory
+
+
+def _attach_normalized_action_vqvae_input(trajectory: dict[str, Any], statistics: Mapping[str, Any], tf: Any):
+    """Keep a q01/q99-normalized action chunk exclusively for the frozen VQ-VAE encoder.
+
+    ``trajectory["action"]`` remains in the canonical, unnormalized ActionMem
+    action space. The policy preprocessor can therefore continue applying its
+    configured normalization to the flow target without double-normalizing it.
+    """
+    action = tf.cast(trajectory["action"], tf.float32)
+    action_stats = statistics["action"]
+    low = tf.convert_to_tensor(action_stats["q01"], dtype=tf.float32)
+    high = tf.convert_to_tensor(action_stats["q99"], dtype=tf.float32)
+    mask = tf.convert_to_tensor(
+        action_stats.get("mask", np.ones_like(action_stats["q01"], dtype=bool)), dtype=tf.bool
+    )
+    normalized_action = tf.clip_by_value(2.0 * (action - low) / (high - low + 1e-8) - 1.0, -1.0, 1.0)
+    normalized_action = tf.where(mask, normalized_action, action)
+
+    # Match the vendored OXE BOUNDS_Q99 behavior for constant dimensions.
+    minimum = tf.convert_to_tensor(action_stats["min"], dtype=tf.float32)
+    maximum = tf.convert_to_tensor(action_stats["max"], dtype=tf.float32)
+    normalized_action = tf.where(tf.equal(minimum, maximum), tf.zeros_like(action), normalized_action)
+    trajectory[_ACTION_VQVAE_INPUT] = normalized_action
     return trajectory
 
 
@@ -586,6 +614,14 @@ class ActionMemRLDSDataset(IterableDataset):
                 num_parallel_calls=threads_per_dataset,
             )
             source = source.traj_map(
+                partial(
+                    _attach_normalized_action_vqvae_input,
+                    statistics=statistics,
+                    tf=self.backend.tf,
+                ),
+                threads_per_dataset,
+            )
+            source = source.traj_map(
                 partial(_trim_invalid_chunk_targets, horizon=self.action_horizon, tf=self.backend.tf),
                 threads_per_dataset,
             ).flatten(num_parallel_calls=threads_per_dataset)
@@ -616,9 +652,16 @@ class ActionMemRLDSDataset(IterableDataset):
             raise ValueError(
                 f"Expected RLDS action chunk {(self.action_horizon, self.action_dim)}, got {action.shape}."
             )
+        action_vqvae_input = np.asarray(frame[_ACTION_VQVAE_INPUT], dtype=np.float32)
+        if action_vqvae_input.shape != (self.action_horizon, self.action_dim):
+            raise ValueError(
+                "Expected q01/q99-normalized RLDS VQ-VAE action chunk "
+                f"{(self.action_horizon, self.action_dim)}, got {action_vqvae_input.shape}."
+            )
         sample: dict[str, Any] = {
             OBS_STATE: torch.from_numpy(state),
             ACTION: torch.from_numpy(action.copy()),
+            _ACTION_VQVAE_INPUT: torch.from_numpy(action_vqvae_input.copy()),
             "action_is_pad": torch.zeros(self.action_horizon, dtype=torch.bool),
             "task": _decode_text(frame["task"]["language_instruction"]),
             "dataset_name": _decode_text(frame["dataset_name"]),

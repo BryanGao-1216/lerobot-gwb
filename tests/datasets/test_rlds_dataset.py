@@ -22,8 +22,11 @@ import torch
 
 from lerobot.configs.default import DatasetConfig
 from lerobot.datasets.rlds_dataset import (
+    _ACTION_VQVAE_INPUT,
     ActionMemRLDSDataset,
+    RLDSActionTokenCollator,
     _aggregate_weighted_stats,
+    _attach_normalized_action_vqvae_input,
     _load_mixture_spec,
     _make_actionmem_standardizer,
     _validate_statistics,
@@ -33,10 +36,15 @@ from lerobot.datasets.rlds_dataset import (
 
 class _NumpyTensorFlow:
     float32 = np.float32
+    bool = np.bool_
     math = type("Math", (), {"floormod": staticmethod(np.mod)})
 
     @staticmethod
     def cast(value, dtype):
+        return np.asarray(value, dtype=dtype)
+
+    @staticmethod
+    def convert_to_tensor(value, dtype):
         return np.asarray(value, dtype=dtype)
 
     @staticmethod
@@ -54,6 +62,14 @@ class _NumpyTensorFlow:
     @staticmethod
     def equal(left, right):
         return np.equal(left, right)
+
+    @staticmethod
+    def clip_by_value(value, minimum, maximum):
+        return np.clip(value, minimum, maximum)
+
+    @staticmethod
+    def zeros_like(value):
+        return np.zeros_like(value)
 
 
 def test_load_explicit_rlds_mixture(tmp_path):
@@ -176,6 +192,61 @@ def test_rlds_statistics_must_match_vqvae_action_dimension():
         _validate_statistics("droid", statistics, action_dim=7, state_dim=32)
 
 
+def test_vqvae_action_input_uses_q01_q99_while_flow_action_stays_raw():
+    raw_action = np.array(
+        [[[0.0, 2.0, -3.0], [1.0, 3.0, 4.0]]],
+        dtype=np.float32,
+    )
+    trajectory = {"action": raw_action.copy()}
+    statistics = {
+        "action": {
+            "q01": np.array([-1.0, 1.0, -1.0], dtype=np.float32),
+            "q99": np.array([1.0, 3.0, 1.0], dtype=np.float32),
+            "min": np.array([-2.0, 0.0, -1.0], dtype=np.float32),
+            "max": np.array([2.0, 4.0, 1.0], dtype=np.float32),
+            "mask": np.array([True, True, False]),
+        }
+    }
+
+    result = _attach_normalized_action_vqvae_input(trajectory, statistics, _NumpyTensorFlow)
+
+    assert np.array_equal(result["action"], raw_action)
+    assert np.allclose(
+        result[_ACTION_VQVAE_INPUT],
+        [[[-0.0, 0.0, -3.0], [1.0, 1.0, 4.0]]],
+    )
+
+
+def test_rlds_collator_encodes_only_normalized_vqvae_action_input():
+    class _RecordingEncoder:
+        def __init__(self):
+            self.actions = None
+
+        def __call__(self, actions):
+            self.actions = actions.clone()
+            return torch.tensor([17], dtype=torch.long, device=actions.device)
+
+    collator = object.__new__(RLDSActionTokenCollator)
+    collator.device = torch.device("cpu")
+    collator.encoder = _RecordingEncoder()
+    raw_action = torch.full((2, 3), 10.0)
+    normalized_action = torch.full((2, 3), 0.25)
+
+    batch = collator(
+        [
+            {
+                "action": raw_action,
+                _ACTION_VQVAE_INPUT: normalized_action,
+            }
+        ]
+    )
+
+    assert torch.equal(collator.encoder.actions, normalized_action.unsqueeze(0))
+    assert torch.equal(batch["action"], raw_action.unsqueeze(0))
+    assert torch.equal(batch["action_token"], torch.tensor([17]))
+    assert _ACTION_VQVAE_INPUT not in batch
+
+
 def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
     dataset = object.__new__(ActionMemRLDSDataset)
     dataset.action_horizon = 16
@@ -186,6 +257,7 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
     )
     frame = {
         "action": np.zeros((16, 7), dtype=np.float32),
+        _ACTION_VQVAE_INPUT: np.full((16, 7), 0.25, dtype=np.float32),
         "dataset_name": b"droid",
         "task": {"language_instruction": b"pick up the cup"},
         "observation": {
@@ -202,6 +274,7 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
     sample = dataset._to_lerobot_sample(frame)
 
     assert sample["action"].shape == (16, 7)
+    assert torch.all(sample[_ACTION_VQVAE_INPUT] == 0.25)
     assert sample["observation.state"].shape == (10,)
     assert sample["observation.images.image"].shape == (3, 8, 8)
     assert sample["observation.images.image3_padding_mask"].item() is False
