@@ -274,6 +274,7 @@ class TrainPipelineConfig(HubMixin):
                 "actionmem",
                 "pi05_actionmem",
                 "smol_actionmem",
+                "smol_actionmem2",
             }:
                 raise ValueError(
                     "dataset_type='rlds' currently supports only ActionMem-family policies, got "
