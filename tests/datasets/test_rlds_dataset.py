@@ -14,7 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
+import pickle
+import tarfile
 
 import numpy as np
 import pytest
@@ -29,7 +32,14 @@ from lerobot.datasets.rlds_dataset import (
     _attach_normalized_action_vqvae_input,
     _filter_vqvla_action_chunk,
     _load_mixture_spec,
+    _resolve_rlds_source_format,
     _validate_statistics,
+)
+from lerobot.datasets.rlds_webdataset import (
+    iter_openx_tar_episodes,
+    load_or_compute_openx_tar_statistics,
+    resolve_openx_tar_paths,
+    stack_openx_episode_steps,
 )
 from lerobot.utils.constants import (
     ACTION_VQVAE_NORMALIZATION_MASK,
@@ -108,6 +118,119 @@ def test_rlds_mixture_rejects_duplicate_sources():
 
     with pytest.raises(ValueError, match="duplicate dataset"):
         _load_mixture_spec(config, named)
+
+
+def _write_openx_tar(path, payload):
+    serialized = pickle.dumps(payload)
+    member = tarfile.TarInfo("sample_000000000000.data.pickle")
+    member.size = len(serialized)
+    with tarfile.open(path, "w") as archive:
+        archive.addfile(member, io.BytesIO(serialized))
+
+
+def test_local_openx_tar_is_detected_and_streamed_without_extraction(tmp_path):
+    dataset_dir = tmp_path / "austin_buds_dataset_converted_externally_to_rlds"
+    dataset_dir.mkdir()
+    tar_path = dataset_dir / "austin_buds_dataset_converted_externally_to_rlds_00000.tar"
+    payload = {
+        "steps": [
+            {
+                "action": np.array([1.0, 2.0], dtype=np.float32),
+                "observation": {
+                    "state": np.array([3.0], dtype=np.float32),
+                    "image": {"bytes": b"first", "path": None},
+                },
+                "language_instruction": "pick",
+            },
+            {
+                "action": np.array([4.0, 5.0], dtype=np.float32),
+                "observation": {
+                    "state": np.array([6.0], dtype=np.float32),
+                    "image": {"bytes": b"second", "path": None},
+                },
+                "language_instruction": "pick",
+            },
+        ]
+    }
+    _write_openx_tar(tar_path, payload)
+
+    paths = resolve_openx_tar_paths(tmp_path, dataset_dir.name)
+    loaded = next(iter_openx_tar_episodes(paths))
+    trajectory = stack_openx_episode_steps(loaded)
+
+    assert paths == (tar_path,)
+    assert np.array_equal(trajectory["action"], [[1.0, 2.0], [4.0, 5.0]])
+    assert trajectory["observation"]["image"].tolist() == [b"first", b"second"]
+    assert trajectory["language_instruction"].tolist() == ["pick", "pick"]
+    assert list(dataset_dir.glob("*.data.pickle")) == []
+
+
+def test_rlds_source_format_auto_prefers_tar_and_explicit_webdataset_requires_it(tmp_path):
+    dataset_dir = tmp_path / "droid"
+    dataset_dir.mkdir()
+    (dataset_dir / "droid_00000.tar").touch()
+
+    auto = DatasetConfig(repo_id="droid", root=str(tmp_path), rlds_storage_format="auto")
+    assert _resolve_rlds_source_format(auto, "droid") == "webdataset"
+    assert _resolve_rlds_source_format(auto, "missing") == "tfds"
+
+    explicit = DatasetConfig(repo_id="missing", root=str(tmp_path), rlds_storage_format="webdataset")
+    with pytest.raises(FileNotFoundError, match="no tar shards"):
+        _resolve_rlds_source_format(explicit, "missing")
+
+
+def test_local_openx_tar_statistics_are_computed_and_cached(tmp_path):
+    dataset_dir = tmp_path / "toy"
+    dataset_dir.mkdir()
+    tar_path = dataset_dir / "toy_00000.tar"
+    _write_openx_tar(
+        tar_path,
+        {
+            "steps": [
+                {
+                    "action": np.array([1.0, 3.0], dtype=np.float32),
+                    "observation": {"state": np.array([2.0], dtype=np.float32)},
+                },
+                {
+                    "action": np.array([5.0, 7.0], dtype=np.float32),
+                    "observation": {"state": np.array([6.0], dtype=np.float32)},
+                },
+            ]
+        },
+    )
+
+    class _FakeTensorFlow:
+        string = "string"
+
+        @staticmethod
+        def convert_to_tensor(value, dtype=None):
+            return np.asarray(value, dtype=object if dtype == "string" else None)
+
+    statistics = load_or_compute_openx_tar_statistics(
+        paths=(tar_path,),
+        tf=_FakeTensorFlow,
+        restructure_fn=lambda trajectory: {
+            "action": trajectory["action"],
+            "observation": {"proprio": trajectory["observation"]["state"]},
+        },
+        hash_dependencies=("toy",),
+    )
+
+    assert statistics["num_trajectories"] == 1
+    assert statistics["num_transitions"] == 2
+    assert statistics["action"]["mean"] == [3.0, 5.0]
+    assert statistics["proprio"]["mean"] == [4.0]
+    assert len(list(dataset_dir.glob("dataset_statistics_*.json"))) == 1
+
+
+def test_webdataset_image_decoder_accepts_predecoded_images():
+    dataset = ActionMemRLDSDataset.__new__(ActionMemRLDSDataset)
+    dataset.dataset_config = DatasetConfig(repo_id="toy", rlds_resize_size=(2, 3))
+
+    image = dataset._decode_webdataset_image(np.full((4, 5, 3), 127, dtype=np.uint8))
+
+    assert image.shape == (2, 3, 3)
+    assert image.dtype == np.uint8
 
 
 def test_weighted_stats_follow_effective_sampling_distribution_and_pad_state():
@@ -288,9 +411,7 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
         _ACTION_VQVAE_INPUT: np.full((16, 7), 0.25, dtype=np.float32),
         ACTION_VQVAE_Q01: np.tile(np.arange(7, dtype=np.float32), (16, 1)),
         ACTION_VQVAE_Q99: np.tile(np.arange(7, dtype=np.float32) + 1, (16, 1)),
-        ACTION_VQVAE_NORMALIZATION_MASK: np.tile(
-            np.array([True] * 6 + [False]), (16, 1)
-        ),
+        ACTION_VQVAE_NORMALIZATION_MASK: np.tile(np.array([True] * 6 + [False]), (16, 1)),
         "dataset_name": b"droid",
         "task": {"language_instruction": b"pick up the cup"},
         "observation": {

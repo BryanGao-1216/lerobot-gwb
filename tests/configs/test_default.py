@@ -43,6 +43,7 @@ def test_dataset_config_rlds_defaults_are_valid():
 
     assert config.rlds_data_mix is None
     assert config.rlds_camera_views == ("primary", "secondary", "wrist")
+    assert config.rlds_storage_format == "auto"
     assert config.rlds_action_transform == "oxe"
     assert not hasattr(config, "rlds_backend_path")
 
@@ -53,6 +54,7 @@ def test_dataset_config_rlds_defaults_are_valid():
         ({"rlds_shuffle_buffer_size": 0}, "shuffle_buffer_size"),
         ({"rlds_resize_size": (256, 0)}, "resize_size"),
         ({"rlds_action_transform": "unknown"}, "action_transform"),
+        ({"rlds_storage_format": "pickle"}, "storage_format"),
         ({"rlds_q0_device": "mps"}, "q0_device"),
         ({"rlds_camera_views": ("primary", "overhead")}, "camera_views"),
     ],

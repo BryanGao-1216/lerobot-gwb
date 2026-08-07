@@ -26,6 +26,7 @@ LeRobot policy contract.
 from __future__ import annotations
 
 import copy
+import io
 import json
 import logging
 from collections.abc import Callable, Mapping
@@ -37,9 +38,15 @@ from typing import Any
 
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import IterableDataset, default_collate
 
 from lerobot.configs.default import DatasetConfig
+from lerobot.datasets.rlds_webdataset import (
+    iter_openx_tar_episodes,
+    resolve_openx_tar_paths,
+    transform_openx_tar_episode,
+)
 from lerobot.policies.actionmem.action_vqvae import (
     ActionVQVAEQ0Encoder,
     load_action_vqvae_q0_encoder,
@@ -67,6 +74,8 @@ class RLDSBackendModules:
     dl: Any
     tf: Any
     make_dataset_from_rlds: Callable[..., Any]
+    make_dataset_from_webdataset: Callable[..., Any]
+    make_restructure_fn: Callable[..., Any]
     apply_trajectory_transforms: Callable[..., Any]
     apply_per_dataset_frame_transforms: Callable[..., Any]
     apply_frame_transforms: Callable[..., Any]
@@ -154,6 +163,8 @@ def _load_rlds_backend() -> RLDSBackendModules:
         dl=dl,
         tf=tf,
         make_dataset_from_rlds=dataset_module.make_dataset_from_rlds,
+        make_dataset_from_webdataset=dataset_module.make_dataset_from_webdataset,
+        make_restructure_fn=dataset_module._make_restructure_fn,
         apply_trajectory_transforms=dataset_module.apply_trajectory_transforms,
         apply_per_dataset_frame_transforms=dataset_module.apply_per_dataset_frame_transforms,
         apply_frame_transforms=dataset_module.apply_frame_transforms,
@@ -208,6 +219,19 @@ def _load_mixture_spec(
             raise ValueError(f"RLDS mixture contains duplicate dataset {name!r}.")
         seen.add(name)
     return [(name, float(weight)) for name, weight in mixture]
+
+
+def _resolve_rlds_source_format(dataset_config: DatasetConfig, dataset_name: str) -> str:
+    configured = dataset_config.rlds_storage_format
+    has_tar_shards = bool(resolve_openx_tar_paths(dataset_config.root or "", dataset_name))
+    if configured == "auto":
+        return "webdataset" if has_tar_shards else "tfds"
+    if configured == "webdataset" and not has_tar_shards:
+        raise FileNotFoundError(
+            f"dataset.rlds_storage_format='webdataset', but no tar shards were found for "
+            f"{dataset_name!r} under {dataset_config.root!r}."
+        )
+    return configured
 
 
 def _denormalize_trajectory(trajectory: dict[str, Any], statistics: Mapping[str, Any], tf: Any):
@@ -417,9 +441,11 @@ class ActionMemRLDSDataset(IterableDataset):
         self.action_horizon = action_horizon
         self.action_dim = action_dim
         self.state_dim = state_dim
+        self.seed = seed
         self.backend = _load_rlds_backend()
         self.rank, self.world_size = _resolve_rank_and_world_size()
         self.backend.tf.random.set_seed(seed)
+        self._webdataset_sources: list[dict[str, Any]] = []
 
         mixture_spec = _load_mixture_spec(dataset_config, self.backend.named_mixtures)
         per_dataset_kwargs, base_weights = self.backend.get_oxe_dataset_kwargs_and_weights(
@@ -445,6 +471,9 @@ class ActionMemRLDSDataset(IterableDataset):
             np.asarray(base_weights, dtype=np.float64),
         )
         self.dataset_names = [kwargs["name"] for kwargs in per_dataset_kwargs]
+        self.source_formats = {
+            name: _resolve_rlds_source_format(dataset_config, name) for name in self.dataset_names
+        }
         self.sample_weights = effective_weights
         self.num_frames = int(
             max(size / weight for size, weight in zip(valid_sizes, effective_weights, strict=True))
@@ -503,22 +532,47 @@ class ActionMemRLDSDataset(IterableDataset):
                 for name, weight in zip(self.dataset_names, effective_weights, strict=True)
             ),
         )
+        logging.info(
+            "RLDS storage backends: %s",
+            ", ".join(f"{name}={self.source_formats[name]}" for name in self.dataset_names),
+        )
 
     def _build_interleaved_dataset(
         self,
         per_dataset_kwargs: list[dict[str, Any]],
         base_weights: np.ndarray,
     ) -> tuple[Any, list[Mapping[str, Any]], np.ndarray, list[int]]:
+        source_formats = [
+            _resolve_rlds_source_format(self.dataset_config, kwargs["name"]) for kwargs in per_dataset_kwargs
+        ]
+        if "webdataset" in source_formats and "tfds" in source_formats:
+            raise ValueError(
+                "A single RLDS mixture cannot currently combine local OpenX tar shards with TFDS sources. "
+                "Download tar shards for every selected source, or set dataset.rlds_storage_format='tfds'."
+            )
+        use_webdataset = bool(source_formats) and all(
+            source_format == "webdataset" for source_format in source_formats
+        )
+
         all_statistics: list[Mapping[str, Any]] = []
         valid_sizes: list[int] = []
-        for kwargs in per_dataset_kwargs:
+        for kwargs, source_format in zip(per_dataset_kwargs, source_formats, strict=True):
             statistics_kwargs = copy.deepcopy(kwargs)
             statistics_kwargs.pop("dataset_frame_transform_kwargs", None)
-            _, statistics = self.backend.make_dataset_from_rlds(
+            make_source = (
+                self.backend.make_dataset_from_webdataset
+                if source_format == "webdataset"
+                else self.backend.make_dataset_from_rlds
+            )
+            source_options = (
+                {"seed": self.seed, "statistics_only": True} if source_format == "webdataset" else {}
+            )
+            _, statistics = make_source(
                 **statistics_kwargs,
                 train=True,
                 num_parallel_calls=self.dataset_config.rlds_num_parallel_calls,
                 num_parallel_reads=self.dataset_config.rlds_num_parallel_calls,
+                **source_options,
             )
             _validate_statistics(
                 kwargs["name"], statistics, action_dim=self.action_dim, state_dim=self.state_dim
@@ -536,6 +590,31 @@ class ActionMemRLDSDataset(IterableDataset):
         if self.dataset_config.rlds_balance_weights:
             effective_weights *= np.asarray(valid_sizes, dtype=np.float64)
         effective_weights /= effective_weights.sum()
+
+        if use_webdataset:
+            for kwargs, statistics in zip(per_dataset_kwargs, all_statistics, strict=True):
+                source_kwargs = copy.deepcopy(kwargs)
+                frame_transform_kwargs = source_kwargs.pop("dataset_frame_transform_kwargs", {})
+                restructure = self.backend.make_restructure_fn(
+                    name=source_kwargs["name"],
+                    standardize_fn=source_kwargs.get("standardize_fn"),
+                    image_obs_keys=source_kwargs.get("image_obs_keys", {}),
+                    depth_obs_keys=source_kwargs.get("depth_obs_keys", {}),
+                    state_obs_keys=source_kwargs.get("state_obs_keys", ()),
+                    language_key=source_kwargs.get("language_key"),
+                    absolute_action_mask=source_kwargs.get("absolute_action_mask"),
+                )
+                paths = resolve_openx_tar_paths(self.dataset_config.root or "", source_kwargs["name"])
+                self._webdataset_sources.append(
+                    {
+                        "name": source_kwargs["name"],
+                        "paths": paths,
+                        "statistics": statistics,
+                        "restructure": restructure,
+                        "chunk_filter_fn": frame_transform_kwargs.get("chunk_filter_fn"),
+                    }
+                )
+            return None, all_statistics, effective_weights, valid_sizes
 
         datasets = []
         threads_per_dataset = max(
@@ -584,9 +663,7 @@ class ActionMemRLDSDataset(IterableDataset):
                 threads_per_dataset,
             ).flatten(num_parallel_calls=threads_per_dataset)
             if chunk_filter_fn is not None:
-                source = source.filter(
-                    partial(_filter_vqvla_action_chunk, chunk_filter_fn=chunk_filter_fn)
-                )
+                source = source.filter(partial(_filter_vqvla_action_chunk, chunk_filter_fn=chunk_filter_fn))
             source = self.backend.apply_per_dataset_frame_transforms(source, **frame_transform_kwargs)
             datasets.append(source)
 
@@ -599,6 +676,161 @@ class ActionMemRLDSDataset(IterableDataset):
             num_parallel_calls=self.dataset_config.rlds_num_parallel_calls,
         )
         return mixed.with_ram_budget(1), all_statistics, effective_weights, valid_sizes
+
+    def _decode_webdataset_image(self, encoded: Any) -> np.ndarray:
+        encoded_array = np.asarray(encoded)
+        is_decoded_image = encoded_array.ndim >= 2 and encoded_array.dtype.kind not in {"O", "S", "U"}
+        if is_decoded_image:
+            image = Image.fromarray(encoded_array.astype(np.uint8, copy=False))
+        else:
+            if encoded_array.ndim == 0:
+                encoded = encoded_array.item()
+            if not encoded:
+                return np.zeros((*self.dataset_config.rlds_resize_size, 3), dtype=np.uint8)
+            image = Image.open(io.BytesIO(encoded))
+        height, width = self.dataset_config.rlds_resize_size
+        with image:
+            image = image.convert("RGB")
+            image = image.resize((width, height), resample=Image.Resampling.LANCZOS)
+            return np.asarray(image, dtype=np.uint8)
+
+    def _iter_webdataset_source(self, source: Mapping[str, Any], source_index: int):
+        statistics = source["statistics"]
+        action_stats = statistics["action"]
+        q01 = np.asarray(action_stats["q01"], dtype=np.float32)
+        q99 = np.asarray(action_stats["q99"], dtype=np.float32)
+        minimum = np.asarray(action_stats["min"], dtype=np.float32)
+        maximum = np.asarray(action_stats["max"], dtype=np.float32)
+        normalization_mask = np.asarray(
+            action_stats.get("mask", np.ones(self.action_dim, dtype=bool)),
+            dtype=bool,
+        )
+        chunk_filter_fn = source.get("chunk_filter_fn")
+        epoch = 0
+        while True:
+            yielded_in_epoch = False
+            episode_stream = iter_openx_tar_episodes(
+                source["paths"],
+                seed=self.seed + epoch,
+                shuffle_shards=True,
+            )
+            frame_rng = np.random.default_rng(self.seed + 10_007 * source_index + epoch)
+            for episode_index, payload in enumerate(episode_stream):
+                if episode_index % self.world_size != self.rank:
+                    continue
+                trajectory = transform_openx_tar_episode(
+                    payload,
+                    tf=self.backend.tf,
+                    transform=source["restructure"],
+                )
+                action = np.asarray(trajectory["action"], dtype=np.float32)
+                observation = trajectory["observation"]
+                proprio = np.asarray(observation["proprio"], dtype=np.float32)
+                language = np.asarray(trajectory["task"]["language_instruction"])
+                if self.dataset_config.rlds_skip_unlabeled and not any(
+                    _decode_text(value) for value in language
+                ):
+                    continue
+                valid_length = action.shape[0] - self.action_horizon + 1
+                if valid_length <= 0:
+                    continue
+                frame_indices = np.arange(valid_length)
+                frame_rng.shuffle(frame_indices)
+                for frame_index in frame_indices:
+                    action_chunk = action[frame_index : frame_index + self.action_horizon]
+                    normalized_chunk = np.clip(
+                        2.0 * (action_chunk - q01) / (q99 - q01 + 1e-8) - 1.0,
+                        -1.0,
+                        1.0,
+                    )
+                    normalized_chunk = np.where(normalization_mask, normalized_chunk, action_chunk)
+                    normalized_chunk = np.where(minimum == maximum, 0.0, normalized_chunk).astype(np.float32)
+                    if chunk_filter_fn is not None:
+                        keep = chunk_filter_fn(
+                            {"action": self.backend.tf.convert_to_tensor(normalized_chunk)}
+                        )
+                        if not bool(np.asarray(keep)):
+                            continue
+
+                    pad_mask_dict: dict[str, np.ndarray] = {}
+                    frame_observation: dict[str, Any] = {
+                        "proprio": proprio[frame_index : frame_index + 1],
+                        "pad_mask_dict": pad_mask_dict,
+                    }
+                    for view in self.dataset_config.rlds_camera_views:
+                        key = f"image_{view}"
+                        encoded = np.asarray(observation[key])[frame_index]
+                        encoded_array = np.asarray(encoded)
+                        image_is_present = (
+                            True
+                            if encoded_array.ndim >= 2
+                            else bool(encoded_array.item() if encoded_array.ndim == 0 else encoded)
+                        )
+                        # Keep images compressed while frames are in the large
+                        # cross-episode shuffle buffer. Decode only the frame
+                        # selected for the next training sample.
+                        frame_observation[key] = encoded
+                        pad_mask_dict[key] = np.asarray([image_is_present], dtype=bool)
+
+                    yielded_in_epoch = True
+                    yield {
+                        "observation": frame_observation,
+                        "task": {"language_instruction": language[frame_index]},
+                        "action": action_chunk,
+                        _ACTION_VQVAE_INPUT: normalized_chunk,
+                        ACTION_VQVAE_Q01: np.broadcast_to(q01, action_chunk.shape),
+                        ACTION_VQVAE_Q99: np.broadcast_to(q99, action_chunk.shape),
+                        ACTION_VQVAE_NORMALIZATION_MASK: np.broadcast_to(
+                            normalization_mask, action_chunk.shape
+                        ),
+                        "dataset_name": source["name"],
+                    }
+            if not yielded_in_epoch:
+                raise ValueError(
+                    f"OpenX tar source {source['name']!r} produced no valid samples on rank "
+                    f"{self.rank}/{self.world_size}."
+                )
+            epoch += 1
+
+    def _materialize_webdataset_frame(self, frame: Mapping[str, Any]) -> dict[str, Any]:
+        materialized = dict(frame)
+        observation = dict(frame["observation"])
+        materialized["observation"] = observation
+        for view in self.dataset_config.rlds_camera_views:
+            key = f"image_{view}"
+            observation[key] = self._decode_webdataset_image(observation[key])[None]
+        return materialized
+
+    def _iter_weighted_webdatasets(self):
+        iterators = [
+            iter(self._iter_webdataset_source(source, source_index))
+            for source_index, source in enumerate(self._webdataset_sources)
+        ]
+        rng = np.random.default_rng(self.seed + self.rank)
+        shuffle_buffer: list[Mapping[str, Any]] = []
+
+        def next_weighted_frame():
+            source_index = int(rng.choice(len(iterators), p=self.sample_weights))
+            return next(iterators[source_index])
+
+        logging.info(
+            "Filling the OpenX tar shuffle buffer with %d compressed frames before training starts.",
+            self.dataset_config.rlds_shuffle_buffer_size,
+        )
+        while len(shuffle_buffer) < self.dataset_config.rlds_shuffle_buffer_size:
+            shuffle_buffer.append(next_weighted_frame())
+            if len(shuffle_buffer) % 10_000 == 0:
+                logging.info(
+                    "OpenX tar shuffle buffer: %d/%d frames.",
+                    len(shuffle_buffer),
+                    self.dataset_config.rlds_shuffle_buffer_size,
+                )
+        logging.info("OpenX tar shuffle buffer is ready.")
+        while True:
+            buffer_index = int(rng.integers(len(shuffle_buffer)))
+            frame = shuffle_buffer[buffer_index]
+            shuffle_buffer[buffer_index] = next_weighted_frame()
+            yield self._materialize_webdataset_frame(frame)
 
     def _to_lerobot_sample(self, frame: Mapping[str, Any]) -> dict[str, Any]:
         observation = frame["observation"]
@@ -629,9 +861,7 @@ class ActionMemRLDSDataset(IterableDataset):
             (ACTION_VQVAE_NORMALIZATION_MASK, action_vqvae_mask),
         ):
             if value.shape != (self.action_dim,):
-                raise ValueError(
-                    f"Expected {name} shape {(self.action_dim,)}, got {value.shape}."
-                )
+                raise ValueError(f"Expected {name} shape {(self.action_dim,)}, got {value.shape}.")
         sample: dict[str, Any] = {
             OBS_STATE: torch.from_numpy(state),
             ACTION: torch.from_numpy(action.copy()),
@@ -656,6 +886,10 @@ class ActionMemRLDSDataset(IterableDataset):
         return sample
 
     def __iter__(self):
+        if self._webdataset_sources:
+            for frame in self._iter_weighted_webdatasets():
+                yield self._to_lerobot_sample(frame)
+            return
         for frame in self._dataset.as_numpy_iterator():
             yield self._to_lerobot_sample(frame)
 

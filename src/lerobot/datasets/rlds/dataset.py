@@ -36,6 +36,98 @@ overwatch = logging.getLogger(__name__)
 tf.config.set_visible_devices([], "GPU")
 
 
+def _standardize_and_restructure_trajectory(
+    traj,
+    *,
+    name,
+    standardize_fn,
+    image_obs_keys,
+    depth_obs_keys,
+    state_obs_keys,
+    language_key,
+    absolute_action_mask,
+):
+    if standardize_fn is not None:
+        traj = standardize_fn(traj)
+
+    required_keys = {"observation", "action"}
+    if language_key is not None:
+        required_keys.add(language_key)
+    if not all(key in traj for key in required_keys):
+        raise ValueError(
+            f"Trajectory is missing keys: {required_keys - set(traj.keys())}. "
+            "Did you write a `standardize_fn`?"
+        )
+
+    traj_len = tf.shape(traj["action"])[0]
+    old_obs = traj["observation"]
+    new_obs = {}
+    for new, old in image_obs_keys.items():
+        new_obs[f"image_{new}"] = tf.repeat("", traj_len) if old is None else old_obs[old]
+    for new, old in depth_obs_keys.items():
+        new_obs[f"depth_{new}"] = tf.repeat("", traj_len) if old is None else old_obs[old]
+
+    if state_obs_keys:
+        new_obs["proprio"] = tf.concat(
+            [
+                tf.zeros((traj_len, 1), dtype=tf.float32)
+                if key is None
+                else tf.cast(old_obs[key], tf.float32)
+                for key in state_obs_keys
+            ],
+            axis=1,
+        )
+    new_obs["timestep"] = tf.range(traj_len)
+
+    task = {}
+    if language_key is not None:
+        if traj[language_key].dtype != tf.string:
+            raise ValueError(
+                f"Language key {language_key} has dtype {traj[language_key].dtype}, but it must be tf.string."
+            )
+        task["language_instruction"] = traj.pop(language_key)
+
+    traj = {
+        "observation": new_obs,
+        "task": task,
+        "action": tf.cast(traj["action"], tf.float32),
+        "dataset_name": tf.repeat(name, traj_len),
+    }
+    if absolute_action_mask is not None:
+        if len(absolute_action_mask) != traj["action"].shape[-1]:
+            raise ValueError(
+                f"Length of absolute_action_mask ({len(absolute_action_mask)}) "
+                f"does not match action dimension ({traj['action'].shape[-1]})."
+            )
+        traj["absolute_action_mask"] = tf.tile(
+            tf.convert_to_tensor(absolute_action_mask, dtype=tf.bool)[None],
+            [traj_len, 1],
+        )
+    return traj
+
+
+def _make_restructure_fn(
+    *,
+    name,
+    standardize_fn,
+    image_obs_keys,
+    depth_obs_keys,
+    state_obs_keys,
+    language_key,
+    absolute_action_mask,
+):
+    return partial(
+        _standardize_and_restructure_trajectory,
+        name=name,
+        standardize_fn=standardize_fn,
+        image_obs_keys=image_obs_keys,
+        depth_obs_keys=depth_obs_keys,
+        state_obs_keys=state_obs_keys,
+        language_key=language_key,
+        absolute_action_mask=absolute_action_mask,
+    )
+
+
 def make_action_dataset_from_rlds(
     name: str,
     data_dir: str,
@@ -236,82 +328,15 @@ def make_dataset_from_rlds(
         - action                        # action vector
         - dataset_name                  # name of the dataset
     """
-    REQUIRED_KEYS = {"observation", "action"}
-    if language_key is not None:
-        REQUIRED_KEYS.add(language_key)
-
-    def restructure(traj):
-        # apply a standardization function, if provided
-        if standardize_fn is not None:
-            traj = standardize_fn(traj)
-
-        if not all(k in traj for k in REQUIRED_KEYS):
-            raise ValueError(
-                f"Trajectory is missing keys: {REQUIRED_KEYS - set(traj.keys())}. "
-                "Did you write a `standardize_fn`?"
-            )
-
-        # extracts images, depth images and proprio from the "observation" dict
-        traj_len = tf.shape(traj["action"])[0]
-        old_obs = traj["observation"]
-        new_obs = {}
-        for new, old in image_obs_keys.items():
-            if old is None:
-                new_obs[f"image_{new}"] = tf.repeat("", traj_len)  # padding
-            else:
-                new_obs[f"image_{new}"] = old_obs[old]
-
-        for new, old in depth_obs_keys.items():
-            if old is None:
-                new_obs[f"depth_{new}"] = tf.repeat("", traj_len)  # padding
-            else:
-                new_obs[f"depth_{new}"] = old_obs[old]
-
-        if state_obs_keys:
-            new_obs["proprio"] = tf.concat(
-                [
-                    (
-                        tf.zeros((traj_len, 1), dtype=tf.float32)  # padding
-                        if key is None
-                        else tf.cast(old_obs[key], tf.float32)
-                    )
-                    for key in state_obs_keys
-                ],
-                axis=1,
-            )
-
-        # add timestep info
-        new_obs["timestep"] = tf.range(traj_len)
-
-        # extracts `language_key` into the "task" dict
-        task = {}
-        if language_key is not None:
-            if traj[language_key].dtype != tf.string:
-                raise ValueError(
-                    f"Language key {language_key} has dtype {traj[language_key].dtype}, "
-                    "but it must be tf.string."
-                )
-            task["language_instruction"] = traj.pop(language_key)
-
-        traj = {
-            "observation": new_obs,
-            "task": task,
-            "action": tf.cast(traj["action"], tf.float32),
-            "dataset_name": tf.repeat(name, traj_len),
-        }
-
-        if absolute_action_mask is not None:
-            if len(absolute_action_mask) != traj["action"].shape[-1]:
-                raise ValueError(
-                    f"Length of absolute_action_mask ({len(absolute_action_mask)}) "
-                    f"does not match action dimension ({traj['action'].shape[-1]})."
-                )
-            traj["absolute_action_mask"] = tf.tile(
-                tf.convert_to_tensor(absolute_action_mask, dtype=tf.bool)[None],
-                [traj_len, 1],
-            )
-
-        return traj
+    restructure = _make_restructure_fn(
+        name=name,
+        standardize_fn=standardize_fn,
+        image_obs_keys=image_obs_keys,
+        depth_obs_keys=depth_obs_keys,
+        state_obs_keys=state_obs_keys,
+        language_key=language_key,
+        absolute_action_mask=absolute_action_mask,
+    )
 
     builder = tfds.builder(name, data_dir=data_dir)
 
@@ -365,6 +390,89 @@ def make_dataset_from_rlds(
     )
 
     return dataset, dataset_statistics
+
+
+def make_dataset_from_webdataset(
+    name: str,
+    data_dir: str,
+    *,
+    train: bool,
+    standardize_fn: Optional[Callable[[dict], dict]] = None,
+    shuffle: bool = True,
+    image_obs_keys: Dict[str, Optional[str]] = {},
+    depth_obs_keys: Dict[str, Optional[str]] = {},
+    state_obs_keys: List[Optional[str]] = (),
+    language_key: Optional[str] = None,
+    action_proprio_normalization_type: NormalizationType = NormalizationType.NORMAL,
+    dataset_statistics: Optional[Union[dict, str]] = None,
+    absolute_action_mask: Optional[List[bool]] = None,
+    action_normalization_mask: Optional[List[bool]] = None,
+    num_parallel_reads: int = tf.data.AUTOTUNE,
+    num_parallel_calls: int = tf.data.AUTOTUNE,
+    seed: int = 0,
+    statistics_only: bool = False,
+) -> Tuple[dl.DLataset, dict]:
+    """Compute statistics used by the direct local OpenX tar stream."""
+    del num_parallel_reads
+    if not train:
+        raise ValueError("Local OpenX WebDataset currently supports only the training stream.")
+
+    from lerobot.datasets.rlds_webdataset import (
+        load_or_compute_openx_tar_statistics,
+        openx_tar_manifest,
+        resolve_openx_tar_paths,
+    )
+
+    restructure = _make_restructure_fn(
+        name=name,
+        standardize_fn=standardize_fn,
+        image_obs_keys=image_obs_keys,
+        depth_obs_keys=depth_obs_keys,
+        state_obs_keys=state_obs_keys,
+        language_key=language_key,
+        absolute_action_mask=absolute_action_mask,
+    )
+
+    paths = resolve_openx_tar_paths(data_dir, name)
+    if not paths:
+        raise FileNotFoundError(
+            f"No OpenX WebDataset tar shards found for {name!r} under {data_dir!r}. "
+            f"Expected {data_dir}/{name}/*.tar."
+        )
+    manifest = openx_tar_manifest(paths)
+
+    if isinstance(dataset_statistics, str):
+        with tf.io.gfile.GFile(dataset_statistics, "r") as f:
+            dataset_statistics = json.load(f)
+    elif dataset_statistics is None:
+        dataset_statistics = load_or_compute_openx_tar_statistics(
+            paths=paths,
+            tf=tf,
+            restructure_fn=restructure,
+            hash_dependencies=(
+                name,
+                repr(manifest),
+                str(state_obs_keys),
+                inspect.getsource(standardize_fn) if standardize_fn is not None else "",
+            ),
+        )
+    dataset_statistics = tree_map(np.array, dataset_statistics)
+
+    if action_normalization_mask is not None:
+        if len(action_normalization_mask) != dataset_statistics["action"]["mean"].shape[-1]:
+            raise ValueError(
+                f"Length of skip_normalization_mask ({len(action_normalization_mask)}) "
+                f"does not match action dimension ({dataset_statistics['action']['mean'].shape[-1]})."
+            )
+        dataset_statistics["action"]["mask"] = np.array(action_normalization_mask)
+
+    if not statistics_only:
+        raise ValueError(
+            "OpenX tar training is streamed directly by ActionMemRLDSDataset; "
+            "make_dataset_from_webdataset is only its statistics adapter."
+        )
+    del shuffle, action_proprio_normalization_type, num_parallel_calls, seed
+    return None, dataset_statistics
 
 
 def apply_trajectory_transforms(
