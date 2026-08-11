@@ -26,7 +26,7 @@ from ..smolvla.configuration_smolvla import SmolVLAConfig
 @PreTrainedConfig.register_subclass("smol_actionmem")
 @dataclass
 class SmolActionMemConfig(SmolVLAConfig):
-    """SmolVLA architecture with ActionMem token generation and VQ flow initialization."""
+    """SmolVLA with ActionMem token generation and code-conditioned flow matching."""
 
     chunk_size: int = 16
     n_action_steps: int = 16
@@ -41,11 +41,13 @@ class SmolActionMemConfig(SmolVLAConfig):
     # Action tokens are inserted as validated token IDs by the policy processor.
     tokenizer_name: str | None = None
     action_token_map_path: str | None = None
+    # Retained for compatibility with existing policy configs and token-map
+    # metadata. The policy no longer loads the VQ-VAE decoder at runtime.
     action_vqvae_checkpoint_path: str | None = None
 
-    # The VQ-VAE reconstruction is in VQ-VLA's BOUNDS_Q99 space. Restore the
-    # OXE action first (while preserving masked gripper dimensions), then map
-    # it into the flow target's MEAN_STD space.
+    # Legacy decoded-flow-source fields. They remain loadable so existing
+    # checkpoints do not require config migration, but the Gaussian-source
+    # conditional-flow implementation does not consume them.
     action_vqvae_input_q01: list[float] | None = None
     action_vqvae_input_q99: list[float] | None = None
     action_vqvae_input_mask: list[bool] | None = None
@@ -122,9 +124,7 @@ class SmolActionMemConfig(SmolVLAConfig):
             if self.action_vqvae_input_mask is None or len(self.action_vqvae_input_mask) != len(
                 self.action_vqvae_input_q01
             ):
-                raise ValueError(
-                    "action_vqvae_input_mask must be set and match the q01/q99 dimension."
-                )
+                raise ValueError("action_vqvae_input_mask must be set and match the q01/q99 dimension.")
         if (self.action_vqvae_flow_mean is None) != (self.action_vqvae_flow_std is None):
             raise ValueError(
                 "action_vqvae_flow_mean and action_vqvae_flow_std must either both be set or both be None."

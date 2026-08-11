@@ -20,32 +20,24 @@ from __future__ import annotations
 
 import logging
 import math
-from pathlib import Path
 from typing import Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
-from lerobot.configs import NormalizationMode
 from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN_MASK,
     ACTION_TOKENS,
-    ACTION_VQVAE_NORMALIZATION_MASK,
-    ACTION_VQVAE_Q01,
-    ACTION_VQVAE_Q99,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
 )
 from lerobot.utils.import_utils import require_package
 
-from ..actionmem.action_vqvae import ActionVQVAEQ0Decoder, load_action_vqvae_q0_decoder
 from ..actionmem.modeling_actionmem import (
-    _configure_action_vqvae_flow_normalization,
     _masked_action_token_cross_entropy,
-    _restore_vqvla_oxe_actions,
     _select_action_token,
 )
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
@@ -56,7 +48,6 @@ from ..smolvla.modeling_smolvla import (
     VLAFlowMatching,
     make_att_2d_masks,
     pad_tensor,
-    pad_vector,
 )
 from .configuration_smol_actionmem import SmolActionMemConfig
 from .smolvlm_with_expert import SmolActionMemVLMWithExpertModel
@@ -66,27 +57,8 @@ from .tokenization_smol_actionmem import (
 )
 
 
-def _configure_flow_normalization_if_available(
-    config: SmolActionMemConfig,
-    dataset_stats: dict[str, dict[str, Tensor]] | None,
-) -> None:
-    """Persist runtime action stats, while allowing creation of a base conversion artifact."""
-    action_normalization = NormalizationMode(config.normalization_mapping["ACTION"])
-    if action_normalization is NormalizationMode.IDENTITY:
-        config.action_vqvae_flow_mean = None
-        config.action_vqvae_flow_std = None
-        return
-    if (
-        dataset_stats is None
-        and config.action_vqvae_flow_mean is None
-        and config.action_vqvae_flow_std is None
-    ):
-        return
-    _configure_action_vqvae_flow_normalization(config, dataset_stats)
-
-
 class SmolActionMemFlowMatching(VLAFlowMatching):
-    """SmolVLA flow expert conditioned on a generated discrete action token."""
+    """SmolVLA Gaussian flow expert conditioned on a discrete action token."""
 
     def __init__(self, config: SmolActionMemConfig, rtc_processor=None):
         # VLAFlowMatching is deliberately not initialized through super(): its
@@ -149,52 +121,6 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         self.add_image_special_tokens = config.add_image_special_tokens
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = config.prefix_length
-
-        action_normalization = NormalizationMode(config.normalization_mapping["ACTION"])
-        self._normalize_action_vqvae_flow_source = action_normalization is NormalizationMode.MEAN_STD
-        q01 = config.action_vqvae_input_q01
-        q99 = config.action_vqvae_input_q99
-        input_mask = config.action_vqvae_input_mask
-        if q01 is not None and q99 is not None and input_mask is not None:
-            if len(q01) != self.action_token_map.action_dim or len(input_mask) != len(q01):
-                raise ValueError(
-                    "Smol ActionMem VQ-VAE input statistics must match action dimension "
-                    f"{self.action_token_map.action_dim}."
-                )
-            self.register_buffer(
-                "_action_vqvae_input_q01", torch.tensor(q01, dtype=torch.float32), persistent=False
-            )
-            self.register_buffer(
-                "_action_vqvae_input_q99", torch.tensor(q99, dtype=torch.float32), persistent=False
-            )
-            self.register_buffer(
-                "_action_vqvae_input_mask", torch.tensor(input_mask, dtype=torch.bool), persistent=False
-            )
-        else:
-            # Conversion can create a base artifact before dataset statistics
-            # are known. Training/inference decoding still requires them.
-            self.register_buffer("_action_vqvae_input_q01", None, persistent=False)
-            self.register_buffer("_action_vqvae_input_q99", None, persistent=False)
-            self.register_buffer("_action_vqvae_input_mask", None, persistent=False)
-        mean = config.action_vqvae_flow_mean
-        std = config.action_vqvae_flow_std
-        if self._normalize_action_vqvae_flow_source and mean is not None:
-            if len(mean) != self.action_token_map.action_dim:
-                raise ValueError(
-                    f"Action normalization stats have dimension {len(mean)}, but the VQ-VAE action "
-                    f"dimension is {self.action_token_map.action_dim}."
-                )
-            self.register_buffer("_action_vqvae_flow_mean", torch.tensor(mean, dtype=torch.float32))
-            self.register_buffer("_action_vqvae_flow_std", torch.tensor(std, dtype=torch.float32))
-        else:
-            self.register_buffer("_action_vqvae_flow_mean", None, persistent=False)
-            self.register_buffer("_action_vqvae_flow_std", None, persistent=False)
-
-        checkpoint_path = config.action_vqvae_checkpoint_path or self.action_token_map.vqvae_checkpoint_path
-        self.action_vqvae_checkpoint_path = (
-            str(Path(checkpoint_path).expanduser().resolve()) if checkpoint_path is not None else None
-        )
-        object.__setattr__(self, "_action_vqvae", None)
 
         self._training_stage_configured = False
         self.configure_training_stage()
@@ -282,109 +208,9 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             offset=self.config.time_sampling_offset,
         )
 
-    def _get_action_vqvae(self, device: torch.device) -> ActionVQVAEQ0Decoder:
-        if self.action_vqvae_checkpoint_path is None:
-            raise ValueError(
-                "Set action_vqvae_checkpoint_path or vqvae.checkpoint_path in the Smol ActionMem "
-                "token map before running flow training or inference."
-            )
-        checkpoint_path = Path(self.action_vqvae_checkpoint_path)
-        if not checkpoint_path.is_file():
-            raise FileNotFoundError(f"Action VQ-VAE checkpoint does not exist: {checkpoint_path}")
-
-        action_vqvae = self.__dict__.get("_action_vqvae")
-        if action_vqvae is None:
-            action_vqvae = load_action_vqvae_q0_decoder(checkpoint_path)
-            if action_vqvae.horizon != self.config.chunk_size:
-                raise ValueError(
-                    f"Action VQ-VAE horizon ({action_vqvae.horizon}) does not match "
-                    f"chunk_size ({self.config.chunk_size})."
-                )
-            if action_vqvae.action_dim != self.action_token_map.action_dim:
-                raise ValueError(
-                    f"Action VQ-VAE action_dim ({action_vqvae.action_dim}) does not match "
-                    f"the token map ({self.action_token_map.action_dim})."
-                )
-            if action_vqvae.codebook_size != self.action_token_map.codebook_size:
-                raise ValueError(
-                    f"Action VQ-VAE codebook_size ({action_vqvae.codebook_size}) does not match "
-                    f"the token map ({self.action_token_map.codebook_size})."
-                )
-            object.__setattr__(self, "_action_vqvae", action_vqvae)
-
-        if action_vqvae.q0_codebook.device != device:
-            action_vqvae.to(device=device, dtype=torch.float32)
-        action_vqvae.eval()
-        return action_vqvae
-
-    @torch.no_grad()
-    def decode_action_tokens(
-        self,
-        action_tokens: Tensor,
-        input_q01: Tensor | None = None,
-        input_q99: Tensor | None = None,
-        input_mask: Tensor | None = None,
-    ) -> Tensor:
-        action_tokens = action_tokens.reshape(-1)
-        invalid = (action_tokens < self.action_token_map.token_id_min) | (
-            action_tokens > self.action_token_map.token_id_max
-        )
-        if torch.any(invalid):
-            invalid_ids = action_tokens[invalid].detach().cpu().tolist()
-            raise ValueError(
-                f"Action token IDs must be in [{self.action_token_map.token_id_min}, "
-                f"{self.action_token_map.token_id_max}], got {invalid_ids}."
-            )
-
-        q0_codes = self.action_token_map.anchor_token_id - action_tokens
-        decoded_actions = self._get_action_vqvae(action_tokens.device)(q0_codes)
-        selected_q01 = self._action_vqvae_input_q01 if input_q01 is None else input_q01
-        selected_q99 = self._action_vqvae_input_q99 if input_q99 is None else input_q99
-        selected_mask = self._action_vqvae_input_mask if input_mask is None else input_mask
-        if selected_q01 is None or selected_q99 is None or selected_mask is None:
-            raise ValueError(
-                "Smol ActionMem requires VQ-VLA q01/q99/mask statistics from the training dataset "
-                "or saved policy config before decoding action tokens."
-            )
-        decoded_actions = _restore_vqvla_oxe_actions(
-            decoded_actions,
-            selected_q01,
-            selected_q99,
-            selected_mask,
-            self.config.action_vqvae_flow_normalization_eps,
-        )
-        if self._normalize_action_vqvae_flow_source:
-            if self._action_vqvae_flow_mean is None or self._action_vqvae_flow_std is None:
-                raise ValueError(
-                    "Smol ActionMem uses MEAN_STD action normalization, but flow-source mean/std "
-                    "were not supplied by the dataset or a trained policy config."
-                )
-            decoded_actions = (decoded_actions - self._action_vqvae_flow_mean) / (
-                self._action_vqvae_flow_std + self.config.action_vqvae_flow_normalization_eps
-            )
-        return pad_vector(decoded_actions, self.config.max_action_dim)
-
-    @torch.no_grad()
-    def _make_training_flow_source(
-        self,
-        action_tokens: Tensor,
-        action_token_masks: Tensor,
-        actions: Tensor,
-        input_q01: Tensor | None = None,
-        input_q99: Tensor | None = None,
-        input_mask: Tensor | None = None,
-    ) -> Tensor:
-        valid_targets = action_token_masks[:, -1].bool()
-        source_actions = self.sample_noise(actions.shape, actions.device)
-        if torch.any(valid_targets):
-            decoded_actions = self.decode_action_tokens(
-                action_tokens[valid_targets, -1],
-                None if input_q01 is None else input_q01[valid_targets],
-                None if input_q99 is None else input_q99[valid_targets],
-                None if input_mask is None else input_mask[valid_targets],
-            )
-            source_actions[valid_targets] = decoded_actions.to(source_actions.dtype)
-        return source_actions
+    def _make_training_flow_source(self, actions: Tensor) -> Tensor:
+        """Sample the standard Gaussian source used by conditional flow matching."""
+        return self.sample_noise(actions.shape, actions.device)
 
     def _validate_action_token_sequence(self, action_tokens, action_token_masks) -> None:
         if action_tokens is None or action_token_masks is None:
@@ -560,9 +386,6 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         noise=None,
         time=None,
         *,
-        action_vqvae_input_q01: Tensor | None = None,
-        action_vqvae_input_q99: Tensor | None = None,
-        action_vqvae_input_mask: Tensor | None = None,
         compute_flow: bool = True,
         compute_action_token: bool = True,
     ) -> dict[str, Tensor]:
@@ -603,18 +426,14 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         if state is None or actions is None or time is None:
             raise ValueError("Flow training requires state, actions, and time tensors.")
         if noise is None:
-            noise = self._make_training_flow_source(
-                action_tokens,
-                action_token_masks,
-                actions,
-                action_vqvae_input_q01,
-                action_vqvae_input_q99,
-                action_vqvae_input_mask,
-            )
+            noise = self._make_training_flow_source(actions)
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
+        # The final valid action token is the ground-truth q0 code during
+        # training. It is part of the prefix, so every flow suffix token can
+        # attend to it while predicting the Gaussian-to-action vector field.
         prefix_embs, prefix_pad_masks, prefix_att_masks, query_positions = self.embed_prefix(
             images,
             img_masks,
@@ -701,9 +520,8 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             self.action_token_map.token_id_max,
         )
 
-        # SmolVLA's mixed self/cross cache does not support appending a generated
-        # VLM token to the existing mixed prefix. Rebuild once with the same
-        # memory/state/query ordering and cache that complete prefix.
+        # Rebuild and cache the complete prefix with the generated q0 code.
+        # This cache is the code condition read by every Euler denoising step.
         generated_sequence = torch.cat([action_prompt_tokens, generated_action_token], dim=1)
         generated_masks = torch.cat(
             [
@@ -733,7 +551,10 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         )
 
         if noise is None:
-            noise = self.decode_action_tokens(generated_action_token)
+            noise = self.sample_noise(
+                (state.shape[0], self.config.chunk_size, self.config.max_action_dim),
+                state.device,
+            )
         return euler_integrate(
             lambda input_x_t, timestep: super(SmolActionMemFlowMatching, self).denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
@@ -762,7 +583,6 @@ class SmolActionMemPolicy(SmolVLAPolicy):
         PreTrainedPolicy.__init__(self, config)
         config.validate_features()
         self.config = config
-        _configure_flow_normalization_if_available(config, kwargs.get("dataset_stats"))
         self.init_rtc_processor()
         self.model = SmolActionMemFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
@@ -856,9 +676,6 @@ class SmolActionMemPolicy(SmolVLAPolicy):
             actions,
             noise,
             time,
-            action_vqvae_input_q01=batch.get(ACTION_VQVAE_Q01),
-            action_vqvae_input_q99=batch.get(ACTION_VQVAE_Q99),
-            action_vqvae_input_mask=batch.get(ACTION_VQVAE_NORMALIZATION_MASK),
             compute_flow=compute_flow,
             compute_action_token=compute_action_token,
         )

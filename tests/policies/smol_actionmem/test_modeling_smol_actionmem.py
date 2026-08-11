@@ -4,6 +4,7 @@ import pytest
 import torch
 from torch import nn
 
+import lerobot.policies.smol_actionmem.modeling_smol_actionmem as modeling_smol_actionmem
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.smol_actionmem.configuration_smol_actionmem import SmolActionMemConfig
 from lerobot.policies.smol_actionmem.modeling_smol_actionmem import (
@@ -63,6 +64,25 @@ def test_embed_prefix_orders_state_before_action_tokens():
     )
 
 
+def test_training_flow_source_is_standard_gaussian_noise():
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
+    nn.Module.__init__(model)
+    actions = torch.zeros(2, 16, 7)
+    sampled_noise = torch.randn_like(actions)
+    calls = []
+
+    def sample_noise(shape, device):
+        calls.append((shape, device))
+        return sampled_noise
+
+    model.sample_noise = sample_noise
+
+    source = model._make_training_flow_source(actions)
+
+    assert source is sampled_noise
+    assert calls == [(actions.shape, actions.device)]
+
+
 class _StageModel(SmolActionMemFlowMatching):
     def __init__(self, stage):
         nn.Module.__init__(self)
@@ -90,16 +110,16 @@ def test_training_stage_selects_branch(stage, vlm_trainable, expert_trainable):
     model = _StageModel(stage)
     model.configure_training_stage()
     vlm = [
-        parameter
-        for name, parameter in model.named_parameters()
-        if name.startswith("vlm_with_expert.vlm.")
+        parameter for name, parameter in model.named_parameters() if name.startswith("vlm_with_expert.vlm.")
     ]
     expert = [
         parameter
         for name, parameter in model.named_parameters()
         if model._is_action_expert_parameter(name) and not name.startswith("state_proj.")
     ]
-    state_projection = [parameter for name, parameter in model.named_parameters() if name.startswith("state_proj.")]
+    state_projection = [
+        parameter for name, parameter in model.named_parameters() if name.startswith("state_proj.")
+    ]
     assert vlm and expert
     assert all(parameter.requires_grad is vlm_trainable for parameter in vlm)
     assert all(parameter.requires_grad is expert_trainable for parameter in expert)
@@ -235,3 +255,93 @@ def test_default_peft_targets_cover_both_branches_and_projections():
     ]
     assert all(re.fullmatch(pattern, module) for module in expected_modules)
     assert not re.fullmatch(pattern, "model.vlm_with_expert.vlm.model.vision_model.encoder.layers.0")
+
+
+class _InferenceHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(10, 2))
+
+    def forward(self, hidden):
+        logits = torch.zeros(*hidden.shape[:-1], 10, device=hidden.device)
+        logits[..., 7] = 10
+        return logits
+
+
+class _InferenceVLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.output_head = _InferenceHead()
+        self.vlm = type("VLM", (), {"get_output_embeddings": lambda _: self.output_head})()
+        self.forward_calls = 0
+
+    def forward(self, *, inputs_embeds, **kwargs):
+        del kwargs
+        self.forward_calls += 1
+        return (inputs_embeds[0], None), "prefix_cache"
+
+
+def test_inference_uses_generated_code_condition_with_gaussian_noise(monkeypatch):
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
+    nn.Module.__init__(model)
+    model.config = type(
+        "Config",
+        (),
+        {
+            "num_inference_steps": 2,
+            "chunk_size": 2,
+            "max_action_dim": 2,
+            "use_cache": True,
+            "rtc_config": None,
+        },
+    )()
+    model.action_token_map = type(
+        "TokenMap",
+        (),
+        {"token_id_min": 6, "token_id_max": 8, "action_query_token_id": 9},
+    )()
+    model.rtc_processor = None
+    model.vlm_with_expert = _InferenceVLM()
+    embedded_action_sequences = []
+
+    def embed_prefix(
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        action_tokens,
+        action_token_masks,
+        state,
+    ):
+        del images, img_masks, lang_tokens, lang_masks, action_token_masks, state
+        embedded_action_sequences.append(action_tokens.clone())
+        return (
+            torch.ones(1, 5, 2),
+            torch.ones(1, 5, dtype=torch.bool),
+            torch.zeros(1, 5, dtype=torch.bool),
+            torch.tensor([4]),
+        )
+
+    model.embed_prefix = embed_prefix
+    sampled_noise = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    model.sample_noise = lambda shape, device: sampled_noise
+    monkeypatch.setattr(
+        modeling_smol_actionmem,
+        "euler_integrate",
+        lambda denoise_fn, noise, num_steps, **kwargs: noise,
+    )
+
+    output = model.sample_actions(
+        images=[],
+        img_masks=[],
+        lang_tokens=torch.ones(1, 3, dtype=torch.long),
+        lang_masks=torch.ones(1, 3, dtype=torch.bool),
+        action_tokens=torch.tensor([[8, 9, 0]]),
+        action_token_masks=torch.tensor([[True, True, False]]),
+        state=torch.zeros(1, 2),
+    )
+
+    assert torch.equal(output, sampled_noise)
+    assert model.vlm_with_expert.forward_calls == 2
+    assert torch.equal(embedded_action_sequences[0], torch.tensor([[8, 9]]))
+    assert torch.equal(embedded_action_sequences[1], torch.tensor([[8, 9, 7]]))
