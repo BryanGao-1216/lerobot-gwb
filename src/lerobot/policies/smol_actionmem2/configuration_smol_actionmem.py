@@ -26,7 +26,7 @@ from ..smolvla.configuration_smolvla import SmolVLAConfig
 @PreTrainedConfig.register_subclass("smol_actionmem2")
 @dataclass
 class SmolActionMem2Config(SmolVLAConfig):
-    """SmolVLA with a 256-way action classifier and independent action embeddings."""
+    """SmolVLA with a 256-way action classifier and code-conditioned flow matching."""
 
     chunk_size: int = 16
     n_action_steps: int = 16
@@ -42,13 +42,15 @@ class SmolActionMem2Config(SmolVLAConfig):
     # these IDs never enter the SmolVLM tokenizer or language vocabulary.
     tokenizer_name: str | None = None
     action_token_map_path: str | None = None
+    # Retained for compatibility with existing policy configs and token-map
+    # metadata. The policy no longer loads the VQ-VAE decoder at runtime.
     action_vqvae_checkpoint_path: str | None = None
     # Initialization used only by the new action-code embedding and classifier.
     action_code_init_std: float = 0.02
 
-    # The VQ-VAE reconstruction is in VQ-VLA's BOUNDS_Q99 space. Restore the
-    # OXE action first (while preserving masked gripper dimensions), then map
-    # it into the flow target's MEAN_STD space.
+    # Legacy decoded-flow-source fields. They remain loadable so existing
+    # checkpoints do not require config migration, but the Gaussian-source
+    # conditional-flow implementation does not consume them.
     action_vqvae_input_q01: list[float] | None = None
     action_vqvae_input_q99: list[float] | None = None
     action_vqvae_input_mask: list[bool] | None = None

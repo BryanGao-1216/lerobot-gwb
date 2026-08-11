@@ -127,6 +127,18 @@ class _DummyVLM:
         return tokens.float().unsqueeze(-1).expand(-1, -1, 4)
 
 
+def test_training_flow_source_is_standard_gaussian_noise():
+    model = SmolActionMem2FlowMatching.__new__(SmolActionMem2FlowMatching)
+    nn.Module.__init__(model)
+    actions = torch.zeros(2, 3, 4)
+    expected_noise = torch.arange(actions.numel(), dtype=actions.dtype).reshape_as(actions)
+    model.sample_noise = lambda shape, device: expected_noise
+
+    source = model._make_training_flow_source(actions)
+
+    assert source is expected_noise
+
+
 def test_prefix_uses_independent_action_embedding_and_keeps_state_before_query():
     model = SmolActionMem2FlowMatching.__new__(SmolActionMem2FlowMatching)
     nn.Module.__init__(model)
@@ -207,13 +219,19 @@ class _InferenceVLM(nn.Module):
         return [inputs_embeds[0], None], "cache"
 
 
-def test_inference_uses_classifier_class_for_vq_decode(monkeypatch):
+def test_inference_uses_classifier_class_as_condition_with_gaussian_noise(monkeypatch):
     model = SmolActionMem2FlowMatching.__new__(SmolActionMem2FlowMatching)
     nn.Module.__init__(model)
     model.config = type(
         "Config",
         (),
-        {"num_inference_steps": 1, "use_cache": False, "rtc_config": None},
+        {
+            "chunk_size": 16,
+            "max_action_dim": 7,
+            "num_inference_steps": 1,
+            "use_cache": False,
+            "rtc_config": None,
+        },
     )()
     model.rtc_processor = None
     model.vlm_with_expert = _InferenceVLM()
@@ -231,14 +249,12 @@ def test_inference_uses_classifier_class_for_vq_decode(monkeypatch):
     model.state_proj = nn.Linear(2, 4)
     model.add_image_special_tokens = False
     model.prefix_length = -1
-    decoded = torch.ones(1, 16, 7)
-    decoded_classes = []
-
-    def decode_action_classes(action_classes):
-        decoded_classes.append(action_classes.clone())
-        return decoded
-
-    model.decode_action_classes = decode_action_classes
+    embedded_action_sequences = []
+    model.action_code_embedding.register_forward_pre_hook(
+        lambda module, args: embedded_action_sequences.append(args[0].clone())
+    )
+    expected_noise = torch.ones(1, 16, 7)
+    model.sample_noise = lambda shape, device: expected_noise
     monkeypatch.setattr(
         modeling_smol_actionmem2,
         "euler_integrate",
@@ -255,8 +271,9 @@ def test_inference_uses_classifier_class_for_vq_decode(monkeypatch):
         state=torch.zeros(1, 2),
     )
 
-    assert torch.equal(decoded_classes[0], torch.tensor([[7]]))
-    assert torch.equal(output, decoded)
+    assert output is expected_noise
+    assert torch.equal(embedded_action_sequences[0], torch.tensor([[256, 257, 258]]))
+    assert torch.equal(embedded_action_sequences[1], torch.tensor([[256, 257, 258, 7]]))
 
 
 class _StageModel(SmolActionMem2FlowMatching):
