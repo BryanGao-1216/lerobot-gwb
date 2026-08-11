@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from lerobot.policies.factory import get_policy_class, make_policy_config
+from lerobot.policies.smol_actionmem import modeling_smol_actionmem
 from lerobot.policies.smol_actionmem.configuration_smol_actionmem import SmolActionMemConfig
 from lerobot.policies.smol_actionmem.modeling_smol_actionmem import (
     SmolActionMemFlowMatching,
@@ -26,6 +27,18 @@ class _DummyVLM:
 
     def embed_language_tokens(self, tokens):
         return tokens.float().unsqueeze(-1).expand(-1, -1, 4)
+
+
+def test_training_flow_source_is_standard_gaussian_noise():
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
+    nn.Module.__init__(model)
+    actions = torch.zeros(2, 3, 4)
+    expected_noise = torch.arange(actions.numel(), dtype=actions.dtype).reshape_as(actions)
+    model.sample_noise = lambda shape, device: expected_noise
+
+    source = model._make_training_flow_source(actions)
+
+    assert source is expected_noise
 
 
 def test_embed_prefix_orders_state_before_action_tokens():
@@ -130,9 +143,6 @@ class _DummyCore(nn.Module):
         *,
         compute_flow,
         compute_action_token,
-        action_vqvae_input_q01=None,
-        action_vqvae_input_q99=None,
-        action_vqvae_input_mask=None,
     ):
         del (
             images,
@@ -143,9 +153,6 @@ class _DummyCore(nn.Module):
             action_token_masks,
             noise,
             time,
-            action_vqvae_input_q01,
-            action_vqvae_input_q99,
-            action_vqvae_input_mask,
         )
         self.calls.append((compute_flow, compute_action_token))
         self.states.append(state)
@@ -235,3 +242,104 @@ def test_default_peft_targets_cover_both_branches_and_projections():
     ]
     assert all(re.fullmatch(pattern, module) for module in expected_modules)
     assert not re.fullmatch(pattern, "model.vlm_with_expert.vlm.model.vision_model.encoder.layers.0")
+
+
+class _DummyInferenceHead(nn.Module):
+    def __init__(self, vocab_size: int, hidden_size: int, selected_token: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(vocab_size, hidden_size), requires_grad=False)
+        self.selected_token = selected_token
+
+    def forward(self, hidden_states):
+        logits = torch.zeros(
+            *hidden_states.shape[:-1],
+            self.weight.shape[0],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        logits[..., self.selected_token] = 1
+        return logits
+
+
+class _DummyInferenceBackbone(nn.Module):
+    def __init__(self, selected_token: int):
+        super().__init__()
+        self.head = _DummyInferenceHead(16, 4, selected_token)
+
+    def get_output_embeddings(self):
+        return self.head
+
+
+class _DummyInferenceVLM(nn.Module):
+    def __init__(self, selected_token: int):
+        super().__init__()
+        self.vlm = _DummyInferenceBackbone(selected_token)
+
+    def forward(self, *, inputs_embeds, **kwargs):
+        del kwargs
+        prefix = inputs_embeds[0]
+        return (prefix, None), {"cached": True}
+
+
+def test_inference_uses_generated_code_condition_with_gaussian_noise(monkeypatch):
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
+    nn.Module.__init__(model)
+    model.config = type(
+        "Config",
+        (),
+        {
+            "chunk_size": 3,
+            "max_action_dim": 4,
+            "num_inference_steps": 5,
+            "use_cache": True,
+        },
+    )()
+    model.rtc_processor = None
+    model.action_token_map = type(
+        "Map",
+        (),
+        {
+            "action_query_token_id": 9,
+            "token_id_min": 7,
+            "token_id_max": 7,
+        },
+    )()
+    model.vlm_with_expert = _DummyInferenceVLM(selected_token=7)
+
+    embedded_action_sequences = []
+
+    def embed_prefix(images, img_masks, lang_tokens, lang_masks, action_tokens, action_masks, state=None):
+        del images, img_masks, lang_tokens, lang_masks, state
+        embedded_action_sequences.append(action_tokens.clone())
+        batch_size, sequence_length = action_tokens.shape
+        embeddings = torch.zeros(batch_size, sequence_length, 4)
+        return (
+            embeddings,
+            action_masks.bool(),
+            torch.ones_like(action_masks, dtype=torch.bool),
+            torch.zeros(batch_size, dtype=torch.long),
+        )
+
+    model.embed_prefix = embed_prefix
+    expected_noise = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+    model.sample_noise = lambda shape, device: expected_noise
+    model._rtc_enabled = lambda: False
+    monkeypatch.setattr(
+        modeling_smol_actionmem,
+        "euler_integrate",
+        lambda denoise_step, noise, num_steps, **kwargs: noise,
+    )
+
+    actions = model.sample_actions(
+        images=[],
+        img_masks=[],
+        lang_tokens=torch.ones(1, 1, dtype=torch.long),
+        lang_masks=torch.ones(1, 1, dtype=torch.bool),
+        action_tokens=torch.tensor([[9, 0]]),
+        action_token_masks=torch.tensor([[True, False]]),
+        state=torch.zeros(1, 2),
+    )
+
+    assert actions is expected_noise
+    assert torch.equal(embedded_action_sequences[0], torch.tensor([[9]]))
+    assert torch.equal(embedded_action_sequences[1], torch.tensor([[9, 7]]))

@@ -48,7 +48,6 @@ from ..smolvla.modeling_smolvla import (
     VLAFlowMatching,
     make_att_2d_masks,
     pad_tensor,
-    pad_vector,
 )
 from .configuration_smol_actionmem import SmolActionMemConfig
 from .smolvlm_with_expert import SmolActionMemVLMWithExpertModel
@@ -387,9 +386,6 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         noise=None,
         time=None,
         *,
-        action_vqvae_input_q01: Tensor | None = None,
-        action_vqvae_input_q99: Tensor | None = None,
-        action_vqvae_input_mask: Tensor | None = None,
         compute_flow: bool = True,
         compute_action_token: bool = True,
     ) -> dict[str, Tensor]:
@@ -430,18 +426,14 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         if state is None or actions is None or time is None:
             raise ValueError("Flow training requires state, actions, and time tensors.")
         if noise is None:
-            noise = self._make_training_flow_source(
-                action_tokens,
-                action_token_masks,
-                actions,
-                action_vqvae_input_q01,
-                action_vqvae_input_q99,
-                action_vqvae_input_mask,
-            )
+            noise = self._make_training_flow_source(actions)
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
+        # The final valid action token is the ground-truth q0 code during
+        # training. It is part of the prefix, so every flow suffix token can
+        # attend to it while predicting the Gaussian-to-action vector field.
         prefix_embs, prefix_pad_masks, prefix_att_masks, query_positions = self.embed_prefix(
             images,
             img_masks,
@@ -528,9 +520,8 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             self.action_token_map.token_id_max,
         )
 
-        # SmolVLA's mixed self/cross cache does not support appending a generated
-        # VLM token to the existing mixed prefix. Rebuild once with the same
-        # memory/state/query ordering and cache that complete prefix.
+        # Rebuild and cache the complete prefix with the generated q0 code.
+        # This cache is the code condition read by every Euler denoising step.
         generated_sequence = torch.cat([action_prompt_tokens, generated_action_token], dim=1)
         generated_masks = torch.cat(
             [
@@ -560,7 +551,10 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         )
 
         if noise is None:
-            noise = self.decode_action_tokens(generated_action_token)
+            noise = self.sample_noise(
+                (state.shape[0], self.config.chunk_size, self.config.max_action_dim),
+                state.device,
+            )
         return euler_integrate(
             lambda input_x_t, timestep: super(SmolActionMemFlowMatching, self).denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
@@ -589,7 +583,6 @@ class SmolActionMemPolicy(SmolVLAPolicy):
         PreTrainedPolicy.__init__(self, config)
         config.validate_features()
         self.config = config
-        _configure_flow_normalization_if_available(config, kwargs.get("dataset_stats"))
         self.init_rtc_processor()
         self.model = SmolActionMemFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
@@ -683,9 +676,6 @@ class SmolActionMemPolicy(SmolVLAPolicy):
             actions,
             noise,
             time,
-            action_vqvae_input_q01=batch.get(ACTION_VQVAE_Q01),
-            action_vqvae_input_q99=batch.get(ACTION_VQVAE_Q99),
-            action_vqvae_input_mask=batch.get(ACTION_VQVAE_NORMALIZATION_MASK),
             compute_flow=compute_flow,
             compute_action_token=compute_action_token,
         )
