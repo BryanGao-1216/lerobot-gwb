@@ -229,9 +229,11 @@ def test_vqvae_q0_encoder_loader_matches_nearest_codebook_entry(tmp_path):
     actions = torch.tensor([[[-0.5], [0.25]], [[0.5], [-0.25]]])
     with torch.inference_mode():
         latents = encoder(actions.unsqueeze(1))
-        expected = torch.cdist(latents, q0_codebook).argmin(dim=-1)
+        expected_distances = torch.cdist(latents, q0_codebook).square()
+        expected = expected_distances.argmin(dim=-1)
 
     assert torch.equal(loaded(actions), expected)
+    assert torch.allclose(loaded.compute_code_distances(actions), expected_distances, atol=1e-6)
     assert not any(parameter.requires_grad for parameter in loaded.parameters())
 
 

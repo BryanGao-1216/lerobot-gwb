@@ -54,6 +54,7 @@ from lerobot.policies.actionmem.action_vqvae import (
 from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN,
+    ACTION_TOKEN_Q0_DISTANCES,
     ACTION_VQVAE_NORMALIZATION_MASK,
     ACTION_VQVAE_Q01,
     ACTION_VQVAE_Q99,
@@ -137,8 +138,10 @@ class RLDSActionTokenCollator:
             device=self.device, dtype=torch.float32, non_blocking=True
         )
         with torch.inference_mode():
-            q0_codes = self.encoder(actions)
+            q0_distances = self.encoder.compute_code_distances(actions)
+            q0_codes = q0_distances.argmin(dim=-1)
         batch[ACTION_TOKEN] = q0_codes.to(device="cpu", dtype=torch.long)
+        batch[ACTION_TOKEN_Q0_DISTANCES] = q0_distances.to(device="cpu", dtype=torch.float32)
         return batch
 
 

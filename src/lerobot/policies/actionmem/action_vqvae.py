@@ -456,7 +456,7 @@ class ActionVQVAEQ0Encoder(nn.Module):
         self.action_dim = encoder.action_dim
         self.codebook_size = q0_codebook.shape[0]
 
-    def forward(self, actions: Tensor) -> Tensor:
+    def _encode_latents(self, actions: Tensor) -> Tensor:
         actions = actions.to(device=self.q0_codebook.device, dtype=torch.float32)
         if actions.ndim != 3 or actions.shape[1:] != (self.horizon, self.action_dim):
             raise ValueError(
@@ -485,9 +485,15 @@ class ActionVQVAEQ0Encoder(nn.Module):
                 device=encoder_input.device, dtype=encoder_input.dtype
             )
 
-        latents = self.encoder(encoder_input)
-        distances = _squared_distance(latents.float(), self.q0_codebook.float())
-        return distances.argmin(dim=-1)
+        return self.encoder(encoder_input)
+
+    def compute_code_distances(self, actions: Tensor) -> Tensor:
+        """Return squared latent distances to every first-layer codebook center."""
+        latents = self._encode_latents(actions)
+        return _squared_distance(latents.float(), self.q0_codebook.float()).clamp_min_(0)
+
+    def forward(self, actions: Tensor) -> Tensor:
+        return self.compute_code_distances(actions).argmin(dim=-1)
 
 
 def _load_checkpoint(path: Path) -> Mapping[str, Any]:

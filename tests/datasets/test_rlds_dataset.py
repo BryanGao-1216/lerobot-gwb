@@ -42,6 +42,7 @@ from lerobot.datasets.rlds_webdataset import (
     stack_openx_episode_steps,
 )
 from lerobot.utils.constants import (
+    ACTION_TOKEN_Q0_DISTANCES,
     ACTION_VQVAE_NORMALIZATION_MASK,
     ACTION_VQVAE_Q01,
     ACTION_VQVAE_Q99,
@@ -353,9 +354,11 @@ def test_rlds_collator_encodes_only_normalized_vqvae_action_input():
         def __init__(self):
             self.actions = None
 
-        def __call__(self, actions):
+        def compute_code_distances(self, actions):
             self.actions = actions.clone()
-            return torch.tensor([17], dtype=torch.long, device=actions.device)
+            distances = torch.ones(actions.shape[0], 256, device=actions.device)
+            distances[:, 17] = 0
+            return distances
 
     collator = object.__new__(RLDSActionTokenCollator)
     collator.device = torch.device("cpu")
@@ -378,6 +381,8 @@ def test_rlds_collator_encodes_only_normalized_vqvae_action_input():
     assert torch.equal(collator.encoder.actions, normalized_action.unsqueeze(0))
     assert torch.equal(batch["action"], raw_action.unsqueeze(0))
     assert torch.equal(batch["action_token"], torch.tensor([17]))
+    assert batch[ACTION_TOKEN_Q0_DISTANCES].shape == (1, 256)
+    assert batch[ACTION_TOKEN_Q0_DISTANCES][0].argmin().item() == 17
     assert torch.equal(batch[ACTION_VQVAE_NORMALIZATION_MASK], torch.tensor([[True, True, False]]))
     assert _ACTION_VQVAE_INPUT not in batch
 

@@ -29,6 +29,7 @@ from torch import Tensor, nn
 from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN_MASK,
+    ACTION_TOKEN_Q0_DISTANCES,
     ACTION_TOKENS,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
@@ -36,7 +37,6 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.import_utils import require_package
 
-from ..actionmem.modeling_actionmem import _masked_action_token_cross_entropy
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
 from ..pretrained import PreTrainedPolicy
 from ..smolvla.modeling_smolvla import (
@@ -361,27 +361,59 @@ class SmolActionMem2FlowMatching(VLAFlowMatching):
         query_positions: Tensor,
         action_tokens: Tensor,
         action_token_masks: Tensor,
+        q0_distances: Tensor | None,
     ) -> dict[str, Tensor]:
         batch_indices = torch.arange(prefix_out.shape[0], device=prefix_out.device)
         query_hidden = prefix_out[batch_indices, query_positions]
         query_hidden = query_hidden.to(dtype=self.action_classifier.weight.dtype)
         logits = self.action_classifier(query_hidden)
         target_mask = action_token_masks[:, -1].bool()
-        # The masked inference/episode-tail slot contains the model-local
-        # padding ID (K + 3), which is intentionally outside the K classifier
-        # classes. Cross entropy validates targets before masking, so replace
-        # only invalid/masked slots with an arbitrary valid class first.
         safe_targets = torch.where(target_mask, action_tokens[:, -1], 0)
-        per_sample, mean_loss, accuracy = _masked_action_token_cross_entropy(
-            logits,
-            safe_targets,
-            target_mask,
-        )
+        if torch.any(target_mask):
+            if q0_distances is None:
+                raise ValueError(
+                    "Smol ActionMem 2 soft-token training requires "
+                    f"'{ACTION_TOKEN_Q0_DISTANCES}' in the processed batch. Use the ActionMem RLDS "
+                    "collator or provide squared distances from the frozen VQ encoder latent to "
+                    "all q0 codebook centers."
+                )
+            if q0_distances.shape != logits.shape:
+                raise ValueError(
+                    f"Expected q0 distances with shape {tuple(logits.shape)}, got "
+                    f"{tuple(q0_distances.shape)}."
+                )
+            distances = q0_distances.to(device=logits.device, dtype=torch.float32)
+            if not torch.isfinite(distances).all():
+                raise ValueError("q0 latent distances must contain only finite values.")
+            soft_targets = torch.softmax(
+                -distances / self.config.action_token_soft_target_temperature,
+                dim=-1,
+            )
+            log_predictions = F.log_softmax(logits.float(), dim=-1)
+            per_sample = F.kl_div(log_predictions, soft_targets, reduction="none").sum(dim=-1)
+            target_entropy_per_sample = -(
+                soft_targets * soft_targets.clamp_min(torch.finfo(soft_targets.dtype).tiny).log()
+            ).sum(dim=-1)
+            target_peak_per_sample = soft_targets.max(dim=-1).values
+        else:
+            per_sample = torch.zeros(logits.shape[0], device=logits.device, dtype=torch.float32)
+            target_entropy_per_sample = torch.zeros_like(per_sample)
+            target_peak_per_sample = torch.zeros_like(per_sample)
+
+        mask = target_mask.to(dtype=per_sample.dtype)
+        valid_count = mask.sum().clamp_min(1)
+        per_sample = per_sample * mask
+        mean_loss = per_sample.sum() / valid_count
+        accuracy = ((logits.argmax(dim=-1) == safe_targets) & target_mask).float().sum() / valid_count
+        target_entropy = (target_entropy_per_sample * mask).sum() / valid_count
+        target_peak_probability = (target_peak_per_sample * mask).sum() / valid_count
         return {
             "action_token_loss_per_sample": per_sample,
             "action_token_target_mask": target_mask,
-            "action_token_ce_loss": mean_loss,
+            "action_token_kl_loss": mean_loss,
             "action_token_accuracy": accuracy,
+            "action_token_soft_target_entropy": target_entropy,
+            "action_token_soft_target_peak_probability": target_peak_probability,
         }
 
     def forward(
@@ -397,6 +429,7 @@ class SmolActionMem2FlowMatching(VLAFlowMatching):
         noise=None,
         time=None,
         *,
+        action_token_q0_distances: Tensor | None = None,
         compute_flow: bool = True,
         compute_action_token: bool = True,
     ) -> dict[str, Tensor]:
@@ -432,6 +465,7 @@ class SmolActionMem2FlowMatching(VLAFlowMatching):
                 query_positions,
                 action_tokens,
                 action_token_masks,
+                action_token_q0_distances,
             )
 
         if state is None or actions is None or time is None:
@@ -478,6 +512,7 @@ class SmolActionMem2FlowMatching(VLAFlowMatching):
                     query_positions,
                     action_tokens,
                     action_token_masks,
+                    action_token_q0_distances,
                 )
             )
         return output
@@ -682,6 +717,7 @@ class SmolActionMem2Policy(SmolVLAPolicy):
             actions,
             noise,
             time,
+            action_token_q0_distances=batch.get(ACTION_TOKEN_Q0_DISTANCES),
             compute_flow=compute_flow,
             compute_action_token=compute_action_token,
         )
@@ -714,7 +750,7 @@ class SmolActionMem2Policy(SmolVLAPolicy):
             )
 
         if compute_action_token:
-            token_loss = output["action_token_ce_loss"]
+            token_loss = output["action_token_kl_loss"]
             target_mask = output["action_token_target_mask"]
             valid_count = target_mask.sum().clamp(min=1)
             token_scale = target_mask.numel() / valid_count
@@ -723,11 +759,17 @@ class SmolActionMem2Policy(SmolVLAPolicy):
             per_sample_terms.append(self.config.action_token_loss_weight * per_sample_token)
             metrics.update(
                 {
-                    "action_token_ce_loss": token_loss.item(),
-                    "weighted_action_token_ce_loss": (
+                    "action_token_kl_loss": token_loss.item(),
+                    "weighted_action_token_kl_loss": (
                         self.config.action_token_loss_weight * token_loss
                     ).item(),
                     "action_token_accuracy": output["action_token_accuracy"].item(),
+                    "action_token_soft_target_entropy": output[
+                        "action_token_soft_target_entropy"
+                    ].item(),
+                    "action_token_soft_target_peak_probability": output[
+                        "action_token_soft_target_peak_probability"
+                    ].item(),
                 }
             )
 

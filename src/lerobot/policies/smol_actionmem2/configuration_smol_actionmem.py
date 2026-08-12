@@ -47,6 +47,8 @@ class SmolActionMem2Config(SmolVLAConfig):
     action_vqvae_checkpoint_path: str | None = None
     # Initialization used only by the new action-code embedding and classifier.
     action_code_init_std: float = 0.02
+    # Temperature of y_k = softmax(-||E(A) - e_k||^2 / T).
+    action_token_soft_target_temperature: float = 1.0
 
     # Legacy decoded-flow-source fields. They remain loadable so existing
     # checkpoints do not require config migration, but the Gaussian-source
@@ -145,6 +147,11 @@ class SmolActionMem2Config(SmolVLAConfig):
             )
         if self.action_code_init_std <= 0:
             raise ValueError(f"action_code_init_std must be positive, got {self.action_code_init_std}.")
+        if self.action_token_soft_target_temperature <= 0:
+            raise ValueError(
+                "action_token_soft_target_temperature must be positive, got "
+                f"{self.action_token_soft_target_temperature}."
+            )
 
         for name in (
             "tensorboard_log_freq",
