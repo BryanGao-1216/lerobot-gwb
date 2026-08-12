@@ -47,8 +47,7 @@ class SmolActionMemConfig(SmolVLAConfig):
     action_vqvae_checkpoint_path: str | None = None
     # Initialization used only by the new action-code embedding and classifier.
     action_code_init_std: float = 0.02
-    # Temperature applied after normalizing each sample's q0 distances by their
-    # standard deviation: y_k = softmax(-normalized_distance_k / T).
+    # Temperature of y_k = softmax(-||E(A) - e_k||^2 / T).
     action_token_soft_target_temperature: float = 1.0
 
     # Legacy decoded-flow-source fields. They remain loadable so existing
