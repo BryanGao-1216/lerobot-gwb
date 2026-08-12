@@ -918,10 +918,6 @@ def resolve_actionmem_token_metadata(policy_config: Any) -> SimpleNamespace:
         from lerobot.policies.smol_actionmem.tokenization_smol_actionmem import SmolActionMemTokenMap
 
         return SmolActionMemTokenMap.from_json(token_map_path)
-    if policy_config.type == "smol_actionmem2":
-        from lerobot.policies.smol_actionmem2.tokenization_smol_actionmem import SmolActionMem2TokenMap
-
-        return SmolActionMem2TokenMap.from_json(token_map_path)
     if policy_config.type == "actionmem":
         from lerobot.policies.actionmem.tokenization_actionmem import ActionMemTokenMap
 

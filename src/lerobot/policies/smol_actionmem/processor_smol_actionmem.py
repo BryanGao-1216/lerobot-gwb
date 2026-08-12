@@ -39,17 +39,19 @@ from lerobot.utils.constants import ACTION_TOKEN, ACTION_TOKEN_MASK, ACTION_TOKE
 from .configuration_smol_actionmem import SmolActionMemConfig
 from .tokenization_smol_actionmem import (
     SmolActionMemTokenMap,
-    default_smol_action_token_map_path,
+    default_smol_actionmem_token_map_path,
 )
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="smol_actionmem_action_token_processor")
-class SmolActionMemActionTokenProcessorStep(ComplementaryDataProcessorStep):
-    """Map each frame's q0 code to the ActionMem token protocol.
+@ProcessorStepRegistry.register(name="smol_actionmem_action_code_processor")
+class SmolActionMemActionCodeProcessorStep(ComplementaryDataProcessorStep):
+    """Map each frame's q0 code to the independent action context.
 
     History is intentionally empty in this first version:
     ``[MEMORY_START, MEMORY_END, ACTION_QUERY, CURRENT_TARGET]``.
+    These IDs index a model-local embedding table and never enter the SmolVLM
+    tokenizer or language embedding matrix.
     """
 
     token_map_path: str
@@ -65,7 +67,7 @@ class SmolActionMemActionTokenProcessorStep(ComplementaryDataProcessorStep):
         language_tokens = observation.get(OBS_LANGUAGE_TOKENS)
         if not isinstance(language_tokens, torch.Tensor) or language_tokens.ndim < 1:
             raise ValueError(
-                "SmolActionMemActionTokenProcessorStep must run after TokenizerProcessorStep so that "
+                "SmolActionMemActionCodeProcessorStep must run after TokenizerProcessorStep so that "
                 f"'{OBS_LANGUAGE_TOKENS}' is available."
             )
         return language_tokens.shape[0], language_tokens.device
@@ -74,14 +76,14 @@ class SmolActionMemActionTokenProcessorStep(ComplementaryDataProcessorStep):
         batch_size, device = self._batch_size_and_device()
         tokens = torch.full(
             (batch_size, 4),
-            self._token_map.pad_token_id,
+            self._token_map.padding_id,
             dtype=torch.long,
             device=device,
         )
         masks = torch.zeros((batch_size, 4), dtype=torch.bool, device=device)
-        tokens[:, 0] = self._token_map.memory_start_token_id
-        tokens[:, 1] = self._token_map.memory_end_token_id
-        tokens[:, 2] = self._token_map.action_query_token_id
+        tokens[:, 0] = self._token_map.memory_start_id
+        tokens[:, 1] = self._token_map.memory_end_id
+        tokens[:, 2] = self._token_map.action_query_id
         masks[:, :3] = True
 
         raw_q0 = complementary_data.get(self.action_token_key)
@@ -104,7 +106,7 @@ class SmolActionMemActionTokenProcessorStep(ComplementaryDataProcessorStep):
                     f"or equal invalid_value={self._token_map.invalid_value}; got {invalid_codes}."
                 )
 
-            tokens[valid, 3] = self._token_map.anchor_token_id - q0[valid]
+            tokens[valid, 3] = q0[valid] - self._token_map.code_id_min
             masks[valid, 3] = True
 
         complementary_data[ACTION_TOKENS] = tokens
@@ -147,8 +149,8 @@ def make_smol_actionmem_pre_post_processors(
             padding_side="right",
             max_length=config.tokenizer_max_length,
         ),
-        SmolActionMemActionTokenProcessorStep(
-            token_map_path=config.action_token_map_path or str(default_smol_action_token_map_path()),
+        SmolActionMemActionCodeProcessorStep(
+            token_map_path=config.action_token_map_path or str(default_smol_actionmem_token_map_path()),
         ),
         steps.to_device,
         relative_step,

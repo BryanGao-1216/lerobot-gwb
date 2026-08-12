@@ -15,12 +15,12 @@
 from .configuration_smol_actionmem import SmolActionMemConfig
 from .modeling_smol_actionmem import SmolActionMemPolicy
 from .processor_smol_actionmem import (
-    SmolActionMemActionTokenProcessorStep,
+    SmolActionMemActionCodeProcessorStep,
     make_smol_actionmem_pre_post_processors,
 )
 
 __all__ = [
-    "SmolActionMemActionTokenProcessorStep",
+    "SmolActionMemActionCodeProcessorStep",
     "SmolActionMemConfig",
     "SmolActionMemPolicy",
     "make_smol_actionmem_pre_post_processors",

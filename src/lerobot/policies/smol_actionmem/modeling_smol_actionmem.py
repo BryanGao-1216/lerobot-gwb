@@ -29,6 +29,7 @@ from torch import Tensor, nn
 from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN_MASK,
+    ACTION_TOKEN_Q0_DISTANCES,
     ACTION_TOKENS,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
@@ -36,10 +37,6 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.import_utils import require_package
 
-from ..actionmem.modeling_actionmem import (
-    _masked_action_token_cross_entropy,
-    _select_action_token,
-)
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
 from ..pretrained import PreTrainedPolicy
 from ..smolvla.modeling_smolvla import (
@@ -53,12 +50,12 @@ from .configuration_smol_actionmem import SmolActionMemConfig
 from .smolvlm_with_expert import SmolActionMemVLMWithExpertModel
 from .tokenization_smol_actionmem import (
     SmolActionMemTokenMap,
-    default_smol_action_token_map_path,
+    default_smol_actionmem_token_map_path,
 )
 
 
 class SmolActionMemFlowMatching(VLAFlowMatching):
-    """SmolVLA flow expert conditioned on a generated discrete action token."""
+    """Gaussian flow expert conditioned on an independent discrete action code."""
 
     def __init__(self, config: SmolActionMemConfig, rtc_processor=None):
         # VLAFlowMatching is deliberately not initialized through super(): its
@@ -68,18 +65,18 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         self.config = config
         self.rtc_processor = rtc_processor
 
-        token_map_path = config.action_token_map_path or str(default_smol_action_token_map_path())
-        self.action_token_map = SmolActionMemTokenMap.from_json(token_map_path)
-        config.action_token_map_path = self.action_token_map.path
-        if config.chunk_size != self.action_token_map.action_horizon:
+        token_map_path = config.action_token_map_path or str(default_smol_actionmem_token_map_path())
+        self.action_code_map = SmolActionMemTokenMap.from_json(token_map_path)
+        config.action_token_map_path = self.action_code_map.path
+        if config.chunk_size != self.action_code_map.action_horizon:
             raise ValueError(
                 f"Smol ActionMem chunk_size ({config.chunk_size}) must match the VQ-VAE action horizon "
-                f"({self.action_token_map.action_horizon})."
+                f"({self.action_code_map.action_horizon})."
             )
-        if config.max_action_dim < self.action_token_map.action_dim:
+        if config.max_action_dim < self.action_code_map.action_dim:
             raise ValueError(
                 f"max_action_dim ({config.max_action_dim}) must be at least the VQ-VAE action dimension "
-                f"({self.action_token_map.action_dim})."
+                f"({self.action_code_map.action_dim})."
             )
 
         self.vlm_with_expert = SmolActionMemVLMWithExpertModel(
@@ -95,7 +92,19 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             expert_width_multiplier=config.expert_width_multiplier,
             device=config.device if config.device is not None else "auto",
         )
-        self._ensure_action_vocabulary()
+
+        hidden_size = self.vlm_with_expert.config.text_config.hidden_size
+        self.action_code_embedding = nn.Embedding(
+            self.action_code_map.context_vocab_size,
+            hidden_size,
+            padding_idx=self.action_code_map.padding_id,
+        )
+        self.action_classifier = nn.Linear(hidden_size, self.action_code_map.codebook_size)
+        nn.init.normal_(self.action_code_embedding.weight, mean=0.0, std=config.action_code_init_std)
+        nn.init.normal_(self.action_classifier.weight, mean=0.0, std=config.action_code_init_std)
+        nn.init.zeros_(self.action_classifier.bias)
+        with torch.no_grad():
+            self.action_code_embedding.weight[self.action_code_map.padding_id].zero_()
 
         self.state_proj = nn.Linear(
             config.max_state_dim,
@@ -132,35 +141,30 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
-    def _ensure_action_vocabulary(self) -> None:
-        input_embeddings = self.vlm_with_expert.vlm.get_input_embeddings()
-        current_vocab_size = input_embeddings.num_embeddings
-        required_vocab_size = self.action_token_map.required_vocab_size
-        if current_vocab_size < required_vocab_size:
-            self.vlm_with_expert.vlm.resize_token_embeddings(required_vocab_size)
-            logging.info(
-                "Expanded SmolVLM vocabulary from %d to %d for ActionMem tokens.",
-                current_vocab_size,
-                required_vocab_size,
-            )
-        output_embeddings = self.vlm_with_expert.vlm.get_output_embeddings()
-        if output_embeddings is None or output_embeddings.weight.shape[0] < required_vocab_size:
-            raise ValueError(
-                "SmolVLM output embeddings were not resized to the ActionMem vocabulary size "
-                f"{required_vocab_size}."
-            )
-
     @staticmethod
     def _is_vlm_parameter(name: str) -> bool:
-        # state_proj is shared: it conditions both action-token generation and
-        # the flow expert, so it must remain trainable in vlm_only as well.
-        return name.startswith(("vlm_with_expert.vlm.", "state_proj."))
+        # The pretrained language vocabulary is deliberately excluded. Action
+        # classification and action memory use their own trainable modules.
+        is_vlm_backbone = name.startswith("vlm_with_expert.vlm.") and not name.startswith(
+            (
+                "vlm_with_expert.vlm.lm_head.",
+                "vlm_with_expert.vlm.model.text_model.embed_tokens.",
+            )
+        )
+        return is_vlm_backbone or name.startswith(
+            (
+                "state_proj.",
+                "action_code_embedding.",
+                "action_classifier.",
+            )
+        )
 
     @staticmethod
     def _is_action_expert_parameter(name: str) -> bool:
         return name.startswith("vlm_with_expert.lm_expert.") or name.startswith(
             (
                 "state_proj.",
+                "action_code_embedding.",
                 "action_in_proj.",
                 "action_out_proj.",
                 "action_time_mlp_in.",
@@ -223,22 +227,23 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         if action_tokens.shape[1] < 2:
             raise ValueError("Smol ActionMem requires ACTION_QUERY plus a target slot.")
         invalid_query = (~action_token_masks[:, -2].bool()) | (
-            action_tokens[:, -2] != self.action_token_map.action_query_token_id
+            action_tokens[:, -2] != self.action_code_map.action_query_id
         )
         if torch.any(invalid_query):
             raise ValueError(
                 "The penultimate action token must be the valid ACTION_QUERY token "
-                f"{self.action_token_map.action_query_token_id}."
+                f"{self.action_code_map.action_query_id}."
             )
         targets = action_tokens[:, -1]
         target_masks = action_token_masks[:, -1].bool()
         invalid_targets = target_masks & (
-            (targets < self.action_token_map.token_id_min) | (targets > self.action_token_map.token_id_max)
+            (targets < self.action_code_map.action_class_min)
+            | (targets > self.action_code_map.action_class_max)
         )
         if torch.any(invalid_targets):
             raise ValueError(
-                f"Action-token targets must be in [{self.action_token_map.token_id_min}, "
-                f"{self.action_token_map.token_id_max}]."
+                f"Action-class targets must be in [{self.action_code_map.action_class_min}, "
+                f"{self.action_code_map.action_class_max}]."
             )
 
     def embed_prefix(
@@ -297,10 +302,11 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         pad_masks.append(lang_masks.bool())
         att_masks += [0] * lang_emb.shape[1]
 
-        action_token_emb = self.vlm_with_expert.embed_language_tokens(action_tokens)
+        action_token_emb = self.action_code_embedding(action_tokens)
         action_token_emb = action_token_emb * math.sqrt(action_token_emb.shape[-1])
+        action_token_emb = action_token_emb.to(dtype=lang_emb.dtype)
         query_offsets = (
-            (action_tokens == self.action_token_map.action_query_token_id) & action_token_masks.bool()
+            (action_tokens == self.action_code_map.action_query_id) & action_token_masks.bool()
         ).to(torch.int64)
         if not torch.all(query_offsets.sum(dim=1) == 1):
             raise ValueError("Each Smol ActionMem prefix must contain exactly one valid ACTION_QUERY.")
@@ -355,22 +361,59 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         query_positions: Tensor,
         action_tokens: Tensor,
         action_token_masks: Tensor,
+        q0_distances: Tensor | None,
     ) -> dict[str, Tensor]:
         batch_indices = torch.arange(prefix_out.shape[0], device=prefix_out.device)
         query_hidden = prefix_out[batch_indices, query_positions]
-        output_embeddings = self.vlm_with_expert.vlm.get_output_embeddings()
-        query_hidden = query_hidden.to(dtype=output_embeddings.weight.dtype)
-        logits = output_embeddings(query_hidden)
-        per_sample, mean_loss, accuracy = _masked_action_token_cross_entropy(
-            logits,
-            action_tokens[:, -1],
-            action_token_masks[:, -1],
-        )
+        query_hidden = query_hidden.to(dtype=self.action_classifier.weight.dtype)
+        logits = self.action_classifier(query_hidden)
+        target_mask = action_token_masks[:, -1].bool()
+        safe_targets = torch.where(target_mask, action_tokens[:, -1], 0)
+        if torch.any(target_mask):
+            if q0_distances is None:
+                raise ValueError(
+                    "Smol ActionMem soft-token training requires "
+                    f"'{ACTION_TOKEN_Q0_DISTANCES}' in the processed batch. Use the ActionMem RLDS "
+                    "collator or provide squared distances from the frozen VQ encoder latent to "
+                    "all q0 codebook centers."
+                )
+            if q0_distances.shape != logits.shape:
+                raise ValueError(
+                    f"Expected q0 distances with shape {tuple(logits.shape)}, got "
+                    f"{tuple(q0_distances.shape)}."
+                )
+            distances = q0_distances.to(device=logits.device, dtype=torch.float32)
+            if not torch.isfinite(distances).all():
+                raise ValueError("q0 latent distances must contain only finite values.")
+            soft_targets = torch.softmax(
+                -distances / self.config.action_token_soft_target_temperature,
+                dim=-1,
+            )
+            log_predictions = F.log_softmax(logits.float(), dim=-1)
+            per_sample = F.kl_div(log_predictions, soft_targets, reduction="none").sum(dim=-1)
+            target_entropy_per_sample = -(
+                soft_targets * soft_targets.clamp_min(torch.finfo(soft_targets.dtype).tiny).log()
+            ).sum(dim=-1)
+            target_peak_per_sample = soft_targets.max(dim=-1).values
+        else:
+            per_sample = torch.zeros(logits.shape[0], device=logits.device, dtype=torch.float32)
+            target_entropy_per_sample = torch.zeros_like(per_sample)
+            target_peak_per_sample = torch.zeros_like(per_sample)
+
+        mask = target_mask.to(dtype=per_sample.dtype)
+        valid_count = mask.sum().clamp_min(1)
+        per_sample = per_sample * mask
+        mean_loss = per_sample.sum() / valid_count
+        accuracy = ((logits.argmax(dim=-1) == safe_targets) & target_mask).float().sum() / valid_count
+        target_entropy = (target_entropy_per_sample * mask).sum() / valid_count
+        target_peak_probability = (target_peak_per_sample * mask).sum() / valid_count
         return {
             "action_token_loss_per_sample": per_sample,
-            "action_token_target_mask": action_token_masks[:, -1].bool(),
-            "action_token_ce_loss": mean_loss,
+            "action_token_target_mask": target_mask,
+            "action_token_kl_loss": mean_loss,
             "action_token_accuracy": accuracy,
+            "action_token_soft_target_entropy": target_entropy,
+            "action_token_soft_target_peak_probability": target_peak_probability,
         }
 
     def forward(
@@ -386,6 +429,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         noise=None,
         time=None,
         *,
+        action_token_q0_distances: Tensor | None = None,
         compute_flow: bool = True,
         compute_action_token: bool = True,
     ) -> dict[str, Tensor]:
@@ -421,6 +465,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
                 query_positions,
                 action_tokens,
                 action_token_masks,
+                action_token_q0_distances,
             )
 
         if state is None or actions is None or time is None:
@@ -431,9 +476,9 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        # The final valid action token is the ground-truth q0 code during
-        # training. It is part of the prefix, so every flow suffix token can
-        # attend to it while predicting the Gaussian-to-action vector field.
+        # The final valid local class is the ground-truth q0 code condition.
+        # It is embedded in the prefix, so every flow suffix token can attend
+        # to it while predicting the Gaussian-to-action vector field.
         prefix_embs, prefix_pad_masks, prefix_att_masks, query_positions = self.embed_prefix(
             images,
             img_masks,
@@ -467,6 +512,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
                     query_positions,
                     action_tokens,
                     action_token_masks,
+                    action_token_q0_distances,
                 )
             )
         return output
@@ -512,15 +558,10 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         )
         batch_indices = torch.arange(prefix_out.shape[0], device=prefix_out.device)
         query_hidden = prefix_out[batch_indices, query_positions]
-        output_embeddings = self.vlm_with_expert.vlm.get_output_embeddings()
-        logits = output_embeddings(query_hidden.to(dtype=output_embeddings.weight.dtype))
-        generated_action_token = _select_action_token(
-            logits,
-            self.action_token_map.token_id_min,
-            self.action_token_map.token_id_max,
-        )
+        logits = self.action_classifier(query_hidden.to(dtype=self.action_classifier.weight.dtype))
+        generated_action_token = logits.argmax(dim=-1, keepdim=True)
 
-        # Rebuild and cache the complete prefix with the generated q0 code.
+        # Rebuild and cache the complete prefix with the generated q0 class.
         # This cache is the code condition read by every Euler denoising step.
         generated_sequence = torch.cat([action_prompt_tokens, generated_action_token], dim=1)
         generated_masks = torch.cat(
@@ -676,6 +717,7 @@ class SmolActionMemPolicy(SmolVLAPolicy):
             actions,
             noise,
             time,
+            action_token_q0_distances=batch.get(ACTION_TOKEN_Q0_DISTANCES),
             compute_flow=compute_flow,
             compute_action_token=compute_action_token,
         )
@@ -708,7 +750,7 @@ class SmolActionMemPolicy(SmolVLAPolicy):
             )
 
         if compute_action_token:
-            token_loss = output["action_token_ce_loss"]
+            token_loss = output["action_token_kl_loss"]
             target_mask = output["action_token_target_mask"]
             valid_count = target_mask.sum().clamp(min=1)
             token_scale = target_mask.numel() / valid_count
@@ -717,11 +759,17 @@ class SmolActionMemPolicy(SmolVLAPolicy):
             per_sample_terms.append(self.config.action_token_loss_weight * per_sample_token)
             metrics.update(
                 {
-                    "action_token_ce_loss": token_loss.item(),
-                    "weighted_action_token_ce_loss": (
+                    "action_token_kl_loss": token_loss.item(),
+                    "weighted_action_token_kl_loss": (
                         self.config.action_token_loss_weight * token_loss
                     ).item(),
                     "action_token_accuracy": output["action_token_accuracy"].item(),
+                    "action_token_soft_target_entropy": output[
+                        "action_token_soft_target_entropy"
+                    ].item(),
+                    "action_token_soft_target_peak_probability": output[
+                        "action_token_soft_target_peak_probability"
+                    ].item(),
                 }
             )
 
@@ -737,8 +785,7 @@ class SmolActionMemPolicy(SmolVLAPolicy):
         """Create both branches so staged LoRA training can reuse one adapter."""
         vlm_targets = (
             r".*\.vlm_with_expert\.vlm\."
-            r"(model\.text_model\.layers\.[0-9]+\.self_attn\.(q|v)_proj|"
-            r"model\.text_model\.embed_tokens|lm_head)"
+            r"model\.text_model\.layers\.[0-9]+\.self_attn\.(q|v)_proj"
         )
         expert_targets = r".*\.vlm_with_expert\.lm_expert\.layers\.[0-9]+\.self_attn\.(q|v)_proj"
         projections = (
@@ -747,5 +794,7 @@ class SmolActionMemPolicy(SmolVLAPolicy):
         )
         return {
             "target_modules": rf"({vlm_targets}|{expert_targets}|{projections})",
-            "modules_to_save": [],
+            # These modules are randomly initialized for this policy and must
+            # be trained and serialized in full even when the backbone uses LoRA.
+            "modules_to_save": ["action_code_embedding", "action_classifier"],
         }

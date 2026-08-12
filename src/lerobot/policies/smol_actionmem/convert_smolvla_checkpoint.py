@@ -42,7 +42,6 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 from .configuration_smol_actionmem import SmolActionMemConfig
 from .modeling_smol_actionmem import SmolActionMemPolicy
 from .processor_smol_actionmem import make_smol_actionmem_pre_post_processors
-from .tokenization_smol_actionmem import select_low_frequency_token_ids
 
 
 def _parse_args() -> argparse.Namespace:
@@ -87,74 +86,42 @@ def _create_tokenizer_and_map(
     codebook_size = int(vqvae["codebook_size"])
 
     processor = AutoProcessor.from_pretrained(tokenizer_source)
-    tokenizer = processor.tokenizer
-    action_ids, control_ids = select_low_frequency_token_ids(tokenizer, codebook_size)
-    action_strings = [str(tokenizer.convert_ids_to_tokens(token_id)) for token_id in action_ids]
-    expected_ids = list(range(min(action_ids), min(action_ids) + codebook_size))
-    if action_ids != expected_ids:
-        raise ValueError(
-            "Action token IDs must form one existing contiguous range; got "
-            f"{action_ids[:3]} ... {action_ids[-3:]}."
-        )
-
-    control_strings = [str(tokenizer.convert_ids_to_tokens(token_id)) for token_id in control_ids]
-    if len(set(action_ids + control_ids)) != codebook_size + 3:
-        raise ValueError("The tokenizer did not assign unique IDs to all Smol ActionMem tokens.")
+    processor.save_pretrained(output_dir)
 
     if vqvae_checkpoint is not None:
         vqvae["checkpoint_path"] = str(vqvae_checkpoint.expanduser().resolve())
 
-    # q0 codes use the same reverse-contiguous formula as ActionMem: the
-    # highest selected action ID represents q0=0.
     token_map = {
-        "format_version": 1,
-        "name": "smol_actionmem_q0_low_frequency_token_map",
+        "format_version": 2,
+        "name": "smol_actionmem_q0_class_map",
         "description": (
-            "Maps the first residual VQ codebook to existing high-rank, low-frequency "
-            "tokens in the SmolVLM base BPE vocabulary."
+            "Describes the first residual VQ codebook used by Smol ActionMem's "
+            "independent classifier and embedding table."
         ),
         "vqvae": vqvae,
         "smolvlm": {
             "tokenizer_source": tokenizer_source,
-            "base_vocab_size": int(tokenizer.vocab_size),
-            "tokenizer_length": len(tokenizer),
-            "vocabulary_strategy": "reuse_high_rank_base_bpe_tokens",
-            "reused_token_id_min": min(action_ids),
-            "reused_token_id_max": max(control_ids),
+            "vocabulary_strategy": "independent_action_vocabulary",
+            "language_vocabulary_modified": False,
         },
-        "action_tokens": {
+        "action_classes": {
             "count": codebook_size,
-            "mapping_type": "reverse_contiguous",
-            "mapping_formula": "token_id = anchor_token_id - q0_code_id",
-            "anchor_token_id": max(action_ids),
-            "token_id_min": min(action_ids),
-            "token_id_max": max(action_ids),
-            "source_token_strings_by_ascending_id": action_strings,
+            "class_id_min": 0,
+            "class_id_max": codebook_size - 1,
+            "mapping_formula": "class_id = q0_code_id - vqvae.code_id_min",
         },
-        "control_tokens": {
-            "action_memory_start": {
-                "token_id": control_ids[0],
-                "source_token": control_strings[0],
-            },
-            "action_memory_end": {
-                "token_id": control_ids[1],
-                "source_token": control_strings[1],
-            },
-            "action_query": {
-                "token_id": control_ids[2],
-                "source_token": control_strings[2],
-            },
-        },
-        "padding": {
-            "token_id": int(tokenizer.pad_token_id),
-            "token": tokenizer.pad_token,
+        "action_context": {
+            "embedding_size": codebook_size + 4,
+            "memory_start_id": codebook_size,
+            "memory_end_id": codebook_size + 1,
+            "action_query_id": codebook_size + 2,
+            "padding_id": codebook_size + 3,
         },
     }
     token_map_path = output_dir / "token_map.json"
     with token_map_path.open("w", encoding="utf-8") as file:
         json.dump(token_map, file, indent=2, ensure_ascii=False)
         file.write("\n")
-    processor.save_pretrained(output_dir)
     return token_map_path
 
 
@@ -199,7 +166,6 @@ def _copy_compatible_weights(source_policy: SmolVLAPolicy, target_policy: SmolAc
     source_state = source_policy.state_dict()
     target_state = target_policy.state_dict()
     compatible_state = {}
-    expanded_keys = []
     skipped_keys = []
 
     for key, source_value in source_state.items():
@@ -210,47 +176,28 @@ def _copy_compatible_weights(source_policy: SmolVLAPolicy, target_policy: SmolAc
         if source_value.shape == target_value.shape:
             compatible_state[key] = source_value
             continue
-
-        is_vocab_matrix = (
-            source_value.ndim == target_value.ndim == 2
-            and source_value.shape[1:] == target_value.shape[1:]
-            and source_value.shape[0] < target_value.shape[0]
-            and (key.endswith("text_model.embed_tokens.weight") or key.endswith("lm_head.weight"))
-        )
-        if is_vocab_matrix:
-            expanded = target_value.detach().clone()
-            expanded[: source_value.shape[0]].copy_(
-                source_value.to(device=expanded.device, dtype=expanded.dtype)
-            )
-            compatible_state[key] = expanded
-            expanded_keys.append(key)
-        else:
-            skipped_keys.append(key)
+        skipped_keys.append(key)
 
     missing_keys, unexpected_keys = target_policy.load_state_dict(compatible_state, strict=False)
     logging.info(
-        "Transferred %d tensors; expanded %d vocabulary tensors; skipped %d source tensors.",
+        "Transferred %d tensors without changing the language vocabulary; skipped %d source tensors.",
         len(compatible_state),
-        len(expanded_keys),
         len(skipped_keys),
     )
     if unexpected_keys:
         raise RuntimeError(f"Unexpected converted checkpoint keys: {unexpected_keys}")
-    actionmem_only_missing = [
-        key
-        for key in missing_keys
-        if key not in expanded_keys
-        and not key.endswith(
-            (
-                "text_model.embed_tokens.weight",
-                "lm_head.weight",
-            )
-        )
-    ]
-    if actionmem_only_missing:
+    expected_new_modules = (
+        "model.action_code_embedding.",
+        "model.action_classifier.",
+    )
+    expected_missing = [key for key in missing_keys if key.startswith(expected_new_modules)]
+    unmatched_missing = [key for key in missing_keys if not key.startswith(expected_new_modules)]
+    if expected_missing:
+        logging.info("Initialized new independent action modules: %s", expected_missing)
+    if unmatched_missing:
         logging.warning(
             "Target-only or unmatched tensors retain their initialization: %s",
-            actionmem_only_missing,
+            unmatched_missing,
         )
 
 

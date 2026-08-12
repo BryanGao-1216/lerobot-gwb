@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for the lightweight SmolVLA-backed ActionMem policy."""
+"""Configuration for Smol ActionMem with an independent action vocabulary."""
 
 from dataclasses import dataclass, field
 
@@ -26,7 +26,7 @@ from ..smolvla.configuration_smolvla import SmolVLAConfig
 @PreTrainedConfig.register_subclass("smol_actionmem")
 @dataclass
 class SmolActionMemConfig(SmolVLAConfig):
-    """SmolVLA with ActionMem token generation and code-conditioned flow matching."""
+    """SmolVLA with a 256-way action classifier and code-conditioned flow matching."""
 
     chunk_size: int = 16
     n_action_steps: int = 16
@@ -38,12 +38,17 @@ class SmolActionMemConfig(SmolVLAConfig):
     time_sampling_offset: float = 0.001
 
     # Keep the tokenizer used for task strings separate from the VLM checkpoint.
-    # Action tokens are inserted as validated token IDs by the policy processor.
+    # The processor maps q0 codes to IDs in a model-local action embedding table;
+    # these IDs never enter the SmolVLM tokenizer or language vocabulary.
     tokenizer_name: str | None = None
     action_token_map_path: str | None = None
     # Retained for compatibility with existing policy configs and token-map
     # metadata. The policy no longer loads the VQ-VAE decoder at runtime.
     action_vqvae_checkpoint_path: str | None = None
+    # Initialization used only by the new action-code embedding and classifier.
+    action_code_init_std: float = 0.02
+    # Temperature of y_k = softmax(-||E(A) - e_k||^2 / T).
+    action_token_soft_target_temperature: float = 1.0
 
     # Legacy decoded-flow-source fields. They remain loadable so existing
     # checkpoints do not require config migration, but the Gaussian-source
@@ -124,7 +129,9 @@ class SmolActionMemConfig(SmolVLAConfig):
             if self.action_vqvae_input_mask is None or len(self.action_vqvae_input_mask) != len(
                 self.action_vqvae_input_q01
             ):
-                raise ValueError("action_vqvae_input_mask must be set and match the q01/q99 dimension.")
+                raise ValueError(
+                    "action_vqvae_input_mask must be set and match the q01/q99 dimension."
+                )
         if (self.action_vqvae_flow_mean is None) != (self.action_vqvae_flow_std is None):
             raise ValueError(
                 "action_vqvae_flow_mean and action_vqvae_flow_std must either both be set or both be None."
@@ -137,6 +144,13 @@ class SmolActionMemConfig(SmolVLAConfig):
             raise ValueError(
                 "action_vqvae_flow_normalization_eps must be positive, got "
                 f"{self.action_vqvae_flow_normalization_eps}."
+            )
+        if self.action_code_init_std <= 0:
+            raise ValueError(f"action_code_init_std must be positive, got {self.action_code_init_std}.")
+        if self.action_token_soft_target_temperature <= 0:
+            raise ValueError(
+                "action_token_soft_target_temperature must be positive, got "
+                f"{self.action_token_soft_target_temperature}."
             )
 
         for name in (

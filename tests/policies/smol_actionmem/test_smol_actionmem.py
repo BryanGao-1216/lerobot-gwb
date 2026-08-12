@@ -6,19 +6,19 @@ import pytest
 import torch
 from torch import nn
 
-import lerobot.policies.smol_actionmem2.modeling_smol_actionmem as modeling_smol_actionmem2
+import lerobot.policies.smol_actionmem.modeling_smol_actionmem as modeling_smol_actionmem
 from lerobot.datasets.rlds_dataset import resolve_actionmem_token_metadata
 from lerobot.policies.actionmem.action_vqvae import ActionVQVAEQ0Encoder
 from lerobot.policies.factory import get_policy_class, make_policy_config
-from lerobot.policies.smol_actionmem2.configuration_smol_actionmem import SmolActionMem2Config
-from lerobot.policies.smol_actionmem2.modeling_smol_actionmem import (
-    SmolActionMem2FlowMatching,
-    SmolActionMem2Policy,
+from lerobot.policies.smol_actionmem.configuration_smol_actionmem import SmolActionMemConfig
+from lerobot.policies.smol_actionmem.modeling_smol_actionmem import (
+    SmolActionMemFlowMatching,
+    SmolActionMemPolicy,
 )
-from lerobot.policies.smol_actionmem2.processor_smol_actionmem import (
-    SmolActionMem2ActionCodeProcessorStep,
+from lerobot.policies.smol_actionmem.processor_smol_actionmem import (
+    SmolActionMemActionCodeProcessorStep,
 )
-from lerobot.policies.smol_actionmem2.tokenization_smol_actionmem import SmolActionMem2TokenMap
+from lerobot.policies.smol_actionmem.tokenization_smol_actionmem import SmolActionMemTokenMap
 from lerobot.processor.converters import create_transition
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import (
@@ -66,15 +66,15 @@ def _transition(q0=None, batch_size=2):
 
 
 def test_policy_is_independently_registered():
-    config = make_policy_config("smol_actionmem2")
+    config = make_policy_config("smol_actionmem")
 
-    assert isinstance(config, SmolActionMem2Config)
-    assert get_policy_class("smol_actionmem2") is SmolActionMem2Policy
+    assert isinstance(config, SmolActionMemConfig)
+    assert get_policy_class("smol_actionmem") is SmolActionMemPolicy
 
 
 def test_config_rejects_non_positive_soft_target_temperature():
     with pytest.raises(ValueError, match="action_token_soft_target_temperature"):
-        SmolActionMem2Config(action_token_soft_target_temperature=0)
+        SmolActionMemConfig(action_token_soft_target_temperature=0)
 
 
 def test_q0_encoder_exposes_the_same_latent_distances_used_for_assignment():
@@ -107,7 +107,7 @@ def test_q0_encoder_exposes_the_same_latent_distances_used_for_assignment():
 
 
 def test_token_map_allocates_a_local_action_context(tmp_path):
-    token_map = SmolActionMem2TokenMap.from_json(_write_token_map(tmp_path))
+    token_map = SmolActionMemTokenMap.from_json(_write_token_map(tmp_path))
 
     assert token_map.action_class_min == 0
     assert token_map.action_class_max == 255
@@ -118,12 +118,12 @@ def test_token_map_allocates_a_local_action_context(tmp_path):
     assert token_map.context_vocab_size == 260
 
 
-def test_rlds_resolves_smol_actionmem2_metadata(tmp_path):
+def test_rlds_resolves_smol_actionmem_metadata(tmp_path):
     config = type(
         "Config",
         (),
         {
-            "type": "smol_actionmem2",
+            "type": "smol_actionmem",
             "pretrained_path": str(tmp_path),
             "action_token_map_path": None,
         },
@@ -137,7 +137,7 @@ def test_rlds_resolves_smol_actionmem2_metadata(tmp_path):
 
 
 def test_processor_emits_local_classes_instead_of_language_token_ids(tmp_path):
-    step = SmolActionMem2ActionCodeProcessorStep(str(_write_token_map(tmp_path)))
+    step = SmolActionMemActionCodeProcessorStep(str(_write_token_map(tmp_path)))
 
     output = step(_transition(torch.tensor([[0], [255]])))[TransitionKey.COMPLEMENTARY_DATA]
     inference = step(_transition())[TransitionKey.COMPLEMENTARY_DATA]
@@ -163,7 +163,7 @@ class _DummyVLM:
 
 
 def test_training_flow_source_is_standard_gaussian_noise():
-    model = SmolActionMem2FlowMatching.__new__(SmolActionMem2FlowMatching)
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
     actions = torch.zeros(2, 3, 4)
     expected_noise = torch.arange(actions.numel(), dtype=actions.dtype).reshape_as(actions)
@@ -175,7 +175,7 @@ def test_training_flow_source_is_standard_gaussian_noise():
 
 
 def test_prefix_uses_independent_action_embedding_and_keeps_state_before_query():
-    model = SmolActionMem2FlowMatching.__new__(SmolActionMem2FlowMatching)
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
     model.vlm_with_expert = _DummyVLM()
     model.action_code_map = type(
@@ -210,7 +210,7 @@ def test_prefix_uses_independent_action_embedding_and_keeps_state_before_query()
 
 
 def test_action_objective_is_exactly_256_way():
-    model = SmolActionMem2FlowMatching.__new__(SmolActionMem2FlowMatching)
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
     model.config = type("Config", (), {"action_token_soft_target_temperature": 1.0})()
     model.action_classifier = nn.Linear(4, 256)
@@ -232,7 +232,7 @@ def test_action_objective_is_exactly_256_way():
 
 
 def test_action_objective_ignores_out_of_range_local_padding_class():
-    model = SmolActionMem2FlowMatching.__new__(SmolActionMem2FlowMatching)
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
     model.action_classifier = nn.Linear(4, 256)
 
@@ -249,7 +249,7 @@ def test_action_objective_ignores_out_of_range_local_padding_class():
 
 
 def test_action_objective_matches_latent_distance_soft_target_kl():
-    model = SmolActionMem2FlowMatching.__new__(SmolActionMem2FlowMatching)
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
     model.config = type("Config", (), {"action_token_soft_target_temperature": 2.0})()
     model.action_classifier = nn.Linear(1, 3)
@@ -287,7 +287,7 @@ class _InferenceVLM(nn.Module):
 
 
 def test_inference_uses_classifier_class_as_condition_with_gaussian_noise(monkeypatch):
-    model = SmolActionMem2FlowMatching.__new__(SmolActionMem2FlowMatching)
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
     model.config = type(
         "Config",
@@ -323,7 +323,7 @@ def test_inference_uses_classifier_class_as_condition_with_gaussian_noise(monkey
     expected_noise = torch.ones(1, 16, 7)
     model.sample_noise = lambda shape, device: expected_noise
     monkeypatch.setattr(
-        modeling_smol_actionmem2,
+        modeling_smol_actionmem,
         "euler_integrate",
         lambda denoise_fn, noise, num_steps, **kwargs: noise,
     )
@@ -343,7 +343,7 @@ def test_inference_uses_classifier_class_as_condition_with_gaussian_noise(monkey
     assert torch.equal(embedded_action_sequences[1], torch.tensor([[256, 257, 258, 7]]))
 
 
-class _StageModel(SmolActionMem2FlowMatching):
+class _StageModel(SmolActionMemFlowMatching):
     def __init__(self, stage):
         nn.Module.__init__(self)
         self.config = type("Config", (), {"training_stage": stage, "freeze_vision_encoder": False})()
@@ -385,7 +385,7 @@ def test_training_stage_handles_new_action_modules(stage, classifier_trainable, 
 
 
 def test_default_peft_targets_do_not_train_language_vocabulary():
-    policy = SmolActionMem2Policy.__new__(SmolActionMem2Policy)
+    policy = SmolActionMemPolicy.__new__(SmolActionMemPolicy)
     defaults = policy._get_default_peft_targets()
     pattern = defaults["target_modules"]
 
