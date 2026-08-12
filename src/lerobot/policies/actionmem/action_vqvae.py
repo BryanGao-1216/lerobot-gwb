@@ -497,15 +497,30 @@ class ActionVQVAEQ0Encoder(nn.Module):
 
 
 def _load_checkpoint(path: Path) -> Mapping[str, Any]:
+    """Load a trusted Action VQ-VAE training checkpoint.
+
+    These checkpoints are not weights-only archives: the training script also
+    stores optimizer and Python/NumPy/PyTorch RNG state.  PyTorch 2.6 defaults
+    ``torch.load`` to ``weights_only=True``, which rejects that metadata.  The
+    checkpoint path is explicitly supplied by the user, so load it using the
+    same trusted-checkpoint semantics as the VQ-VAE resume path.
+    """
     try:
         checkpoint = torch.load(
             path,
             map_location="cpu",
-            weights_only=True,
+            weights_only=False,  # nosec B614: user-supplied, trusted local training checkpoint
             mmap=True,
         )
     except TypeError:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        try:
+            checkpoint = torch.load(
+                path,
+                map_location="cpu",
+                weights_only=False,  # nosec B614
+            )
+        except TypeError:  # PyTorch versions without the ``weights_only`` argument.
+            checkpoint = torch.load(path, map_location="cpu")  # nosec B614
     if not isinstance(checkpoint, Mapping):
         raise ValueError(f"Expected a checkpoint mapping in {path}, got {type(checkpoint).__name__}.")
     return checkpoint

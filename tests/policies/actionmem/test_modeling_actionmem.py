@@ -16,6 +16,7 @@
 
 import re
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -27,6 +28,7 @@ from lerobot.configs import NormalizationMode
 from lerobot.policies.actionmem.action_vqvae import (
     VQVLALikeDecoder,
     VQVLALikeEncoder,
+    _load_checkpoint,
     load_action_vqvae_q0_decoder,
     load_action_vqvae_q0_encoder,
 )
@@ -132,6 +134,25 @@ def test_restore_vqvla_actions_inverts_bounds_but_preserves_gripper():
     )
 
     assert torch.allclose(restored, torch.tensor([[3.0, 1.0]]))
+
+
+def test_vqvae_checkpoint_loader_accepts_numpy_training_metadata(tmp_path):
+    checkpoint_path = tmp_path / "action_vqvae_training_checkpoint.pt"
+    numpy_rng = np.random.RandomState(0).get_state()
+    torch.save(
+        {
+            "config": {"horizon": 2, "action_dim": 1},
+            "model": {"weight": torch.ones(1)},
+            "rng_state": {"numpy": numpy_rng},
+        },
+        checkpoint_path,
+    )
+
+    loaded = _load_checkpoint(checkpoint_path)
+
+    assert loaded["config"] == {"horizon": 2, "action_dim": 1}
+    assert torch.equal(loaded["model"]["weight"], torch.ones(1))
+    assert np.array_equal(loaded["rng_state"]["numpy"][1], numpy_rng[1])
 
 
 def test_vqvae_loader_decodes_only_the_q0_embedding(tmp_path):
