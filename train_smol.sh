@@ -5,11 +5,13 @@ lerobot-train \
   --policy.training_stage=vlm_only \
   --policy.input_features=null \
   --policy.output_features=null \
-  --dataset.repo_id=libero_test_0805 \
-  --dataset_type=rlds \
-  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/Libero \
+  --dataset.repo_id=action_tokenizer_plus \
+  --policy.action_token_soft_target_temperature=0.05 \
+  --rlds-storage-format=hybrid \
+  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/OpenX \
   --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-50000 \
   --steps=100000 \
+  --policy.tensorboard_log_freq=10 \
   --policy.optimizer_grad_clip_norm=5 \
   --batch_size=32 \
   --eval_step=0 \

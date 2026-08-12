@@ -734,6 +734,43 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
     "try": [
         ("austin_buds_dataset_converted_externally_to_rlds", 3.0),
     ],
+    "action_tokenizer_plus": [
+        ("fractal20220817_data", 0.54087122203),                # Google RT-1 Robot Data (Large-Scale)
+        ("kuka", 0.05),
+        # ("bridge_oxe", 1.0)                                   # Version of Bridge V2 in Open-X GCP Bucket
+        ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
+        # ("taco_play", 2.0),
+        ("jaco_play", 1.0),
+        ("berkeley_cable_routing", 1.0),
+        ("roboturk", 2.0),
+        # ("nyu_door_opening_surprising_effectiveness", 1.0),   # Note --> only contains wrist camera images (skip?)
+        ("viola", 2.0),
+        ("berkeley_autolab_ur5", 2.0),
+        ("toto", 1.0),
+        ("stanford_hydra_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_buds_dataset_converted_externally_to_rlds", 1.0),
+        ("nyu_franka_play_dataset_converted_externally_to_rlds", 3.0),
+        ("furniture_bench_dataset_converted_externally_to_rlds", 0.1),
+        ("ucsd_kitchen_dataset_converted_externally_to_rlds", 2.0),
+        ("austin_sailor_dataset_converted_externally_to_rlds", 1.0),
+        ("austin_sirius_dataset_converted_externally_to_rlds", 1.0),
+        # ("bc_z", 0.2),                                        # Note --> raw data is broken!
+        ("dlr_edan_shared_control_converted_externally_to_rlds", 1.0),
+        ("iamlab_cmu_pickup_insert_converted_externally_to_rlds", 1.0),
+        # ("uiuc_d3field", 1.0),                                # Note --> raw data is broken!
+        ("utaustin_mutex", 1.0),
+        ("berkeley_fanuc_manipulation", 2.0),
+        ("cmu_stretch", 1.0),
+
+        ("bc_z", 0.05),
+        # ("fmb_dataset", 1.0),
+        # ("droid", 0.5),
+        ("libero_spatial_no_noops", 2.0),
+        ("libero_object_no_noops", 2.0),
+        ("libero_goal_no_noops", 2.0),
+        ("libero_10_no_noops", 2.0),
+        ("libero_90_no_noops", 2.0),
+    ],
     
 }
 # fmt: on
