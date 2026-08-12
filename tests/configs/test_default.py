@@ -14,6 +14,7 @@
 import pytest
 
 from lerobot.configs.default import DatasetConfig
+from lerobot.configs.parser import normalize_cli_aliases
 
 
 def test_dataset_config_valid():
@@ -46,6 +47,18 @@ def test_dataset_config_rlds_defaults_are_valid():
     assert config.rlds_storage_format == "auto"
     assert config.rlds_action_transform == "oxe"
     assert not hasattr(config, "rlds_backend_path")
+
+
+def test_dataset_config_accepts_hybrid_rlds_storage():
+    config = DatasetConfig(repo_id="actionmem_mix", rlds_storage_format="hybrid")
+
+    assert config.rlds_storage_format == "hybrid"
+
+
+def test_rlds_storage_format_cli_alias_matches_mystudy():
+    assert normalize_cli_aliases(["--rlds-storage-format=hybrid"]) == [
+        "--dataset.rlds_storage_format=hybrid"
+    ]
 
 
 @pytest.mark.parametrize(

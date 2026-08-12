@@ -59,8 +59,9 @@ class DatasetConfig:
     rlds_resize_size: tuple[int, int] = (256, 256)
     rlds_skip_unlabeled: bool = True
     rlds_num_parallel_calls: int = 16
-    # ``auto`` prefers local OpenX WebDataset tar shards when they exist under
-    # ``root/<dataset_name>/*.tar`` and otherwise falls back to prepared TFDS/RLDS.
+    # ``auto`` and ``hybrid`` select local OpenX WebDataset tar shards per
+    # source when they exist under ``root/<dataset_name>/*.tar`` and otherwise
+    # use prepared TFDS/RLDS. A mixed-format mixture is sampled as one stream.
     # WebDataset shards are streamed in place and are never extracted.
     rlds_storage_format: str = "auto"
     # Keep the action convention produced by VQ-VLA's per-dataset OXE
@@ -92,9 +93,9 @@ class DatasetConfig:
             )
         if self.rlds_num_parallel_calls <= 0:
             raise ValueError(f"rlds_num_parallel_calls must be positive, got {self.rlds_num_parallel_calls}")
-        if self.rlds_storage_format not in {"auto", "tfds", "webdataset"}:
+        if self.rlds_storage_format not in {"auto", "tfds", "webdataset", "hybrid"}:
             raise ValueError(
-                "rlds_storage_format must be 'auto', 'tfds', or 'webdataset', got "
+                "rlds_storage_format must be 'auto', 'tfds', 'webdataset', or 'hybrid', got "
                 f"{self.rlds_storage_format!r}"
             )
         if self.rlds_action_transform not in {"oxe", "identity"}:

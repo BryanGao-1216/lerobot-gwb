@@ -18,6 +18,15 @@ from lerobot.datasets.rlds.utils.data_utils import NormalizationType
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = logging.getLogger(__name__)
 
+OXE_DATASET_NAME_ALIASES = {
+    # Stale VQ-VLA mixtures and the tar release use this older name.
+    "fmb_dataset": "fmb",
+}
+
+
+def canonicalize_oxe_dataset_name(dataset_name: str) -> str:
+    return OXE_DATASET_NAME_ALIASES.get(dataset_name, dataset_name)
+
 
 def make_oxe_dataset_kwargs(
     dataset_name: str,
@@ -29,6 +38,11 @@ def make_oxe_dataset_kwargs(
     action_proprio_normalization_type: NormalizationType = NormalizationType.NORMAL,
 ) -> Dict[str, Any]:
     """Generates config (kwargs) for given dataset from Open-X Embodiment."""
+    dataset_name = canonicalize_oxe_dataset_name(dataset_name)
+    if dataset_name not in OXE_DATASET_CONFIGS:
+        raise ValueError(f"No OXE dataset config is registered for `{dataset_name}`.")
+    if dataset_name not in OXE_STANDARDIZATION_TRANSFORMS:
+        raise ValueError(f"No OXE standardization transform is registered for `{dataset_name}`.")
     dataset_kwargs = deepcopy(OXE_DATASET_CONFIGS[dataset_name])
     if dataset_kwargs["action_encoding"] not in [ActionEncoding.EEF_POS, ActionEncoding.EEF_R6]:
         raise ValueError(f"Cannot load `{dataset_name}`; only EEF_POS & EEF_R6 actions supported!")
@@ -102,6 +116,7 @@ def get_oxe_dataset_kwargs_and_weights(
     """
     included_datasets, filtered_mixture_spec = set(), []
     for d_name, d_weight in mixture_spec:
+        d_name = canonicalize_oxe_dataset_name(d_name)
         if d_name in included_datasets:
             overwatch.warning(f"Skipping Duplicate Dataset: `{(d_name, d_weight)}`")
             continue

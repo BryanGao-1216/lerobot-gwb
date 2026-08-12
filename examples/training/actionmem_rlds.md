@@ -46,15 +46,17 @@ downloaded shards in their original layout:
     └── cmu_stretch_00000.tar
 ```
 
-Set `--dataset.root=/data/OpenX`. The default `rlds_storage_format=auto` selects WebDataset for a
-source when `root/<dataset_name>/*.tar` exists and otherwise uses prepared TFDS/RLDS. Set
-`--dataset.rlds_storage_format=webdataset` to require tar shards, or `tfds` to disable auto-detection.
+Set `--dataset.root=/data/OpenX`. Both `rlds_storage_format=auto` and `hybrid` select WebDataset for
+a source when `root/<dataset_name>/*.tar` exists and otherwise use prepared TFDS/RLDS. When one
+mixture contains both kinds, LeRobot preserves the configured per-dataset weights while sampling
+the tar and TFDS streams together. Set `--dataset.rlds_storage_format=webdataset` to require tar
+shards for every source, or `tfds` to disable tar auto-detection.
 Only use trusted local tar files: the release stores episodes as Python pickle objects.
-Every source in one mixture must currently use the same storage backend; a tar mixture therefore
-needs local shards for all selected source names. Tar episodes are standardized with the same OXE
-functions as the TFDS path, mixed using the configured weights, and shuffled before image decoding.
-The first iterator fills `rlds_shuffle_buffer_size` compressed frames (default 100,000) before it
-emits a batch; reduce this setting for a quick smoke test.
+Tar episodes are standardized with the same OXE functions as the TFDS path, mixed using the
+configured weights, and shuffled before image decoding.
+An all-tar stream fills `rlds_shuffle_buffer_size` compressed frames (default 100,000) before its
+first tar sample. In hybrid mode, the tar and TFDS shuffle capacities are divided according to their
+total sampling weights; reduce this setting for a quick smoke test.
 
 Tar shards do not include the TFDS statistics consumed by VQ-VLA. On the first run, LeRobot scans
 each selected source and writes a `dataset_statistics_<hash>.json` cache beside its tar files. This
@@ -69,7 +71,7 @@ lerobot-train \
   --dataset_type=rlds \
   --dataset.repo_id=actionmem_research_mix \
   --dataset.root=/data/open_x_embodiment \
-  --dataset.rlds_storage_format=auto \
+  --rlds-storage-format=hybrid \
   --dataset.rlds_mixture_path=/path/to/lerobot-gwb/examples/training/actionmem_rlds_mix.json \
   --dataset.rlds_action_vqvae_checkpoint_path=/path/to/action_vqvae.pt \
   --dataset.rlds_q0_device=cpu \

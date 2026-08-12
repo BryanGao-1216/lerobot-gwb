@@ -117,6 +117,14 @@ def rt1_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     return trajectory
 
 
+def _decode_kuka_state(value: tf.Tensor, width: int) -> tf.Tensor:
+    """Decode legacy ZLIB strings or pass through materialized tar values."""
+    if value.dtype == tf.string:
+        value = tf.io.decode_compressed(value, compression_type="ZLIB")
+        value = tf.io.decode_raw(value, tf.float32)
+    return tf.reshape(tf.cast(value, tf.float32), (-1, width))
+
+
 def kuka_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     # make gripper action absolute action, +1 = open, 0 = close
     gripper_action = trajectory["action"]["gripper_closedness_action"][:, 0]
@@ -130,18 +138,16 @@ def kuka_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
         ),
         axis=-1,
     )
-    # decode compressed state
-    eef_value = tf.io.decode_compressed(
+    # TFDS stores these states as ZLIB strings, while the OpenX tar release may
+    # already contain materialized float arrays.
+    trajectory["observation"]["clip_function_input/base_pose_tool_reached"] = _decode_kuka_state(
         trajectory["observation"]["clip_function_input/base_pose_tool_reached"],
-        compression_type="ZLIB",
+        7,
     )
-    eef_value = tf.io.decode_raw(eef_value, tf.float32)
-    trajectory["observation"]["clip_function_input/base_pose_tool_reached"] = tf.reshape(eef_value, (-1, 7))
-    gripper_value = tf.io.decode_compressed(
-        trajectory["observation"]["gripper_closed"], compression_type="ZLIB"
+    trajectory["observation"]["gripper_closed"] = _decode_kuka_state(
+        trajectory["observation"]["gripper_closed"],
+        1,
     )
-    gripper_value = tf.io.decode_raw(gripper_value, tf.float32)
-    trajectory["observation"]["gripper_closed"] = tf.reshape(gripper_value, (-1, 1))
     # trajectory["language_instruction"] = tf.fill(
     #     tf.shape(trajectory["observation"]["natural_language_instruction"]), ""
     # )  # delete uninformative language instruction
@@ -400,10 +406,16 @@ def austin_buds_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def nyu_franka_play_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
-    trajectory["observation"]["depth"] = tf.cast(trajectory["observation"]["depth"][..., 0], tf.float32)
-    trajectory["observation"]["depth_additional_view"] = tf.cast(
-        trajectory["observation"]["depth_additional_view"][..., 0], tf.float32
-    )
+    # TFDS has decoded numeric depth, while tar episodes can retain encoded
+    # strings. Action/state standardization does not need to decode tar depth.
+    depth = trajectory["observation"]["depth"]
+    if depth.dtype != tf.string:
+        trajectory["observation"]["depth"] = tf.cast(depth[..., 0], tf.float32)
+    depth_additional = trajectory["observation"]["depth_additional_view"]
+    if depth_additional.dtype != tf.string:
+        trajectory["observation"]["depth_additional_view"] = tf.cast(
+            depth_additional[..., 0], tf.float32
+        )
     trajectory["observation"]["eef_state"] = trajectory["observation"]["state"][:, -6:]
 
     # clip gripper action, +1 = open, 0 = close

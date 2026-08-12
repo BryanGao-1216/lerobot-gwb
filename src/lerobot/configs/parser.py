@@ -42,6 +42,22 @@ _config_path_args: dict[str, str] = {}
 # Storage for non-path YAML overrides so validate() can pass them to from_pretrained.
 _config_yaml_overrides: dict[str, list[str]] = {}
 
+_CLI_ALIASES = {
+    # Match the standalone myStudy/VQ-VAE training CLI while storing the value
+    # in LeRobot's nested DatasetConfig.
+    "--rlds-storage-format": "--dataset.rlds_storage_format",
+}
+
+
+def normalize_cli_aliases(args: Sequence[str]) -> list[str]:
+    """Translate supported compatibility flags to their canonical draccus names."""
+    normalized: list[str] = []
+    for arg in args:
+        key, separator, value = arg.partition("=")
+        canonical_key = _CLI_ALIASES.get(key, key)
+        normalized.append(f"{canonical_key}={value}" if separator else canonical_key)
+    return normalized
+
 
 def _flatten_to_cli_args(d: dict, prefix: str = "") -> list[str]:
     """Recursively flatten a nested dict to CLI-style args (e.g. {"lr": 1e-4} -> ["--lr=0.0001"])."""
@@ -290,7 +306,7 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                 cfg = args[0]
                 args = args[1:]
             else:
-                cli_args = sys.argv[1:]
+                cli_args = normalize_cli_aliases(sys.argv[1:])
                 plugin_args = parse_plugin_args(PLUGIN_DISCOVERY_SUFFIX, cli_args)
                 for plugin_cli_arg, plugin_path in plugin_args.items():
                     try:

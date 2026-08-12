@@ -28,6 +28,7 @@ from lerobot.datasets.rlds_dataset import (
     _ACTION_VQVAE_INPUT,
     ActionMemRLDSDataset,
     RLDSActionTokenCollator,
+    _adapt_openx_tar_source_kwargs,
     _aggregate_weighted_stats,
     _attach_normalized_action_vqvae_input,
     _filter_vqvla_action_chunk,
@@ -175,9 +176,53 @@ def test_rlds_source_format_auto_prefers_tar_and_explicit_webdataset_requires_it
     assert _resolve_rlds_source_format(auto, "droid") == "webdataset"
     assert _resolve_rlds_source_format(auto, "missing") == "tfds"
 
+    hybrid = DatasetConfig(repo_id="droid", root=str(tmp_path), rlds_storage_format="hybrid")
+    assert _resolve_rlds_source_format(hybrid, "droid") == "webdataset"
+    assert _resolve_rlds_source_format(hybrid, "missing") == "tfds"
+
     explicit = DatasetConfig(repo_id="missing", root=str(tmp_path), rlds_storage_format="webdataset")
     with pytest.raises(FileNotFoundError, match="no tar shards"):
         _resolve_rlds_source_format(explicit, "missing")
+
+
+def test_hybrid_iterator_preserves_total_backend_weights():
+    dataset = object.__new__(ActionMemRLDSDataset)
+    dataset.seed = 7
+    dataset.rank = 0
+    dataset._hybrid_backend_weights = np.asarray([0.3, 0.7], dtype=np.float64)
+    dataset._iter_weighted_webdatasets = lambda: iter(lambda: {"backend": "webdataset"}, None)
+    dataset._iter_tfds_frames = lambda: iter(lambda: {"backend": "tfds"}, None)
+
+    iterator = iter(dataset._iter_hybrid_frames())
+    frames = (next(iterator) for _ in range(20_000))
+    webdataset_fraction = sum(frame["backend"] == "webdataset" for frame in frames) / 20_000
+
+    assert webdataset_fraction == pytest.approx(0.3, abs=0.015)
+
+
+def test_bridge_tar_uses_openx_schema_for_action_images_and_state(tmp_path):
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge_00000.tar").touch()
+    original_transform = object()
+    kwargs = {
+        "name": "bridge_orig",
+        "standardize_fn": original_transform,
+        "image_obs_keys": {"primary": "image_0", "wrist": None},
+        "state_obs_keys": ["EEF_state", None, "gripper_state"],
+    }
+
+    bridge_transform = object()
+    adapted = _adapt_openx_tar_source_kwargs(
+        kwargs,
+        tmp_path,
+        standardization_transforms={"bridge_oxe": bridge_transform},
+    )
+
+    assert adapted["standardize_fn"] is bridge_transform
+    assert adapted["image_obs_keys"] == {"primary": "image", "wrist": None}
+    assert adapted["state_obs_keys"] == ["EEF_state", None, "gripper_state"]
+    assert kwargs["image_obs_keys"]["primary"] == "image_0"
 
 
 def test_local_openx_tar_statistics_are_computed_and_cached(tmp_path):

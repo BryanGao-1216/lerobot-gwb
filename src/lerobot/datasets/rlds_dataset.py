@@ -82,6 +82,7 @@ class RLDSBackendModules:
     apply_frame_transforms: Callable[..., Any]
     get_oxe_dataset_kwargs_and_weights: Callable[..., Any]
     named_mixtures: Mapping[str, list[tuple[str, float]]]
+    standardization_transforms: Mapping[str, Callable[..., Any]]
     normalization_type: Any
 
 
@@ -151,6 +152,7 @@ def _load_rlds_backend() -> RLDSBackendModules:
         import tensorflow as tf
 
         from lerobot.datasets.rlds import dataset as dataset_module, oxe as oxe_module
+        from lerobot.datasets.rlds.oxe import transforms as oxe_transforms_module
         from lerobot.datasets.rlds.utils import data_utils as utils_module
     except ModuleNotFoundError as exc:
         raise ImportError(
@@ -173,6 +175,7 @@ def _load_rlds_backend() -> RLDSBackendModules:
         apply_frame_transforms=dataset_module.apply_frame_transforms,
         get_oxe_dataset_kwargs_and_weights=oxe_module.get_oxe_dataset_kwargs_and_weights,
         named_mixtures=oxe_module.OXE_NAMED_MIXTURES,
+        standardization_transforms=oxe_transforms_module.OXE_STANDARDIZATION_TRANSFORMS,
         normalization_type=utils_module.NormalizationType,
     )
 
@@ -227,7 +230,7 @@ def _load_mixture_spec(
 def _resolve_rlds_source_format(dataset_config: DatasetConfig, dataset_name: str) -> str:
     configured = dataset_config.rlds_storage_format
     has_tar_shards = bool(resolve_openx_tar_paths(dataset_config.root or "", dataset_name))
-    if configured == "auto":
+    if configured in {"auto", "hybrid"}:
         return "webdataset" if has_tar_shards else "tfds"
     if configured == "webdataset" and not has_tar_shards:
         raise FileNotFoundError(
@@ -235,6 +238,35 @@ def _resolve_rlds_source_format(dataset_config: DatasetConfig, dataset_name: str
             f"{dataset_name!r} under {dataset_config.root!r}."
         )
     return configured
+
+
+def _adapt_openx_tar_source_kwargs(
+    dataset_kwargs: Mapping[str, Any],
+    root: str | Path,
+    *,
+    standardization_transforms: Mapping[str, Callable[..., Any]] | None = None,
+) -> dict[str, Any]:
+    """Apply schema aliases specific to the local OpenX tar release."""
+    source_kwargs = copy.deepcopy(dataset_kwargs)
+    paths = resolve_openx_tar_paths(root, source_kwargs["name"])
+    if source_kwargs["name"] == "bridge_orig" and paths and paths[0].parent.name == "bridge":
+        # The tar release's ``bridge`` directory follows the Open-X schema,
+        # whereas separately prepared bridge_orig TFDS data uses the legacy
+        # flat-action schema. Replace both the semantic transform and the raw
+        # observation keys; ActionMem loads images/state in addition to action.
+        if standardization_transforms is None:
+            raise ValueError("Bridge OpenX tar adaptation requires the OXE standardization registry.")
+        source_kwargs["standardize_fn"] = standardization_transforms["bridge_oxe"]
+        bridge_image_keys = {"primary": "image", "secondary": "image_1", "wrist": None}
+        source_kwargs["image_obs_keys"] = {
+            view: bridge_image_keys[view] for view in source_kwargs.get("image_obs_keys", {})
+        }
+        if "state_obs_keys" in source_kwargs:
+            source_kwargs["state_obs_keys"] = ["EEF_state", None, "gripper_state"]
+        logging.info(
+            "OpenX tar directory 'bridge' uses the bridge_oxe standardizer for source 'bridge_orig'."
+        )
+    return source_kwargs
 
 
 def _denormalize_trajectory(trajectory: dict[str, Any], statistics: Mapping[str, Any], tf: Any):
@@ -449,6 +481,9 @@ class ActionMemRLDSDataset(IterableDataset):
         self.rank, self.world_size = _resolve_rank_and_world_size()
         self.backend.tf.random.set_seed(seed)
         self._webdataset_sources: list[dict[str, Any]] = []
+        self._webdataset_sample_weights = np.empty(0, dtype=np.float64)
+        self._hybrid_backend_weights = np.empty(0, dtype=np.float64)
+        self._webdataset_shuffle_buffer_size = dataset_config.rlds_shuffle_buffer_size
 
         mixture_spec = _load_mixture_spec(dataset_config, self.backend.named_mixtures)
         per_dataset_kwargs, base_weights = self.backend.get_oxe_dataset_kwargs_and_weights(
@@ -548,20 +583,22 @@ class ActionMemRLDSDataset(IterableDataset):
         source_formats = [
             _resolve_rlds_source_format(self.dataset_config, kwargs["name"]) for kwargs in per_dataset_kwargs
         ]
-        if "webdataset" in source_formats and "tfds" in source_formats:
-            raise ValueError(
-                "A single RLDS mixture cannot currently combine local OpenX tar shards with TFDS sources. "
-                "Download tar shards for every selected source, or set dataset.rlds_storage_format='tfds'."
-            )
-        use_webdataset = bool(source_formats) and all(
-            source_format == "webdataset" for source_format in source_formats
-        )
+        webdataset_indices = [
+            index for index, source_format in enumerate(source_formats) if source_format == "webdataset"
+        ]
+        tfds_indices = [index for index, source_format in enumerate(source_formats) if source_format == "tfds"]
 
         all_statistics: list[Mapping[str, Any]] = []
         valid_sizes: list[int] = []
         for kwargs, source_format in zip(per_dataset_kwargs, source_formats, strict=True):
             statistics_kwargs = copy.deepcopy(kwargs)
             statistics_kwargs.pop("dataset_frame_transform_kwargs", None)
+            if source_format == "webdataset":
+                statistics_kwargs = _adapt_openx_tar_source_kwargs(
+                    statistics_kwargs,
+                    self.dataset_config.root or "",
+                    standardization_transforms=self.backend.standardization_transforms,
+                )
             make_source = (
                 self.backend.make_dataset_from_webdataset
                 if source_format == "webdataset"
@@ -594,9 +631,19 @@ class ActionMemRLDSDataset(IterableDataset):
             effective_weights *= np.asarray(valid_sizes, dtype=np.float64)
         effective_weights /= effective_weights.sum()
 
-        if use_webdataset:
-            for kwargs, statistics in zip(per_dataset_kwargs, all_statistics, strict=True):
-                source_kwargs = copy.deepcopy(kwargs)
+        webdataset_weight = float(effective_weights[webdataset_indices].sum())
+        tfds_weight = float(effective_weights[tfds_indices].sum())
+
+        if webdataset_indices:
+            self._webdataset_sample_weights = (
+                effective_weights[webdataset_indices] / webdataset_weight
+            )
+            for index in webdataset_indices:
+                source_kwargs = _adapt_openx_tar_source_kwargs(
+                    per_dataset_kwargs[index],
+                    self.dataset_config.root or "",
+                    standardization_transforms=self.backend.standardization_transforms,
+                )
                 frame_transform_kwargs = source_kwargs.pop("dataset_frame_transform_kwargs", {})
                 restructure = self.backend.make_restructure_fn(
                     name=source_kwargs["name"],
@@ -612,19 +659,40 @@ class ActionMemRLDSDataset(IterableDataset):
                     {
                         "name": source_kwargs["name"],
                         "paths": paths,
-                        "statistics": statistics,
+                        "statistics": all_statistics[index],
                         "restructure": restructure,
                         "chunk_filter_fn": frame_transform_kwargs.get("chunk_filter_fn"),
                     }
                 )
+
+        using_hybrid_backends = bool(webdataset_indices and tfds_indices)
+        if using_hybrid_backends:
+            self._hybrid_backend_weights = np.asarray(
+                [webdataset_weight, tfds_weight], dtype=np.float64
+            )
+            webdataset_buffer_size = int(
+                round(self.dataset_config.rlds_shuffle_buffer_size * webdataset_weight)
+            )
+            self._webdataset_shuffle_buffer_size = max(1, webdataset_buffer_size)
+            tfds_shuffle_buffer_size = max(
+                1,
+                self.dataset_config.rlds_shuffle_buffer_size
+                - self._webdataset_shuffle_buffer_size,
+            )
+        else:
+            tfds_shuffle_buffer_size = self.dataset_config.rlds_shuffle_buffer_size
+
+        if not tfds_indices:
             return None, all_statistics, effective_weights, valid_sizes
 
         datasets = []
+        tfds_sample_weights = effective_weights[tfds_indices] / tfds_weight
         threads_per_dataset = max(
-            1, self.dataset_config.rlds_num_parallel_calls // max(len(per_dataset_kwargs), 1)
+            1, self.dataset_config.rlds_num_parallel_calls // len(tfds_indices)
         )
-        for kwargs, statistics in zip(per_dataset_kwargs, all_statistics, strict=True):
-            source_kwargs = copy.deepcopy(kwargs)
+        for index in tfds_indices:
+            source_kwargs = copy.deepcopy(per_dataset_kwargs[index])
+            statistics = all_statistics[index]
             frame_transform_kwargs = source_kwargs.pop("dataset_frame_transform_kwargs", {})
             chunk_filter_fn = frame_transform_kwargs.pop("chunk_filter_fn", None)
             source, _ = self.backend.make_dataset_from_rlds(
@@ -670,8 +738,8 @@ class ActionMemRLDSDataset(IterableDataset):
             source = self.backend.apply_per_dataset_frame_transforms(source, **frame_transform_kwargs)
             datasets.append(source)
 
-        mixed = self.backend.dl.DLataset.sample_from_datasets(datasets, effective_weights)
-        mixed = mixed.shuffle(self.dataset_config.rlds_shuffle_buffer_size)
+        mixed = self.backend.dl.DLataset.sample_from_datasets(datasets, tfds_sample_weights)
+        mixed = mixed.shuffle(tfds_shuffle_buffer_size)
         mixed = self.backend.apply_frame_transforms(
             mixed,
             train=True,
@@ -813,20 +881,20 @@ class ActionMemRLDSDataset(IterableDataset):
         shuffle_buffer: list[Mapping[str, Any]] = []
 
         def next_weighted_frame():
-            source_index = int(rng.choice(len(iterators), p=self.sample_weights))
+            source_index = int(rng.choice(len(iterators), p=self._webdataset_sample_weights))
             return next(iterators[source_index])
 
         logging.info(
             "Filling the OpenX tar shuffle buffer with %d compressed frames before training starts.",
-            self.dataset_config.rlds_shuffle_buffer_size,
+            self._webdataset_shuffle_buffer_size,
         )
-        while len(shuffle_buffer) < self.dataset_config.rlds_shuffle_buffer_size:
+        while len(shuffle_buffer) < self._webdataset_shuffle_buffer_size:
             shuffle_buffer.append(next_weighted_frame())
             if len(shuffle_buffer) % 10_000 == 0:
                 logging.info(
                     "OpenX tar shuffle buffer: %d/%d frames.",
                     len(shuffle_buffer),
-                    self.dataset_config.rlds_shuffle_buffer_size,
+                    self._webdataset_shuffle_buffer_size,
                 )
         logging.info("OpenX tar shuffle buffer is ready.")
         while True:
@@ -834,6 +902,27 @@ class ActionMemRLDSDataset(IterableDataset):
             frame = shuffle_buffer[buffer_index]
             shuffle_buffer[buffer_index] = next_weighted_frame()
             yield self._materialize_webdataset_frame(frame)
+
+    def _iter_tfds_frames(self):
+        if self._dataset is None:
+            raise RuntimeError("The TFDS/RLDS stream has not been initialized.")
+        while True:
+            yielded = False
+            for frame in self._dataset.as_numpy_iterator():
+                yielded = True
+                yield frame
+            if not yielded:
+                raise ValueError("The TFDS/RLDS stream is empty.")
+
+    def _iter_hybrid_frames(self):
+        backend_iterators = [
+            iter(self._iter_weighted_webdatasets()),
+            iter(self._iter_tfds_frames()),
+        ]
+        rng = np.random.default_rng(self.seed + 47_021 + self.rank)
+        while True:
+            backend_index = int(rng.choice(2, p=self._hybrid_backend_weights))
+            yield next(backend_iterators[backend_index])
 
     def _to_lerobot_sample(self, frame: Mapping[str, Any]) -> dict[str, Any]:
         observation = frame["observation"]
@@ -889,11 +978,13 @@ class ActionMemRLDSDataset(IterableDataset):
         return sample
 
     def __iter__(self):
-        if self._webdataset_sources:
-            for frame in self._iter_weighted_webdatasets():
-                yield self._to_lerobot_sample(frame)
-            return
-        for frame in self._dataset.as_numpy_iterator():
+        if self._webdataset_sources and self._dataset is not None:
+            frames = self._iter_hybrid_frames()
+        elif self._webdataset_sources:
+            frames = self._iter_weighted_webdatasets()
+        else:
+            frames = self._iter_tfds_frames()
+        for frame in frames:
             yield self._to_lerobot_sample(frame)
 
     def __len__(self) -> int:

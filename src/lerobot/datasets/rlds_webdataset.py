@@ -38,9 +38,11 @@ from typing import Any
 
 import numpy as np
 
-# The Hugging Face WebDataset release calls Bridge V2 ``bridge`` while the
-# vendored VQ-VLA registry calls the same source ``bridge_orig``.
-_OPENX_DIRECTORY_ALIASES = {"bridge_orig": "bridge"}
+# Directory aliases used by the local OpenX tar release and older mixtures.
+_OPENX_DIRECTORY_ALIASES = {
+    "bridge_orig": "bridge",
+    "fmb": "fmb_dataset",
+}
 
 logger = logging.getLogger(__name__)
 
