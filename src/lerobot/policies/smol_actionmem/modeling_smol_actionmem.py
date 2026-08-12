@@ -54,6 +54,15 @@ from .tokenization_smol_actionmem import (
 )
 
 
+def _q0_distance_soft_targets(distances: Tensor, temperature: float) -> Tensor:
+    """Build scale-invariant soft targets from per-sample q0 distances."""
+    relative_distances = distances - distances.min(dim=-1, keepdim=True).values
+    distance_scale = relative_distances.std(dim=-1, keepdim=True, correction=0)
+    distance_scale = distance_scale.clamp_min(torch.finfo(relative_distances.dtype).eps)
+    normalized_distances = relative_distances / distance_scale
+    return torch.softmax(-normalized_distances / temperature, dim=-1)
+
+
 class SmolActionMemFlowMatching(VLAFlowMatching):
     """Gaussian flow expert conditioned on an independent discrete action code."""
 
@@ -385,9 +394,9 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             distances = q0_distances.to(device=logits.device, dtype=torch.float32)
             if not torch.isfinite(distances).all():
                 raise ValueError("q0 latent distances must contain only finite values.")
-            soft_targets = torch.softmax(
-                -distances / self.config.action_token_soft_target_temperature,
-                dim=-1,
+            soft_targets = _q0_distance_soft_targets(
+                distances,
+                self.config.action_token_soft_target_temperature,
             )
             log_predictions = F.log_softmax(logits.float(), dim=-1)
             per_sample = F.kl_div(log_predictions, soft_targets, reduction="none").sum(dim=-1)

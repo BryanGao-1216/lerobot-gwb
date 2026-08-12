@@ -14,6 +14,7 @@ from lerobot.policies.smol_actionmem.configuration_smol_actionmem import SmolAct
 from lerobot.policies.smol_actionmem.modeling_smol_actionmem import (
     SmolActionMemFlowMatching,
     SmolActionMemPolicy,
+    _q0_distance_soft_targets,
 )
 from lerobot.policies.smol_actionmem.processor_smol_actionmem import (
     SmolActionMemActionCodeProcessorStep,
@@ -258,7 +259,7 @@ def test_action_objective_matches_latent_distance_soft_target_kl():
         model.action_classifier.bias.copy_(torch.tensor([1.0, 0.0, -1.0]))
 
     distances = torch.tensor([[0.0, 2.0, 4.0]])
-    soft_target = torch.softmax(-distances / 2.0, dim=-1)
+    soft_target = _q0_distance_soft_targets(distances, temperature=2.0)
     expected_kl = torch.nn.functional.kl_div(
         torch.log_softmax(model.action_classifier.bias, dim=-1).unsqueeze(0),
         soft_target,
@@ -275,6 +276,30 @@ def test_action_objective_matches_latent_distance_soft_target_kl():
     assert torch.allclose(output["action_token_kl_loss"], expected_kl)
     assert 0 < output["action_token_soft_target_entropy"].item() < math.log(3)
     assert 0 < output["action_token_soft_target_peak_probability"].item() < 1
+
+
+def test_action_soft_targets_are_invariant_to_per_sample_distance_scale_and_offset():
+    distances = torch.tensor(
+        [
+            [0.1, 0.2, 0.7, 1.4],
+            [3.0, 3.1, 3.4, 5.0],
+        ],
+        dtype=torch.float64,
+    )
+    scale = torch.tensor([[1e-3], [100.0]], dtype=torch.float64)
+    offset = torch.tensor([[7.0], [-2.0]], dtype=torch.float64)
+
+    targets = _q0_distance_soft_targets(distances, temperature=1.0)
+    rescaled_targets = _q0_distance_soft_targets(distances * scale + offset, temperature=1.0)
+
+    assert torch.allclose(targets, rescaled_targets, atol=1e-12)
+
+
+def test_action_soft_targets_are_uniform_when_all_distances_match():
+    targets = _q0_distance_soft_targets(torch.full((2, 256), 3.0), temperature=1.0)
+
+    assert torch.isfinite(targets).all()
+    assert torch.allclose(targets, torch.full_like(targets, 1 / 256))
 
 
 class _InferenceVLM(nn.Module):
