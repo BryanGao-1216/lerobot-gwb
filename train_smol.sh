@@ -7,7 +7,8 @@ lerobot-train \
   --policy.output_features=null \
   --dataset.repo_id=action_tokenizer_plus \
   --policy.action_token_soft_target_temperature=0.05 \
-  --rlds-storage-format=hybrid \
+  --dataset_type=rlds \
+  --dataset.rlds_storage_format=hybrid \
   --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/OpenX \
   --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-50000 \
   --steps=100000 \

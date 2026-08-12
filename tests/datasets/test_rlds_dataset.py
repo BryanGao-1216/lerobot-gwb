@@ -208,7 +208,7 @@ def test_bridge_tar_uses_openx_schema_for_action_images_and_state(tmp_path):
     kwargs = {
         "name": "bridge_orig",
         "standardize_fn": original_transform,
-        "image_obs_keys": {"primary": "image_0", "wrist": None},
+        "image_obs_keys": {"primary": "image_0", "secondary": "image_1", "wrist": None},
         "state_obs_keys": ["EEF_state", None, "gripper_state"],
     }
 
@@ -220,7 +220,7 @@ def test_bridge_tar_uses_openx_schema_for_action_images_and_state(tmp_path):
     )
 
     assert adapted["standardize_fn"] is bridge_transform
-    assert adapted["image_obs_keys"] == {"primary": "image", "wrist": None}
+    assert adapted["image_obs_keys"] == {"primary": "image", "secondary": None, "wrist": None}
     assert adapted["state_obs_keys"] == ["EEF_state", None, "gripper_state"]
     assert kwargs["image_obs_keys"]["primary"] == "image_0"
 

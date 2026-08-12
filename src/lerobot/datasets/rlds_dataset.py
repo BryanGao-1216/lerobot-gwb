@@ -257,7 +257,11 @@ def _adapt_openx_tar_source_kwargs(
         if standardization_transforms is None:
             raise ValueError("Bridge OpenX tar adaptation requires the OXE standardization registry.")
         source_kwargs["standardize_fn"] = standardization_transforms["bridge_oxe"]
-        bridge_image_keys = {"primary": "image", "secondary": "image_1", "wrist": None}
+        # The jxu124/OpenX tar export contains only the primary ``image``
+        # camera for Bridge.  ``image_1`` belongs to the TFDS schema and is not
+        # present in these pickled tar episodes, so represent every additional
+        # requested view with the pipeline's normal empty-image padding.
+        bridge_image_keys = {"primary": "image", "secondary": None, "wrist": None}
         source_kwargs["image_obs_keys"] = {
             view: bridge_image_keys[view] for view in source_kwargs.get("image_obs_keys", {})
         }
