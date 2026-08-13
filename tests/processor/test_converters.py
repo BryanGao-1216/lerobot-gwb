@@ -29,6 +29,7 @@ from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN,
     ACTION_TOKEN_Q0_DISTANCES,
+    ACTION_VQVAE_INPUT,
     DONE,
     OBS_STATE,
     OBS_STR,
@@ -258,6 +259,7 @@ def test_batch_to_transition_preserves_action_token():
         "task": ["pick_cube", "place_cube"],
         ACTION_TOKEN: torch.tensor([[0], [255]], dtype=torch.int64),
         ACTION_TOKEN_Q0_DISTANCES: torch.randn(2, 256),
+        ACTION_VQVAE_INPUT: torch.randn(2, 16, 7),
     }
 
     transition = batch_to_transition(batch)
@@ -268,6 +270,7 @@ def test_batch_to_transition_preserves_action_token():
         comp_data[ACTION_TOKEN_Q0_DISTANCES],
         batch[ACTION_TOKEN_Q0_DISTANCES],
     )
+    assert torch.equal(comp_data[ACTION_VQVAE_INPUT], batch[ACTION_VQVAE_INPUT])
 
 
 def testtransition_to_batch_with_index_fields():

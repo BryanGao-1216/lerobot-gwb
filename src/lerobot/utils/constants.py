@@ -36,6 +36,10 @@ ACTION_TOKEN = "action_token"
 ACTION_TOKENS = ACTION + ".tokens"
 ACTION_TOKEN_MASK = ACTION + ".token_mask"
 ACTION_TOKEN_Q0_DISTANCES = ACTION + ".token_q0_distances"
+# The exact per-source OXE BOUNDS_Q99 action used by the frozen Action VQ-VAE.
+# It is kept separate from ``ACTION`` so the generic policy normalizer cannot
+# apply the mixed-dataset MEAN_STD transform to it a second time.
+ACTION_VQVAE_INPUT = ACTION + ".vqvae_input"
 # Per-sample VQ-VLA normalization metadata used to map a q0 reconstruction
 # back through the source dataset's OXE action space during mixed-RLDS training.
 ACTION_VQVAE_Q01 = ACTION + ".vqvae_q01"

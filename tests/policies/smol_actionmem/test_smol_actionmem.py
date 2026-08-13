@@ -25,6 +25,7 @@ from lerobot.utils.constants import (
     ACTION_TOKEN,
     ACTION_TOKEN_MASK,
     ACTION_TOKENS,
+    ACTION_VQVAE_INPUT,
     OBS_LANGUAGE_TOKENS,
 )
 
@@ -172,6 +173,31 @@ def test_training_flow_source_is_standard_gaussian_noise():
     source = model._make_training_flow_source(actions)
 
     assert source is expected_noise
+
+
+def test_flow_target_reuses_exact_vqvae_normalized_action():
+    policy = SmolActionMemPolicy.__new__(SmolActionMemPolicy)
+    nn.Module.__init__(policy)
+    policy.config = type(
+        "Config",
+        (),
+        {
+            "chunk_size": 16,
+            "max_action_dim": 32,
+            "action_feature": type("Feature", (), {"shape": (7,)})(),
+        },
+    )()
+    vqvae_actions = torch.linspace(-1, 1, 2 * 16 * 7).reshape(2, 16, 7)
+    batch = {
+        "action": torch.full_like(vqvae_actions, 100.0),
+        ACTION_VQVAE_INPUT: vqvae_actions,
+    }
+
+    target = policy.prepare_flow_target(batch)
+
+    assert target.shape == (2, 16, 32)
+    assert torch.equal(target[..., :7], vqvae_actions)
+    assert torch.count_nonzero(target[..., 7:]) == 0
 
 
 def test_prefix_uses_independent_action_embedding_and_keeps_state_before_query():
