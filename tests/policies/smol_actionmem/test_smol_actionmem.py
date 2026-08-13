@@ -175,28 +175,28 @@ def test_training_flow_source_is_standard_gaussian_noise():
     assert source is expected_noise
 
 
-def test_flow_target_reuses_exact_vqvae_normalized_action():
+def test_flow_target_uses_preprocessor_action_not_vqvae_input():
     policy = SmolActionMemPolicy.__new__(SmolActionMemPolicy)
     nn.Module.__init__(policy)
     policy.config = type(
         "Config",
         (),
         {
-            "chunk_size": 16,
             "max_action_dim": 32,
-            "action_feature": type("Feature", (), {"shape": (7,)})(),
         },
     )()
+    processed_actions = torch.linspace(-2, 2, 2 * 16 * 7).reshape(2, 16, 7)
     vqvae_actions = torch.linspace(-1, 1, 2 * 16 * 7).reshape(2, 16, 7)
     batch = {
-        "action": torch.full_like(vqvae_actions, 100.0),
+        "action": processed_actions,
         ACTION_VQVAE_INPUT: vqvae_actions,
     }
 
-    target = policy.prepare_flow_target(batch)
+    target = policy.prepare_action(batch)
 
     assert target.shape == (2, 16, 32)
-    assert torch.equal(target[..., :7], vqvae_actions)
+    assert torch.equal(target[..., :7], processed_actions)
+    assert not torch.equal(target[..., :7], vqvae_actions)
     assert torch.count_nonzero(target[..., 7:]) == 0
 
 

@@ -31,7 +31,6 @@ from lerobot.utils.constants import (
     ACTION_TOKEN_MASK,
     ACTION_TOKEN_Q0_DISTANCES,
     ACTION_TOKENS,
-    ACTION_VQVAE_INPUT,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
@@ -46,7 +45,6 @@ from ..smolvla.modeling_smolvla import (
     VLAFlowMatching,
     make_att_2d_masks,
     pad_tensor,
-    pad_vector,
 )
 from .configuration_smol_actionmem import SmolActionMemConfig
 from .smolvlm_with_expert import SmolActionMemVLMWithExpertModel
@@ -707,30 +705,6 @@ class SmolActionMemPolicy(SmolVLAPolicy):
         self.configure_training_stage()
         return (parameter for parameter in self.parameters() if parameter.requires_grad)
 
-    def prepare_flow_target(self, batch: dict[str, Tensor]) -> Tensor:
-        """Pad the exact OXE BOUNDS_Q99 action that produced the Q0 condition."""
-        actions = batch.get(ACTION_VQVAE_INPUT)
-        if actions is None:
-            raise ValueError(
-                "Smol ActionMem flow training requires "
-                f"'{ACTION_VQVAE_INPUT}'. The RLDS ActionMem collator must preserve the per-source "
-                "q01/q99-normalized VQ-VAE input so flow and Q0 use the same action space."
-            )
-        if actions.ndim != 3:
-            raise ValueError(
-                f"Expected '{ACTION_VQVAE_INPUT}' with shape [batch, horizon, action_dim], "
-                f"got {tuple(actions.shape)}."
-            )
-        expected_shape = (self.config.chunk_size, self.config.action_feature.shape[0])
-        if tuple(actions.shape[1:]) != expected_shape:
-            raise ValueError(
-                f"Expected '{ACTION_VQVAE_INPUT}' trailing shape {expected_shape}, "
-                f"got {tuple(actions.shape[1:])}."
-            )
-        if not torch.isfinite(actions).all():
-            raise ValueError(f"'{ACTION_VQVAE_INPUT}' must contain only finite values.")
-        return pad_vector(actions, self.config.max_action_dim)
-
     def _get_action_chunk(
         self,
         batch: dict[str, Tensor],
@@ -787,10 +761,11 @@ class SmolActionMemPolicy(SmolVLAPolicy):
         compute_flow = stage in {"action_expert_only", "joint"}
         compute_action_token = stage in {"vlm_only", "joint"} and self.config.action_token_loss_weight > 0
         state = self.prepare_state(batch)
-        # The generic ACTION field has already received the mixed-dataset
-        # MEAN_STD transform. Do not use it here: Q0 was computed from the
-        # per-source OXE BOUNDS_Q99 tensor preserved by the RLDS collator.
-        actions = self.prepare_flow_target(batch) if compute_flow else None
+        # Keep the original SmolVLA flow coordinate system: ACTION has already
+        # been normalized by the policy preprocessor (MEAN_STD by default).
+        # ACTION_VQVAE_INPUT remains a separate per-source BOUNDS_Q99 tensor
+        # used only to produce Q0 labels / soft targets.
+        actions = self.prepare_action(batch) if compute_flow else None
         if compute_flow and time is None:
             time = self.model.sample_time(actions.shape[0], actions.device)
 
