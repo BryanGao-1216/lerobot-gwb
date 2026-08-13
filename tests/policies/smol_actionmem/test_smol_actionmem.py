@@ -219,9 +219,12 @@ def test_action_objective_is_exactly_256_way():
         model.action_classifier.bias.zero_()
         model.action_classifier.weight[3, 0] = 5.0
 
-    output = model._compute_action_token_objective(
+    logits = model._compute_action_logits(
         prefix_out=torch.tensor([[[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]]),
         query_positions=torch.tensor([1]),
+    )
+    output = model._compute_action_token_objective(
+        logits=logits,
         action_tokens=torch.tensor([[256, 257, 258, 3]]),
         action_token_masks=torch.ones(1, 4, dtype=torch.bool),
         q0_distances=torch.nn.functional.one_hot(torch.tensor([3]), 256).logical_not().float(),
@@ -237,8 +240,7 @@ def test_action_objective_ignores_out_of_range_local_padding_class():
     model.action_classifier = nn.Linear(4, 256)
 
     output = model._compute_action_token_objective(
-        prefix_out=torch.zeros(1, 2, 4),
-        query_positions=torch.tensor([1]),
+        logits=torch.zeros(1, 256),
         action_tokens=torch.tensor([[256, 257, 258, 259]]),
         action_token_masks=torch.tensor([[True, True, True, False]]),
         q0_distances=None,
@@ -265,8 +267,7 @@ def test_action_objective_matches_latent_distance_soft_target_kl():
         reduction="batchmean",
     )
     output = model._compute_action_token_objective(
-        prefix_out=torch.zeros(1, 1, 1),
-        query_positions=torch.tensor([0]),
+        logits=model.action_classifier(torch.zeros(1, 1)),
         action_tokens=torch.tensor([[3, 4, 5, 0]]),
         action_token_masks=torch.ones(1, 4, dtype=torch.bool),
         q0_distances=distances,
@@ -286,7 +287,7 @@ class _InferenceVLM(nn.Module):
         return [inputs_embeds[0], None], "cache"
 
 
-def test_inference_uses_classifier_class_as_condition_with_gaussian_noise(monkeypatch):
+def test_inference_uses_complete_logits_condition_without_argmax_token(monkeypatch):
     model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
     model.config = type(
@@ -322,10 +323,18 @@ def test_inference_uses_classifier_class_as_condition_with_gaussian_noise(monkey
     )
     expected_noise = torch.ones(1, 16, 7)
     model.sample_noise = lambda shape, device: expected_noise
+    received_logits = []
+    model._denoise_step_with_action_condition = lambda **kwargs: (
+        received_logits.append(kwargs["action_logits"].detach().clone())
+        or torch.zeros_like(kwargs["x_t"])
+    )
     monkeypatch.setattr(
         modeling_smol_actionmem,
         "euler_integrate",
-        lambda denoise_fn, noise, num_steps, **kwargs: noise,
+        lambda denoise_fn, noise, num_steps, **kwargs: (
+            denoise_fn(noise, torch.ones(noise.shape[0], device=noise.device)),
+            noise,
+        )[1],
     )
 
     output = model.sample_actions(
@@ -340,7 +349,42 @@ def test_inference_uses_classifier_class_as_condition_with_gaussian_noise(monkey
 
     assert output is expected_noise
     assert torch.equal(embedded_action_sequences[0], torch.tensor([[256, 257, 258]]))
-    assert torch.equal(embedded_action_sequences[1], torch.tensor([[256, 257, 258, 7]]))
+    assert len(embedded_action_sequences) == 1
+    assert len(received_logits) == 1
+    assert received_logits[0].shape == (1, 256)
+    assert received_logits[0][0, 7] == 10
+
+
+def test_continuous_condition_receives_flow_gradients_but_blocks_logit_gradients():
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
+    nn.Module.__init__(model)
+    model.config = type("Config", (), {"action_condition_scale": 1.0})()
+    model.action_condition_proj = nn.Sequential(
+        nn.LayerNorm(3),
+        nn.Linear(3, 4),
+        nn.SiLU(),
+        nn.Linear(4, 8),
+    )
+    nn.init.zeros_(model.action_condition_proj[-1].weight)
+    nn.init.zeros_(model.action_condition_proj[-1].bias)
+    suffix = torch.randn(2, 5, 4)
+    logits = torch.randn(2, 3, requires_grad=True)
+
+    conditioned, metrics = model._condition_flow_hidden(suffix, logits)
+    assert torch.equal(conditioned, suffix)
+    assert metrics["action_condition_gamma_rms"].item() == 0
+    assert metrics["action_condition_beta_rms"].item() == 0
+
+    # Flow trains the condition projection, but the logits/VLM branch is trained
+    # separately by its KL objective.
+    conditioned.square().mean().backward()
+    assert model.action_condition_proj[-1].weight.grad.abs().sum() > 0
+    with torch.no_grad():
+        model.action_condition_proj[-1].weight.fill_(0.01)
+    logits = torch.randn(2, 3, requires_grad=True)
+    conditioned, _ = model._condition_flow_hidden(suffix, logits)
+    conditioned.square().mean().backward()
+    assert logits.grad is None
 
 
 class _StageModel(SmolActionMemFlowMatching):
@@ -355,6 +399,7 @@ class _StageModel(SmolActionMemFlowMatching):
         self.state_proj = nn.Linear(2, 2)
         self.action_code_embedding = nn.Embedding(260, 2)
         self.action_classifier = nn.Linear(2, 256)
+        self.action_condition_proj = nn.Sequential(nn.LayerNorm(256), nn.Linear(256, 4))
         self.action_in_proj = nn.Linear(2, 2)
         self.action_out_proj = nn.Linear(2, 2)
         self.action_time_mlp_in = nn.Linear(2, 2)
@@ -380,6 +425,10 @@ def test_training_stage_handles_new_action_modules(stage, classifier_trainable, 
     assert all(
         parameter.requires_grad is expert_trainable for parameter in model.action_out_proj.parameters()
     )
+    assert all(
+        parameter.requires_grad is expert_trainable
+        for parameter in model.action_condition_proj.parameters()
+    )
     assert all(parameter.requires_grad for parameter in model.action_code_embedding.parameters())
     assert not any(parameter.requires_grad for parameter in model.vlm_with_expert.vlm.lm_head.parameters())
 
@@ -395,4 +444,8 @@ def test_default_peft_targets_do_not_train_language_vocabulary():
     )
     assert not re.fullmatch(pattern, "model.vlm_with_expert.vlm.lm_head")
     assert not re.fullmatch(pattern, "model.vlm_with_expert.vlm.model.text_model.embed_tokens")
-    assert defaults["modules_to_save"] == ["action_code_embedding", "action_classifier"]
+    assert defaults["modules_to_save"] == [
+        "action_code_embedding",
+        "action_classifier",
+        "action_condition_proj",
+    ]

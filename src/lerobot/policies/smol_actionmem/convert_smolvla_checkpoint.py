@@ -189,6 +189,7 @@ def _copy_compatible_weights(source_policy: SmolVLAPolicy, target_policy: SmolAc
     expected_new_modules = (
         "model.action_code_embedding.",
         "model.action_classifier.",
+        "model.action_condition_proj.",
     )
     expected_missing = [key for key in missing_keys if key.startswith(expected_new_modules)]
     unmatched_missing = [key for key in missing_keys if not key.startswith(expected_new_modules)]

@@ -26,7 +26,7 @@ from ..smolvla.configuration_smolvla import SmolVLAConfig
 @PreTrainedConfig.register_subclass("smol_actionmem")
 @dataclass
 class SmolActionMemConfig(SmolVLAConfig):
-    """SmolVLA with a 256-way action classifier and code-conditioned flow matching."""
+    """SmolVLA with a continuous flow condition derived from 256 action logits."""
 
     chunk_size: int = 16
     n_action_steps: int = 16
@@ -49,6 +49,12 @@ class SmolActionMemConfig(SmolVLAConfig):
     action_code_init_std: float = 0.02
     # Temperature of y_k = softmax(-||E(A) - e_k||^2 / T).
     action_token_soft_target_temperature: float = 1.0
+    # Map normalized 256-way logits to residual FiLM parameters for every flow
+    # prediction. The final projection is zero-initialized so an old checkpoint
+    # starts from the unconditioned flow field and learns the new condition
+    # smoothly.
+    action_condition_hidden_dim: int = 256
+    action_condition_scale: float = 1.0
 
     # Legacy decoded-flow-source fields. They remain loadable so existing
     # checkpoints do not require config migration, but the Gaussian-source
@@ -62,7 +68,9 @@ class SmolActionMemConfig(SmolVLAConfig):
 
     # ActionMem training objectives.
     flow_loss_weight: float = 1.0
-    action_token_loss_weight: float = 1.0
+    # Q0 KL is auxiliary: flow generation consumes predicted continuous logits,
+    # never a ground-truth or argmax action token.
+    action_token_loss_weight: float = 0.1
     training_stage: str = "joint"
 
     # Compatibility with the original SmolVLA and PI0-style configurations.
@@ -151,6 +159,15 @@ class SmolActionMemConfig(SmolVLAConfig):
             raise ValueError(
                 "action_token_soft_target_temperature must be positive, got "
                 f"{self.action_token_soft_target_temperature}."
+            )
+        if self.action_condition_hidden_dim <= 0:
+            raise ValueError(
+                "action_condition_hidden_dim must be positive, got "
+                f"{self.action_condition_hidden_dim}."
+            )
+        if self.action_condition_scale < 0:
+            raise ValueError(
+                f"action_condition_scale must be non-negative, got {self.action_condition_scale}."
             )
 
         for name in (

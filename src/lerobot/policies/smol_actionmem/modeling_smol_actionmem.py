@@ -55,7 +55,7 @@ from .tokenization_smol_actionmem import (
 
 
 class SmolActionMemFlowMatching(VLAFlowMatching):
-    """Gaussian flow expert conditioned on an independent discrete action code."""
+    """Gaussian flow expert conditioned on continuous VLM action logits."""
 
     def __init__(self, config: SmolActionMemConfig, rtc_processor=None):
         # VLAFlowMatching is deliberately not initialized through super(): its
@@ -100,9 +100,23 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             padding_idx=self.action_code_map.padding_id,
         )
         self.action_classifier = nn.Linear(hidden_size, self.action_code_map.codebook_size)
+        self.action_condition_proj = nn.Sequential(
+            nn.LayerNorm(self.action_code_map.codebook_size),
+            nn.Linear(self.action_code_map.codebook_size, config.action_condition_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(
+                config.action_condition_hidden_dim,
+                self.vlm_with_expert.expert_hidden_size * 2,
+            ),
+        )
         nn.init.normal_(self.action_code_embedding.weight, mean=0.0, std=config.action_code_init_std)
         nn.init.normal_(self.action_classifier.weight, mean=0.0, std=config.action_code_init_std)
         nn.init.zeros_(self.action_classifier.bias)
+        # Residual FiLM starts as an exact identity. This also makes checkpoints
+        # created before the continuous-condition change safe to resume with
+        # strict=False (the LeRobot default).
+        nn.init.zeros_(self.action_condition_proj[-1].weight)
+        nn.init.zeros_(self.action_condition_proj[-1].bias)
         with torch.no_grad():
             self.action_code_embedding.weight[self.action_code_map.padding_id].zero_()
 
@@ -169,6 +183,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
                 "action_out_proj.",
                 "action_time_mlp_in.",
                 "action_time_mlp_out.",
+                "action_condition_proj.",
             )
         )
 
@@ -355,18 +370,53 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
 
         return embeddings, padding_masks, attention_blocks, query_positions
 
+    def _compute_action_logits(self, prefix_out: Tensor, query_positions: Tensor) -> Tensor:
+        batch_indices = torch.arange(prefix_out.shape[0], device=prefix_out.device)
+        query_hidden = prefix_out[batch_indices, query_positions]
+        query_hidden = query_hidden.to(dtype=self.action_classifier.weight.dtype)
+        return self.action_classifier(query_hidden)
+
+    def _condition_flow_hidden(
+        self,
+        suffix_out: Tensor,
+        action_logits: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Apply logit-conditioned FiLM without sending flow gradients into the logits branch."""
+        # The action-token classifier and its VLM representation are supervised
+        # exclusively by the KL objective. Flow still consumes their prediction
+        # as a condition, but must not optimize that prediction through this
+        # branch. The separate VLM-prefix/KV -> action-expert path is deliberately
+        # left intact.
+        action_logits = action_logits.detach()
+        projection_dtype = next(self.action_condition_proj.parameters()).dtype
+        # Bounding FiLM prevents a heterogeneous OXE batch from amplifying the
+        # expert hidden state without limit. ``action_condition_scale`` remains
+        # the explicit knob for widening the modulation range.
+        film = torch.tanh(self.action_condition_proj(action_logits.to(dtype=projection_dtype))).float()
+        gamma, beta = film.chunk(2, dim=-1)
+        scale = self.config.action_condition_scale
+        gamma = gamma * scale
+        beta = beta * scale
+        conditioned = suffix_out.float() * (1.0 + gamma[:, None, :]) + beta[:, None, :]
+        probabilities = torch.softmax(action_logits.float(), dim=-1)
+        predicted_entropy = -(
+            probabilities * probabilities.clamp_min(torch.finfo(probabilities.dtype).tiny).log()
+        ).sum(dim=-1)
+        metrics = {
+            "action_condition_gamma_rms": gamma.float().square().mean().sqrt(),
+            "action_condition_beta_rms": beta.float().square().mean().sqrt(),
+            "action_condition_logit_std": action_logits.float().std(dim=-1, unbiased=False).mean(),
+            "action_condition_predicted_entropy": predicted_entropy.mean(),
+        }
+        return conditioned, metrics
+
     def _compute_action_token_objective(
         self,
-        prefix_out: Tensor,
-        query_positions: Tensor,
+        logits: Tensor,
         action_tokens: Tensor,
         action_token_masks: Tensor,
         q0_distances: Tensor | None,
     ) -> dict[str, Tensor]:
-        batch_indices = torch.arange(prefix_out.shape[0], device=prefix_out.device)
-        query_hidden = prefix_out[batch_indices, query_positions]
-        query_hidden = query_hidden.to(dtype=self.action_classifier.weight.dtype)
-        logits = self.action_classifier(query_hidden)
         target_mask = action_token_masks[:, -1].bool()
         safe_targets = torch.where(target_mask, action_tokens[:, -1], 0)
         if torch.any(target_mask):
@@ -440,13 +490,18 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             raise ValueError("Smol ActionMem requires state for action-token and flow conditioning.")
 
         if not compute_flow:
+            # The target slot is supervision only. It is never embedded into the
+            # condition path, even though causal masking would hide it from the
+            # ACTION_QUERY position.
+            action_prompt_tokens = action_tokens[:, :-1]
+            action_prompt_masks = action_token_masks[:, :-1]
             prefix_embs, prefix_pad_masks, prefix_att_masks, query_positions = self.embed_prefix(
                 images,
                 img_masks,
                 lang_tokens,
                 lang_masks,
-                action_tokens,
-                action_token_masks,
+                action_prompt_tokens,
+                action_prompt_masks,
                 state=state,
             )
             prefix_attention = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -460,9 +515,9 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
                 # Token-only execution must use all VLM self-attention layers.
                 fill_kv_cache=True,
             )
+            logits = self._compute_action_logits(prefix_out, query_positions)
             return self._compute_action_token_objective(
-                prefix_out,
-                query_positions,
+                logits,
                 action_tokens,
                 action_token_masks,
                 action_token_q0_distances,
@@ -476,16 +531,18 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        # The final valid local class is the ground-truth q0 code condition.
-        # It is embedded in the prefix, so every flow suffix token can attend
-        # to it while predicting the Gaussian-to-action vector field.
+        # Ground-truth q0 remains an auxiliary label only. Flow sees the prompt
+        # through ACTION_QUERY, then receives the VLM's complete predicted logit
+        # vector through a stop-gradient continuous residual FiLM path.
+        action_prompt_tokens = action_tokens[:, :-1]
+        action_prompt_masks = action_token_masks[:, :-1]
         prefix_embs, prefix_pad_masks, prefix_att_masks, query_positions = self.embed_prefix(
             images,
             img_masks,
             lang_tokens,
             lang_masks,
-            action_tokens,
-            action_token_masks,
+            action_prompt_tokens,
+            action_prompt_masks,
             state=state,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = super().embed_suffix(x_t, time)
@@ -502,14 +559,15 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             fill_kv_cache=False,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
+        logits = self._compute_action_logits(prefix_out, query_positions)
+        suffix_out, condition_metrics = self._condition_flow_hidden(suffix_out, logits)
         flow_losses = F.mse_loss(u_t, self.action_out_proj(suffix_out), reduction="none")
 
-        output = {"flow_losses": flow_losses}
+        output = {"flow_losses": flow_losses, **condition_metrics}
         if compute_action_token:
             output.update(
                 self._compute_action_token_objective(
-                    prefix_out,
-                    query_positions,
+                    logits,
                     action_tokens,
                     action_token_masks,
                     action_token_q0_distances,
@@ -548,41 +606,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         )
         prefix_attention = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_positions = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        (prefix_out, _), _ = self.vlm_with_expert.forward(
-            attention_mask=prefix_attention,
-            position_ids=prefix_positions,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=False,
-            fill_kv_cache=True,
-        )
-        batch_indices = torch.arange(prefix_out.shape[0], device=prefix_out.device)
-        query_hidden = prefix_out[batch_indices, query_positions]
-        logits = self.action_classifier(query_hidden.to(dtype=self.action_classifier.weight.dtype))
-        generated_action_token = logits.argmax(dim=-1, keepdim=True)
-
-        # Rebuild and cache the complete prefix with the generated q0 class.
-        # This cache is the code condition read by every Euler denoising step.
-        generated_sequence = torch.cat([action_prompt_tokens, generated_action_token], dim=1)
-        generated_masks = torch.cat(
-            [
-                action_prompt_masks,
-                torch.ones_like(generated_action_token, dtype=torch.bool),
-            ],
-            dim=1,
-        )
-        prefix_embs, prefix_pad_masks, prefix_att_masks, _ = self.embed_prefix(
-            images,
-            img_masks,
-            lang_tokens,
-            lang_masks,
-            generated_sequence,
-            generated_masks,
-            state=state,
-        )
-        prefix_attention = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_positions = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        _, past_key_values = self.vlm_with_expert.forward(
+        (prefix_out, _), past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_attention,
             position_ids=prefix_positions,
             past_key_values=None,
@@ -590,6 +614,9 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+        batch_indices = torch.arange(prefix_out.shape[0], device=prefix_out.device)
+        query_hidden = prefix_out[batch_indices, query_positions]
+        logits = self.action_classifier(query_hidden.to(dtype=self.action_classifier.weight.dtype))
 
         if noise is None:
             noise = self.sample_noise(
@@ -597,11 +624,12 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
                 state.device,
             )
         return euler_integrate(
-            lambda input_x_t, timestep: super(SmolActionMemFlowMatching, self).denoise_step(
+            lambda input_x_t, timestep: self._denoise_step_with_action_condition(
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=past_key_values,
                 x_t=input_x_t,
                 timestep=timestep,
+                action_logits=logits,
             ),
             noise,
             num_steps,
@@ -611,6 +639,37 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
         )
+
+    def _denoise_step_with_action_condition(
+        self,
+        *,
+        prefix_pad_masks: Tensor,
+        past_key_values,
+        x_t: Tensor,
+        timestep: Tensor,
+        action_logits: Tensor,
+    ) -> Tensor:
+        """Apply one Euler vector-field evaluation with the predicted logit FiLM."""
+        suffix_embs, suffix_pad_masks, suffix_att_masks = super().embed_suffix(x_t, timestep)
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        outputs_embeds, _ = self.vlm_with_expert.forward(
+            attention_mask=full_att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=False,
+        )
+        suffix_out = outputs_embeds[1][:, -self.config.chunk_size :].to(dtype=torch.float32)
+        suffix_out, _ = self._condition_flow_hidden(suffix_out, action_logits)
+        return self.action_out_proj(suffix_out)
 
 
 class SmolActionMemPolicy(SmolVLAPolicy):
@@ -700,7 +759,7 @@ class SmolActionMemPolicy(SmolVLAPolicy):
 
         stage = self.config.training_stage
         compute_flow = stage in {"action_expert_only", "joint"}
-        compute_action_token = stage in {"vlm_only", "joint"}
+        compute_action_token = stage in {"vlm_only", "joint"} and self.config.action_token_loss_weight > 0
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch) if compute_flow else None
         if compute_flow and time is None:
@@ -746,6 +805,12 @@ class SmolActionMemPolicy(SmolVLAPolicy):
                     "loss_per_dim": flow_losses.mean(dim=(0, 1)).detach().cpu().tolist(),
                     "flow_loss": flow_loss.item(),
                     "weighted_flow_loss": (self.config.flow_loss_weight * flow_loss).item(),
+                    "action_condition_gamma_rms": output["action_condition_gamma_rms"].item(),
+                    "action_condition_beta_rms": output["action_condition_beta_rms"].item(),
+                    "action_condition_logit_std": output["action_condition_logit_std"].item(),
+                    "action_condition_predicted_entropy": output[
+                        "action_condition_predicted_entropy"
+                    ].item(),
                 }
             )
 
@@ -796,5 +861,9 @@ class SmolActionMemPolicy(SmolVLAPolicy):
             "target_modules": rf"({vlm_targets}|{expert_targets}|{projections})",
             # These modules are randomly initialized for this policy and must
             # be trained and serialized in full even when the backbone uses LoRA.
-            "modules_to_save": ["action_code_embedding", "action_classifier"],
+            "modules_to_save": [
+                "action_code_embedding",
+                "action_classifier",
+                "action_condition_proj",
+            ],
         }
