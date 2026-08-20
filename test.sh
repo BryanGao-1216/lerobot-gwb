@@ -1,8 +1,8 @@
 lerobot-eval \
   --output_dir="./outputs/eval/libero_smol_actionmem" \
-  --policy.path="/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-50000/checkpoints/last/pretrained_model" \
+  --policy.path="/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-finall/checkpoints/last/pretrained_model" \
   --policy.use_peft=false \
-  --env.camera_name_mapping='{"agentview_image":"image2","robot0_eye_in_hand_image":"image3"}' \
+  --env.camera_name_mapping='{"agentview_image":"image","robot0_eye_in_hand_image":"image3"}' \
   --env.type=libero \
   --env.task=libero_object,libero_spatial,libero_goal \
   --env.control_mode=relative \
