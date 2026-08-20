@@ -97,6 +97,7 @@ class RLDSDatasetMetadata:
         total_frames: int,
         total_episodes: int,
         camera_keys: list[str],
+        fps: float,
     ) -> None:
         self.repo_id = repo_id
         self.root = Path(root)
@@ -110,7 +111,7 @@ class RLDSDatasetMetadata:
         self.image_keys = list(camera_keys)
         self.has_language_columns = False
         self.robot_type = "multi_rlds"
-        self.fps = 1
+        self.fps = fps
         self.episodes = None
         # PreTrainedPolicy's model-card helper expects this LeRobot metadata
         # attribute even when the policy is not pushed to the Hub.
@@ -489,6 +490,11 @@ class ActionMemRLDSDataset(IterableDataset):
         self._webdataset_sample_weights = np.empty(0, dtype=np.float64)
         self._hybrid_backend_weights = np.empty(0, dtype=np.float64)
         self._webdataset_shuffle_buffer_size = dataset_config.rlds_shuffle_buffer_size
+        self.target_control_hz = (
+            float(dataset_config.rlds_target_control_hz)
+            if dataset_config.rlds_target_control_hz > 0
+            else None
+        )
 
         mixture_spec = _load_mixture_spec(dataset_config, self.backend.named_mixtures)
         per_dataset_kwargs, base_weights = self.backend.get_oxe_dataset_kwargs_and_weights(
@@ -499,6 +505,7 @@ class ActionMemRLDSDataset(IterableDataset):
             load_proprio=True,
             load_language=True,
             action_proprio_normalization_type=self.backend.normalization_type.NORMAL,
+            target_control_hz=self.target_control_hz,
         )
         if len(per_dataset_kwargs) != len(mixture_spec):
             loaded = {kwargs["name"] for kwargs in per_dataset_kwargs}
@@ -560,6 +567,7 @@ class ActionMemRLDSDataset(IterableDataset):
             total_frames=self.num_frames,
             total_episodes=self.num_episodes,
             camera_keys=camera_keys,
+            fps=self.target_control_hz or 1.0,
         )
         self.collate_fn = RLDSActionTokenCollator(
             checkpoint_path=action_vqvae_checkpoint_path,
@@ -579,6 +587,16 @@ class ActionMemRLDSDataset(IterableDataset):
             "RLDS storage backends: %s",
             ", ".join(f"{name}={self.source_formats[name]}" for name in self.dataset_names),
         )
+        if self.target_control_hz is not None:
+            logging.info(
+                "OXE control-frequency alignment: %s",
+                ", ".join(
+                    f"{kwargs['name']}={kwargs['source_control_hz']:g}Hz->{self.target_control_hz:g}Hz"
+                    for kwargs in per_dataset_kwargs
+                ),
+            )
+        else:
+            logging.info("OXE control-frequency alignment is disabled; using native source rates.")
 
     def _build_interleaved_dataset(
         self,
@@ -658,6 +676,8 @@ class ActionMemRLDSDataset(IterableDataset):
                     state_obs_keys=source_kwargs.get("state_obs_keys", ()),
                     language_key=source_kwargs.get("language_key"),
                     absolute_action_mask=source_kwargs.get("absolute_action_mask"),
+                    source_control_hz=source_kwargs.get("source_control_hz"),
+                    target_control_hz=source_kwargs.get("target_control_hz"),
                 )
                 paths = resolve_openx_tar_paths(self.dataset_config.root or "", source_kwargs["name"])
                 self._webdataset_sources.append(

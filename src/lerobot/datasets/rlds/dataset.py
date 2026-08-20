@@ -17,6 +17,10 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import logging
+from lerobot.datasets.rlds.frequency_resampling import (
+    CONTROL_FREQUENCY_RESAMPLER_VERSION,
+    resample_trajectory_tensor,
+)
 from lerobot.datasets.rlds import obs_transforms, traj_transforms
 from lerobot.datasets.rlds.utils import goal_relabeling, task_augmentation
 from lerobot.datasets.rlds.utils.data_utils import (
@@ -46,6 +50,8 @@ def _standardize_and_restructure_trajectory(
     state_obs_keys,
     language_key,
     absolute_action_mask,
+    source_control_hz=None,
+    target_control_hz=None,
 ):
     if standardize_fn is not None:
         traj = standardize_fn(traj)
@@ -103,6 +109,22 @@ def _standardize_and_restructure_trajectory(
             tf.convert_to_tensor(absolute_action_mask, dtype=tf.bool)[None],
             [traj_len, 1],
         )
+    if target_control_hz is not None:
+        if source_control_hz is None:
+            raise ValueError(
+                f"target_control_hz={target_control_hz} was requested for {name!r}, "
+                "but source_control_hz is missing."
+            )
+        if absolute_action_mask is None:
+            raise ValueError(
+                f"Control-frequency alignment for {name!r} requires absolute_action_mask."
+            )
+        traj = resample_trajectory_tensor(
+            traj,
+            absolute_action_mask=absolute_action_mask,
+            source_hz=source_control_hz,
+            target_hz=target_control_hz,
+        )
     return traj
 
 
@@ -115,6 +137,8 @@ def _make_restructure_fn(
     state_obs_keys,
     language_key,
     absolute_action_mask,
+    source_control_hz=None,
+    target_control_hz=None,
 ):
     return partial(
         _standardize_and_restructure_trajectory,
@@ -125,6 +149,8 @@ def _make_restructure_fn(
         state_obs_keys=state_obs_keys,
         language_key=language_key,
         absolute_action_mask=absolute_action_mask,
+        source_control_hz=source_control_hz,
+        target_control_hz=target_control_hz,
     )
 
 
@@ -255,6 +281,8 @@ def make_dataset_from_rlds(
     dataset_statistics: Optional[Union[dict, str]] = None,
     absolute_action_mask: Optional[List[bool]] = None,
     action_normalization_mask: Optional[List[bool]] = None,
+    source_control_hz: Optional[float] = None,
+    target_control_hz: Optional[float] = None,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
 ) -> Tuple[dl.DLataset, dict]:
@@ -336,6 +364,8 @@ def make_dataset_from_rlds(
         state_obs_keys=state_obs_keys,
         language_key=language_key,
         absolute_action_mask=absolute_action_mask,
+        source_control_hz=source_control_hz,
+        target_control_hz=target_control_hz,
     )
 
     builder = tfds.builder(name, data_dir=data_dir)
@@ -349,13 +379,23 @@ def make_dataset_from_rlds(
             builder, split="all", shuffle=False, num_parallel_reads=num_parallel_reads
         ).traj_map(restructure, num_parallel_calls)
         # tries to load from cache, otherwise computes on the fly
+        hash_dependencies = [
+            str(builder.info),
+            str(state_obs_keys),
+            inspect.getsource(standardize_fn) if standardize_fn is not None else "",
+        ]
+        if target_control_hz is not None:
+            hash_dependencies.extend(
+                [
+                    CONTROL_FREQUENCY_RESAMPLER_VERSION,
+                    str(source_control_hz),
+                    str(target_control_hz),
+                    str(absolute_action_mask),
+                ]
+            )
         dataset_statistics = get_dataset_statistics(
             full_dataset,
-            hash_dependencies=(
-                str(builder.info),
-                str(state_obs_keys),
-                inspect.getsource(standardize_fn) if standardize_fn is not None else "",
-            ),
+            hash_dependencies=tuple(hash_dependencies),
             save_dir=builder.data_dir,
         )
     dataset_statistics = tree_map(np.array, dataset_statistics)
@@ -407,6 +447,8 @@ def make_dataset_from_webdataset(
     dataset_statistics: Optional[Union[dict, str]] = None,
     absolute_action_mask: Optional[List[bool]] = None,
     action_normalization_mask: Optional[List[bool]] = None,
+    source_control_hz: Optional[float] = None,
+    target_control_hz: Optional[float] = None,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
     seed: int = 0,
@@ -431,6 +473,8 @@ def make_dataset_from_webdataset(
         state_obs_keys=state_obs_keys,
         language_key=language_key,
         absolute_action_mask=absolute_action_mask,
+        source_control_hz=source_control_hz,
+        target_control_hz=target_control_hz,
     )
 
     paths = resolve_openx_tar_paths(data_dir, name)
@@ -445,16 +489,26 @@ def make_dataset_from_webdataset(
         with tf.io.gfile.GFile(dataset_statistics, "r") as f:
             dataset_statistics = json.load(f)
     elif dataset_statistics is None:
+        hash_dependencies = [
+            name,
+            repr(manifest),
+            str(state_obs_keys),
+            inspect.getsource(standardize_fn) if standardize_fn is not None else "",
+        ]
+        if target_control_hz is not None:
+            hash_dependencies.extend(
+                [
+                    CONTROL_FREQUENCY_RESAMPLER_VERSION,
+                    str(source_control_hz),
+                    str(target_control_hz),
+                    str(absolute_action_mask),
+                ]
+            )
         dataset_statistics = load_or_compute_openx_tar_statistics(
             paths=paths,
             tf=tf,
             restructure_fn=restructure,
-            hash_dependencies=(
-                name,
-                repr(manifest),
-                str(state_obs_keys),
-                inspect.getsource(standardize_fn) if standardize_fn is not None else "",
-            ),
+            hash_dependencies=tuple(hash_dependencies),
         )
     dataset_statistics = tree_map(np.array, dataset_statistics)
 

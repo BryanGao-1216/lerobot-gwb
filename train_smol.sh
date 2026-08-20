@@ -1,17 +1,17 @@
 lerobot-train \
-  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-pt/checkpoints/last/pretrained_model \
-  --policy.action_vqvae_checkpoint_path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/MyStudy/myStudy/scripts/outputs/action_vqvae.pt \
+  --policy.path=/mnt/data27T/media/media/gwb/models/smol_actionmem-final/checkpoints/last/pretrained_model \
+  --policy.action_vqvae_checkpoint_path=/mnt/data27T/media/gwb/MyStudy/myStudy/scripts/outputs/action_vqvae.pt \
   --policy.train_expert_only=false \
-  --policy.training_stage=action_expert_only \
+  --policy.training_stage=vlm_only \
   --policy.input_features=null \
   --policy.output_features=null \
   --dataset.repo_id=action_tokenizer_plus \
   --policy.action_token_soft_target_temperature=1 \
   --dataset_type=rlds \
   --dataset.rlds_storage_format=hybrid \
-  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/OpenX \
-  --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-final \
-  --steps=10000 \
+  --dataset.root=/mnt/data27T/media/media/gwb/datasets/OpenX \
+  --output_dir=/mnt/data27T/media/media/gwb/models/smol_actionmem-finall \
+  --steps=1000 \
   --policy.tensorboard_log_freq=10 \
   --policy.optimizer_grad_clip_norm=5 \
   --batch_size=32 \

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Tuple
 
 import logging
 from lerobot.datasets.rlds.oxe.configs import OXE_DATASET_CONFIGS, ActionEncoding
+from lerobot.datasets.rlds.oxe.control_frequencies import get_oxe_control_frequency_hz
 from lerobot.datasets.rlds.oxe.transforms import OXE_STANDARDIZATION_TRANSFORMS
 from lerobot.datasets.rlds.utils.data_utils import NormalizationType
 
@@ -36,6 +37,7 @@ def make_oxe_dataset_kwargs(
     load_proprio: bool = True,
     load_language: bool = True,
     action_proprio_normalization_type: NormalizationType = NormalizationType.NORMAL,
+    target_control_hz: float | None = None,
 ) -> Dict[str, Any]:
     """Generates config (kwargs) for given dataset from Open-X Embodiment."""
     dataset_name = canonicalize_oxe_dataset_name(dataset_name)
@@ -56,6 +58,9 @@ def make_oxe_dataset_kwargs(
         dataset_kwargs["absolute_action_mask"] = [False] * 9 + [True]
         dataset_kwargs["action_normalization_mask"] = [True] * 9 + [False]
     dataset_kwargs["action_proprio_normalization_type"] = action_proprio_normalization_type
+    if target_control_hz is not None:
+        dataset_kwargs["source_control_hz"] = get_oxe_control_frequency_hz(dataset_name)
+        dataset_kwargs["target_control_hz"] = float(target_control_hz)
 
     # Adjust Loaded Camera Views
     if len(missing_keys := (set(load_camera_views) - set(dataset_kwargs["image_obs_keys"]))) > 0:
@@ -99,6 +104,7 @@ def get_oxe_dataset_kwargs_and_weights(
     load_proprio: bool = True,
     load_language: bool = True,
     action_proprio_normalization_type: NormalizationType = NormalizationType.NORMAL,
+    target_control_hz: float | None = None,
 ) -> Tuple[Dict[str, Any], List[float]]:
     """
     Generates dataset kwargs for a given dataset mix from the Open X-Embodiment dataset. The returned kwargs
@@ -137,6 +143,7 @@ def get_oxe_dataset_kwargs_and_weights(
                     load_proprio,
                     load_language,
                     action_proprio_normalization_type,
+                    target_control_hz,
                 )
             )
             sampling_weights.append(d_weight)

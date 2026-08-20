@@ -46,6 +46,7 @@ def test_dataset_config_rlds_defaults_are_valid():
     assert config.rlds_camera_views == ("primary", "secondary", "wrist")
     assert config.rlds_storage_format == "auto"
     assert config.rlds_action_transform == "oxe"
+    assert config.rlds_target_control_hz == 10.0
     assert not hasattr(config, "rlds_backend_path")
 
 
@@ -61,6 +62,12 @@ def test_rlds_storage_format_cli_alias_matches_mystudy():
     ]
 
 
+def test_target_control_hz_cli_alias_matches_mystudy():
+    assert normalize_cli_aliases(["--target-control-hz=10"]) == [
+        "--dataset.rlds_target_control_hz=10"
+    ]
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -69,6 +76,7 @@ def test_rlds_storage_format_cli_alias_matches_mystudy():
         ({"rlds_action_transform": "unknown"}, "action_transform"),
         ({"rlds_storage_format": "pickle"}, "storage_format"),
         ({"rlds_q0_device": "mps"}, "q0_device"),
+        ({"rlds_target_control_hz": -1}, "target_control_hz"),
         ({"rlds_camera_views": ("primary", "overhead")}, "camera_views"),
     ],
 )

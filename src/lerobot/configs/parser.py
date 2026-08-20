@@ -46,6 +46,7 @@ _CLI_ALIASES = {
     # Match the standalone myStudy/VQ-VAE training CLI while storing the value
     # in LeRobot's nested DatasetConfig.
     "--rlds-storage-format": "--dataset.rlds_storage_format",
+    "--target-control-hz": "--dataset.rlds_target_control_hz",
 }
 
 

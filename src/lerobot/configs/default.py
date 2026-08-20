@@ -59,6 +59,10 @@ class DatasetConfig:
     rlds_resize_size: tuple[int, int] = (256, 256)
     rlds_skip_unlabeled: bool = True
     rlds_num_parallel_calls: int = 16
+    # Align every standardized OXE trajectory to one physical control rate
+    # before statistics, normalization and action chunking. The 10 Hz default
+    # matches the Action VQ-VAE pipeline in scripts/myStudy; zero disables it.
+    rlds_target_control_hz: float = 10.0
     # ``auto`` and ``hybrid`` select local OpenX WebDataset tar shards per
     # source when they exist under ``root/<dataset_name>/*.tar`` and otherwise
     # use prepared TFDS/RLDS. A mixed-format mixture is sampled as one stream.
@@ -93,6 +97,11 @@ class DatasetConfig:
             )
         if self.rlds_num_parallel_calls <= 0:
             raise ValueError(f"rlds_num_parallel_calls must be positive, got {self.rlds_num_parallel_calls}")
+        if self.rlds_target_control_hz < 0:
+            raise ValueError(
+                "rlds_target_control_hz must be non-negative (zero disables resampling), got "
+                f"{self.rlds_target_control_hz}"
+            )
         if self.rlds_storage_format not in {"auto", "tfds", "webdataset", "hybrid"}:
             raise ValueError(
                 "rlds_storage_format must be 'auto', 'tfds', 'webdataset', or 'hybrid', got "
