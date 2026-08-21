@@ -5,6 +5,10 @@ lerobot-train \
   --policy.training_stage=vlm_only \
   --policy.input_features=null \
   --policy.output_features=null \
+  --policy.chunk_size=10 \
+  --policy.n_action_steps=10 \
+  --policy.drop_n_last_frames=9 \
+  --dataset.rlds_target_control_hz=10 \
   --dataset.repo_id=action_tokenizer_plus \
   --policy.action_token_soft_target_temperature=1 \
   --dataset_type=rlds \
