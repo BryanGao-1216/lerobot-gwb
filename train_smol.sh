@@ -1,5 +1,5 @@
 lerobot-train \
-  --policy.path=/mnt/data27T/media/media/gwb/models/smol_actionmem-final/checkpoints/last/pretrained_model \
+  --policy.path=/mnt/data27T/media/gwb/models/smol_actionmem-base \
   --policy.action_vqvae_checkpoint_path=/mnt/data27T/media/gwb/MyStudy/myStudy/scripts/outputs/action_vqvae.pt \
   --policy.train_expert_only=false \
   --policy.training_stage=vlm_only \
@@ -9,9 +9,9 @@ lerobot-train \
   --policy.action_token_soft_target_temperature=1 \
   --dataset_type=rlds \
   --dataset.rlds_storage_format=hybrid \
-  --dataset.root=/mnt/data27T/media/media/gwb/datasets/OpenX \
-  --output_dir=/mnt/data27T/media/media/gwb/models/smol_actionmem-finall \
-  --steps=1000 \
+  --dataset.root=/mnt/data27T/media/gwb/datasets/OpenX \
+  --output_dir=/mnt/data27T/media/gwb/models/smol_actionmem-finall \
+  --steps=100000 \
   --policy.tensorboard_log_freq=10 \
   --policy.optimizer_grad_clip_norm=5 \
   --batch_size=32 \
