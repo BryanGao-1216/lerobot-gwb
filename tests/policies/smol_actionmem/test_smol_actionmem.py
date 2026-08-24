@@ -153,6 +153,7 @@ def test_action_objective_is_exactly_256_way():
 
     assert model.action_classifier.out_features == 256
     assert output["action_token_accuracy"].item() == 1.0
+    assert output["action_token_target_rank"].item() == 1.0
 
 
 def test_action_objective_ignores_out_of_range_local_padding_class():
@@ -169,6 +170,26 @@ def test_action_objective_ignores_out_of_range_local_padding_class():
 
     assert output["action_token_kl_loss"].item() == 0
     assert output["action_token_accuracy"].item() == 0
+    assert output["action_token_target_rank"].item() == 0
+
+
+def test_action_objective_averages_target_logit_rank_over_valid_batch_items():
+    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
+    nn.Module.__init__(model)
+    model.config = type("Config", (), {"action_token_soft_target_temperature": 1.0})()
+    model.action_classifier = nn.Linear(1, 3)
+
+    output = model._compute_action_token_objective(
+        logits=torch.tensor([[3.0, 2.0, 1.0], [3.0, 2.0, 1.0], [0.0, 0.0, 0.0]]),
+        action_tokens=torch.tensor([[3, 4, 5, 0], [3, 4, 5, 2], [3, 4, 5, 1]]),
+        action_token_masks=torch.tensor(
+            [[True, True, True, True], [True, True, True, True], [True, True, True, False]]
+        ),
+        action_code_distances=torch.zeros(3, 3),
+    )
+
+    # The valid targets rank first and third respectively; the masked sample is ignored.
+    assert output["action_token_target_rank"].item() == 2.0
 
 
 def test_action_objective_matches_latent_distance_soft_target_kl():

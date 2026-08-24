@@ -434,6 +434,14 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         per_sample = per_sample * mask
         mean_loss = per_sample.sum() / valid_count
         accuracy = ((logits.argmax(dim=-1) == safe_targets) & target_mask).float().sum() / valid_count
+        target_logits = logits.float().gather(dim=-1, index=safe_targets.unsqueeze(-1)).squeeze(-1)
+        greater_count = (logits.float() > target_logits.unsqueeze(-1)).sum(dim=-1)
+        equal_count = (logits.float() == target_logits.unsqueeze(-1)).sum(dim=-1)
+        # Use the average occupied rank for exact ties. With ordinary floating-point
+        # logits ties are rare, while this keeps an all-equal prediction at the
+        # uninformative midpoint instead of reporting rank 1.
+        target_rank_per_sample = greater_count.float() + (equal_count.float() + 1.0) / 2.0
+        target_rank = (target_rank_per_sample * mask).sum() / valid_count
         target_entropy = (target_entropy_per_sample * mask).sum() / valid_count
         target_peak_probability = (target_peak_per_sample * mask).sum() / valid_count
         return {
@@ -441,6 +449,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             "action_token_target_mask": target_mask,
             "action_token_kl_loss": mean_loss,
             "action_token_accuracy": accuracy,
+            "action_token_target_rank": target_rank,
             "action_token_soft_target_entropy": target_entropy,
             "action_token_soft_target_peak_probability": target_peak_probability,
         }
@@ -810,6 +819,7 @@ class SmolActionMemPolicy(SmolVLAPolicy):
                         self.config.action_token_loss_weight * token_loss
                     ).item(),
                     "action_token_accuracy": output["action_token_accuracy"].item(),
+                    "action_token_target_rank": output["action_token_target_rank"].item(),
                     "action_token_soft_target_entropy": output[
                         "action_token_soft_target_entropy"
                     ].item(),
