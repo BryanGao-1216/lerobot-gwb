@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -37,16 +37,12 @@ from lerobot.types import TransitionKey
 from lerobot.utils.constants import ACTION_TOKEN, ACTION_TOKEN_MASK, ACTION_TOKENS, OBS_LANGUAGE_TOKENS
 
 from .configuration_smol_actionmem import SmolActionMemConfig
-from .tokenization_smol_actionmem import (
-    SmolActionMemTokenMap,
-    default_smol_actionmem_token_map_path,
-)
 
 
 @dataclass
 @ProcessorStepRegistry.register(name="smol_actionmem_action_code_processor")
 class SmolActionMemActionCodeProcessorStep(ComplementaryDataProcessorStep):
-    """Map each frame's q0 code to the independent action context.
+    """Place each endpoint-effect code in the independent action context.
 
     History is intentionally empty in this first version:
     ``[MEMORY_START, MEMORY_END, ACTION_QUERY, CURRENT_TARGET]``.
@@ -54,13 +50,29 @@ class SmolActionMemActionCodeProcessorStep(ComplementaryDataProcessorStep):
     tokenizer or language embedding matrix.
     """
 
-    token_map_path: str
+    codebook_size: int = 256
+    invalid_value: int = -1
     action_token_key: str = ACTION_TOKEN
-    _token_map: SmolActionMemTokenMap = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._token_map = SmolActionMemTokenMap.from_json(self.token_map_path)
-        self.token_map_path = self._token_map.path
+        if self.codebook_size < 2:
+            raise ValueError(f"codebook_size must be at least 2, got {self.codebook_size}.")
+
+    @property
+    def memory_start_id(self) -> int:
+        return self.codebook_size
+
+    @property
+    def memory_end_id(self) -> int:
+        return self.codebook_size + 1
+
+    @property
+    def action_query_id(self) -> int:
+        return self.codebook_size + 2
+
+    @property
+    def padding_id(self) -> int:
+        return self.codebook_size + 3
 
     def _batch_size_and_device(self) -> tuple[int, torch.device]:
         observation = self.transition.get(TransitionKey.OBSERVATION) or {}
@@ -76,37 +88,36 @@ class SmolActionMemActionCodeProcessorStep(ComplementaryDataProcessorStep):
         batch_size, device = self._batch_size_and_device()
         tokens = torch.full(
             (batch_size, 4),
-            self._token_map.padding_id,
+            self.padding_id,
             dtype=torch.long,
             device=device,
         )
         masks = torch.zeros((batch_size, 4), dtype=torch.bool, device=device)
-        tokens[:, 0] = self._token_map.memory_start_id
-        tokens[:, 1] = self._token_map.memory_end_id
-        tokens[:, 2] = self._token_map.action_query_id
+        tokens[:, 0] = self.memory_start_id
+        tokens[:, 1] = self.memory_end_id
+        tokens[:, 2] = self.action_query_id
         masks[:, :3] = True
 
-        raw_q0 = complementary_data.get(self.action_token_key)
-        if raw_q0 is not None:
-            raw_q0_tensor = torch.as_tensor(raw_q0)
-            q0 = raw_q0_tensor.to(device=device, dtype=torch.long).reshape(-1)
-            if q0.numel() != batch_size:
+        raw_codes = complementary_data.get(self.action_token_key)
+        if raw_codes is not None:
+            raw_code_tensor = torch.as_tensor(raw_codes)
+            codes = raw_code_tensor.to(device=device, dtype=torch.long).reshape(-1)
+            if codes.numel() != batch_size:
                 raise ValueError(
-                    f"Expected {batch_size} q0 codes in '{self.action_token_key}', got shape "
-                    f"{tuple(raw_q0_tensor.shape)}."
+                    f"Expected {batch_size} action codes in '{self.action_token_key}', got shape "
+                    f"{tuple(raw_code_tensor.shape)}."
                 )
 
-            valid = q0 != self._token_map.invalid_value
-            out_of_range = valid & ((q0 < self._token_map.code_id_min) | (q0 > self._token_map.code_id_max))
+            valid = codes != self.invalid_value
+            out_of_range = valid & ((codes < 0) | (codes >= self.codebook_size))
             if torch.any(out_of_range):
-                invalid_codes = q0[out_of_range].detach().cpu().tolist()
+                invalid_codes = codes[out_of_range].detach().cpu().tolist()
                 raise ValueError(
-                    f"Smol ActionMem q0 codes must be in "
-                    f"[{self._token_map.code_id_min}, {self._token_map.code_id_max}] "
-                    f"or equal invalid_value={self._token_map.invalid_value}; got {invalid_codes}."
+                    f"Smol ActionMem action codes must be in [0, {self.codebook_size - 1}] "
+                    f"or equal invalid_value={self.invalid_value}; got {invalid_codes}."
                 )
 
-            tokens[valid, 3] = q0[valid] - self._token_map.code_id_min
+            tokens[valid, 3] = codes[valid]
             masks[valid, 3] = True
 
         complementary_data[ACTION_TOKENS] = tokens
@@ -115,7 +126,8 @@ class SmolActionMemActionCodeProcessorStep(ComplementaryDataProcessorStep):
 
     def get_config(self) -> dict[str, Any]:
         return {
-            "token_map_path": self.token_map_path,
+            "codebook_size": self.codebook_size,
+            "invalid_value": self.invalid_value,
             "action_token_key": self.action_token_key,
         }
 
@@ -150,7 +162,8 @@ def make_smol_actionmem_pre_post_processors(
             max_length=config.tokenizer_max_length,
         ),
         SmolActionMemActionCodeProcessorStep(
-            token_map_path=config.action_token_map_path or str(default_smol_actionmem_token_map_path()),
+            codebook_size=config.action_codebook_size,
+            invalid_value=config.action_code_invalid_value,
         ),
         steps.to_device,
         relative_step,

@@ -29,7 +29,7 @@ from lerobot.datasets.rlds_dataset import (
     RLDSActionTokenCollator,
     _adapt_openx_tar_source_kwargs,
     _aggregate_weighted_stats,
-    _attach_normalized_action_vqvae_input,
+    _attach_normalized_action_tokenizer_input,
     _filter_vqvla_action_chunk,
     _load_mixture_spec,
     _resolve_rlds_source_format,
@@ -42,8 +42,8 @@ from lerobot.datasets.rlds_webdataset import (
     stack_openx_episode_steps,
 )
 from lerobot.utils.constants import (
-    ACTION_TOKEN_Q0_DISTANCES,
-    ACTION_VQVAE_INPUT,
+    ACTION_TOKEN_DISTANCES,
+    ACTION_TOKENIZER_INPUT,
     ACTION_VQVAE_NORMALIZATION_MASK,
     ACTION_VQVAE_Q01,
     ACTION_VQVAE_Q99,
@@ -362,11 +362,11 @@ def test_rlds_statistics_must_match_vqvae_action_dimension():
         "proprio": {"mean": np.zeros(7)},
     }
 
-    with pytest.raises(ValueError, match="VQ-VAE expects 7"):
+    with pytest.raises(ValueError, match="action tokenizer expects 7"):
         _validate_statistics("droid", statistics, action_dim=7, state_dim=32)
 
 
-def test_vqvae_action_input_matches_vqvla_q01_q99_and_preserves_gripper():
+def test_action_tokenizer_input_matches_vqvla_q01_q99_and_preserves_gripper():
     raw_action = np.array(
         [[[0.0, 2.0, -3.0], [1.0, 3.0, 4.0]]],
         dtype=np.float32,
@@ -382,11 +382,11 @@ def test_vqvae_action_input_matches_vqvla_q01_q99_and_preserves_gripper():
         }
     }
 
-    result = _attach_normalized_action_vqvae_input(trajectory, statistics, _NumpyTensorFlow)
+    result = _attach_normalized_action_tokenizer_input(trajectory, statistics, _NumpyTensorFlow)
 
     assert np.array_equal(result["action"], raw_action)
     assert np.allclose(
-        result[ACTION_VQVAE_INPUT],
+        result[ACTION_TOKENIZER_INPUT],
         [[[-0.0, 0.0, -3.0], [1.0, 1.0, 4.0]]],
     )
     assert np.array_equal(result[ACTION_VQVAE_NORMALIZATION_MASK][0, 0], [True, True, False])
@@ -394,7 +394,7 @@ def test_vqvae_action_input_matches_vqvla_q01_q99_and_preserves_gripper():
     assert np.array_equal(result[ACTION_VQVAE_Q99][0, 0], [1.0, 3.0, 1.0])
 
 
-def test_rlds_collator_encodes_only_normalized_vqvae_action_input():
+def test_rlds_collator_encodes_only_normalized_action_tokenizer_input():
     class _RecordingEncoder:
         def __init__(self):
             self.actions = None
@@ -415,7 +415,7 @@ def test_rlds_collator_encodes_only_normalized_vqvae_action_input():
         [
             {
                 "action": raw_action,
-                ACTION_VQVAE_INPUT: normalized_action,
+                ACTION_TOKENIZER_INPUT: normalized_action,
                 ACTION_VQVAE_Q01: torch.tensor([-1.0, 0.0, 0.0]),
                 ACTION_VQVAE_Q99: torch.tensor([1.0, 1.0, 1.0]),
                 ACTION_VQVAE_NORMALIZATION_MASK: torch.tensor([True, True, False]),
@@ -426,16 +426,16 @@ def test_rlds_collator_encodes_only_normalized_vqvae_action_input():
     assert torch.equal(collator.encoder.actions, normalized_action.unsqueeze(0))
     assert torch.equal(batch["action"], raw_action.unsqueeze(0))
     assert torch.equal(batch["action_token"], torch.tensor([17]))
-    assert batch[ACTION_TOKEN_Q0_DISTANCES].shape == (1, 256)
-    assert batch[ACTION_TOKEN_Q0_DISTANCES][0].argmin().item() == 17
+    assert batch[ACTION_TOKEN_DISTANCES].shape == (1, 256)
+    assert batch[ACTION_TOKEN_DISTANCES][0].argmin().item() == 17
     assert torch.equal(batch[ACTION_VQVAE_NORMALIZATION_MASK], torch.tensor([[True, True, False]]))
-    assert torch.equal(batch[ACTION_VQVAE_INPUT], normalized_action.unsqueeze(0))
+    assert torch.equal(batch[ACTION_TOKENIZER_INPUT], normalized_action.unsqueeze(0))
 
 
 def test_vqvla_chunk_filter_reads_shared_normalized_action_without_overwriting_raw_action():
     frame = {
         "action": np.full((2, 2), 10.0, dtype=np.float32),
-        ACTION_VQVAE_INPUT: np.full((2, 2), 0.25, dtype=np.float32),
+        ACTION_TOKENIZER_INPUT: np.full((2, 2), 0.25, dtype=np.float32),
     }
     observed = {}
 
@@ -458,7 +458,7 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
     )
     frame = {
         "action": np.zeros((16, 7), dtype=np.float32),
-        ACTION_VQVAE_INPUT: np.full((16, 7), 0.25, dtype=np.float32),
+        ACTION_TOKENIZER_INPUT: np.full((16, 7), 0.25, dtype=np.float32),
         ACTION_VQVAE_Q01: np.tile(np.arange(7, dtype=np.float32), (16, 1)),
         ACTION_VQVAE_Q99: np.tile(np.arange(7, dtype=np.float32) + 1, (16, 1)),
         ACTION_VQVAE_NORMALIZATION_MASK: np.tile(np.array([True] * 6 + [False]), (16, 1)),
@@ -478,7 +478,7 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
     sample = dataset._to_lerobot_sample(frame)
 
     assert sample["action"].shape == (16, 7)
-    assert torch.all(sample[ACTION_VQVAE_INPUT] == 0.25)
+    assert torch.all(sample[ACTION_TOKENIZER_INPUT] == 0.25)
     assert torch.equal(sample[ACTION_VQVAE_Q01], torch.arange(7, dtype=torch.float32))
     assert sample[ACTION_VQVAE_NORMALIZATION_MASK][-1].item() is False
     assert sample["observation.state"].shape == (10,)

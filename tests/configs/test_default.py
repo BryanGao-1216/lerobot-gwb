@@ -75,7 +75,7 @@ def test_target_control_hz_cli_alias_matches_mystudy():
         ({"rlds_resize_size": (256, 0)}, "resize_size"),
         ({"rlds_action_transform": "unknown"}, "action_transform"),
         ({"rlds_storage_format": "pickle"}, "storage_format"),
-        ({"rlds_q0_device": "mps"}, "q0_device"),
+        ({"rlds_action_tokenizer_device": "mps"}, "action_tokenizer_device"),
         ({"rlds_target_control_hz": -1}, "target_control_hz"),
         ({"rlds_camera_views": ("primary", "overhead")}, "camera_views"),
     ],

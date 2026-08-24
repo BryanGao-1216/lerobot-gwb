@@ -61,7 +61,7 @@ class DatasetConfig:
     rlds_num_parallel_calls: int = 16
     # Align every standardized OXE trajectory to one physical control rate
     # before statistics, normalization and action chunking. The 10 Hz default
-    # matches the Action VQ-VAE pipeline in scripts/myStudy; zero disables it.
+    # matches scripts/effectTokenizer; zero disables it.
     rlds_target_control_hz: float = 10.0
     # ``auto`` and ``hybrid`` select local OpenX WebDataset tar shards per
     # source when they exist under ``root/<dataset_name>/*.tar`` and otherwise
@@ -72,10 +72,12 @@ class DatasetConfig:
     # standardizers. ``identity`` is retained as a backwards-compatible alias
     # for ``oxe``; neither value bypasses the OXE standardizer itself.
     rlds_action_transform: str = "oxe"
+    rlds_effect_tokenizer_checkpoint_path: str | None = None
+    # Used only by the residual-VQ ActionMem and PI05ActionMem policies.
     rlds_action_vqvae_checkpoint_path: str | None = None
-    # q0 encoding runs inside the main-process collate function. CPU saves GPU
-    # memory; "cuda" is faster for SmolActionMem when memory permits.
-    rlds_q0_device: str = "cpu"
+    # Action-code encoding runs inside the main-process collate function. CPU
+    # saves GPU memory; CUDA is faster when memory permits.
+    rlds_action_tokenizer_device: str = "cpu"
     # If unset, the active policy's max_state_dim is used. RLDS proprio vectors
     # are padded to this fixed size so heterogeneous datasets can be collated.
     rlds_state_dim: int | None = None
@@ -112,8 +114,13 @@ class DatasetConfig:
                 "rlds_action_transform must be either 'oxe' or its legacy alias 'identity', got "
                 f"{self.rlds_action_transform!r}"
             )
-        if self.rlds_q0_device != "cpu" and not self.rlds_q0_device.startswith("cuda"):
-            raise ValueError(f"rlds_q0_device must be 'cpu' or a CUDA device, got {self.rlds_q0_device!r}")
+        if self.rlds_action_tokenizer_device != "cpu" and not self.rlds_action_tokenizer_device.startswith(
+            "cuda"
+        ):
+            raise ValueError(
+                "rlds_action_tokenizer_device must be 'cpu' or a CUDA device, got "
+                f"{self.rlds_action_tokenizer_device!r}"
+            )
         if self.rlds_state_dim is not None and self.rlds_state_dim <= 0:
             raise ValueError(f"rlds_state_dim must be positive when set, got {self.rlds_state_dim}")
         unknown_camera_views = set(self.rlds_camera_views) - {"primary", "secondary", "wrist"}

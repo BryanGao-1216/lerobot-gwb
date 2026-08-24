@@ -1,4 +1,3 @@
-import json
 import math
 import re
 
@@ -7,8 +6,6 @@ import torch
 from torch import nn
 
 import lerobot.policies.smol_actionmem.modeling_smol_actionmem as modeling_smol_actionmem
-from lerobot.datasets.rlds_dataset import resolve_actionmem_token_metadata
-from lerobot.policies.actionmem.action_vqvae import ActionVQVAEQ0Encoder
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.smol_actionmem.configuration_smol_actionmem import SmolActionMemConfig
 from lerobot.policies.smol_actionmem.modeling_smol_actionmem import (
@@ -18,48 +15,21 @@ from lerobot.policies.smol_actionmem.modeling_smol_actionmem import (
 from lerobot.policies.smol_actionmem.processor_smol_actionmem import (
     SmolActionMemActionCodeProcessorStep,
 )
-from lerobot.policies.smol_actionmem.tokenization_smol_actionmem import SmolActionMemTokenMap
 from lerobot.processor.converters import create_transition
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import (
     ACTION_TOKEN,
     ACTION_TOKEN_MASK,
+    ACTION_TOKENIZER_INPUT,
     ACTION_TOKENS,
-    ACTION_VQVAE_INPUT,
     OBS_LANGUAGE_TOKENS,
 )
 
 
-def _write_token_map(tmp_path):
-    path = tmp_path / "token_map.json"
-    path.write_text(
-        json.dumps(
-            {
-                "vqvae": {
-                    "codebook_size": 256,
-                    "code_id_min": 0,
-                    "code_id_max": 255,
-                    "invalid_value": -1,
-                    "action_horizon": 16,
-                    "action_dim": 7,
-                },
-                # Legacy vocabulary fields are deliberately ignored.
-                "action_tokens": {
-                    "anchor_token_id": 49276,
-                    "token_id_min": 49021,
-                    "token_id_max": 49276,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    return path
-
-
-def _transition(q0=None, batch_size=2):
+def _transition(action_codes=None, batch_size=2):
     data = {"task": ["pick"] * batch_size}
-    if q0 is not None:
-        data[ACTION_TOKEN] = q0
+    if action_codes is not None:
+        data[ACTION_TOKEN] = action_codes
     return create_transition(
         observation={OBS_LANGUAGE_TOKENS: torch.ones(batch_size, 4, dtype=torch.long)},
         complementary_data=data,
@@ -78,67 +48,8 @@ def test_config_rejects_non_positive_soft_target_temperature():
         SmolActionMemConfig(action_token_soft_target_temperature=0)
 
 
-def test_q0_encoder_exposes_the_same_latent_distances_used_for_assignment():
-    class _FlatEncoder(nn.Module):
-        horizon = 2
-        action_dim = 1
-        in_channels = 1
-
-        def forward(self, actions):
-            return actions.flatten(start_dim=1)
-
-    encoder = ActionVQVAEQ0Encoder(
-        encoder=_FlatEncoder(),
-        q0_codebook=torch.tensor([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]),
-        time_emb=None,
-        xyz_emb=None,
-        euler_emb=None,
-        gripper_emb=None,
-        action_mean=torch.zeros(1),
-        action_std=torch.ones(1),
-        normalize_actions=False,
-        use_action_type_pe=False,
-    )
-    actions = torch.tensor([[[0.75], [1.25]]])
-
-    distances = encoder.compute_code_distances(actions)
-
-    assert torch.allclose(distances, torch.tensor([[2.125, 0.125, 2.125]]))
-    assert torch.equal(encoder(actions), distances.argmin(dim=-1))
-
-
-def test_token_map_allocates_a_local_action_context(tmp_path):
-    token_map = SmolActionMemTokenMap.from_json(_write_token_map(tmp_path))
-
-    assert token_map.action_class_min == 0
-    assert token_map.action_class_max == 255
-    assert token_map.memory_start_id == 256
-    assert token_map.memory_end_id == 257
-    assert token_map.action_query_id == 258
-    assert token_map.padding_id == 259
-    assert token_map.context_vocab_size == 260
-
-
-def test_rlds_resolves_smol_actionmem_metadata(tmp_path):
-    config = type(
-        "Config",
-        (),
-        {
-            "type": "smol_actionmem",
-            "pretrained_path": str(tmp_path),
-            "action_token_map_path": None,
-        },
-    )()
-    _write_token_map(tmp_path)
-
-    metadata = resolve_actionmem_token_metadata(config)
-
-    assert metadata.codebook_size == 256
-    assert metadata.action_horizon == 16
-
-
-def test_processor_emits_local_classes_instead_of_language_token_ids(tmp_path):
-    step = SmolActionMemActionCodeProcessorStep(str(_write_token_map(tmp_path)))
+def test_processor_emits_local_classes_instead_of_language_token_ids():
+    step = SmolActionMemActionCodeProcessorStep(codebook_size=256)
 
     output = step(_transition(torch.tensor([[0], [255]])))[TransitionKey.COMPLEMENTARY_DATA]
     inference = step(_transition())[TransitionKey.COMPLEMENTARY_DATA]
@@ -163,19 +74,7 @@ class _DummyVLM:
         return tokens.float().unsqueeze(-1).expand(-1, -1, 4)
 
 
-def test_training_flow_source_is_standard_gaussian_noise():
-    model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
-    nn.Module.__init__(model)
-    actions = torch.zeros(2, 3, 4)
-    expected_noise = torch.arange(actions.numel(), dtype=actions.dtype).reshape_as(actions)
-    model.sample_noise = lambda shape, device: expected_noise
-
-    source = model._make_training_flow_source(actions)
-
-    assert source is expected_noise
-
-
-def test_flow_target_uses_preprocessor_action_not_vqvae_input():
+def test_flow_target_uses_preprocessor_action_not_tokenizer_input():
     policy = SmolActionMemPolicy.__new__(SmolActionMemPolicy)
     nn.Module.__init__(policy)
     policy.config = type(
@@ -186,17 +85,17 @@ def test_flow_target_uses_preprocessor_action_not_vqvae_input():
         },
     )()
     processed_actions = torch.linspace(-2, 2, 2 * 16 * 7).reshape(2, 16, 7)
-    vqvae_actions = torch.linspace(-1, 1, 2 * 16 * 7).reshape(2, 16, 7)
+    tokenizer_actions = torch.linspace(-1, 1, 2 * 16 * 7).reshape(2, 16, 7)
     batch = {
         "action": processed_actions,
-        ACTION_VQVAE_INPUT: vqvae_actions,
+        ACTION_TOKENIZER_INPUT: tokenizer_actions,
     }
 
     target = policy.prepare_action(batch)
 
     assert target.shape == (2, 16, 32)
     assert torch.equal(target[..., :7], processed_actions)
-    assert not torch.equal(target[..., :7], vqvae_actions)
+    assert not torch.equal(target[..., :7], tokenizer_actions)
     assert torch.count_nonzero(target[..., 7:]) == 0
 
 
@@ -204,11 +103,7 @@ def test_prefix_uses_independent_action_embedding_and_keeps_state_before_query()
     model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
     model.vlm_with_expert = _DummyVLM()
-    model.action_code_map = type(
-        "Map",
-        (),
-        {"action_query_id": 258, "action_class_min": 0, "action_class_max": 255},
-    )()
+    model.action_query_id = 258
     model.action_code_embedding = nn.Embedding(260, 4)
     with torch.no_grad():
         model.action_code_embedding.weight.copy_(
@@ -253,7 +148,7 @@ def test_action_objective_is_exactly_256_way():
         logits=logits,
         action_tokens=torch.tensor([[256, 257, 258, 3]]),
         action_token_masks=torch.ones(1, 4, dtype=torch.bool),
-        q0_distances=torch.nn.functional.one_hot(torch.tensor([3]), 256).logical_not().float(),
+        action_code_distances=torch.nn.functional.one_hot(torch.tensor([3]), 256).logical_not().float(),
     )
 
     assert model.action_classifier.out_features == 256
@@ -269,7 +164,7 @@ def test_action_objective_ignores_out_of_range_local_padding_class():
         logits=torch.zeros(1, 256),
         action_tokens=torch.tensor([[256, 257, 258, 259]]),
         action_token_masks=torch.tensor([[True, True, True, False]]),
-        q0_distances=None,
+        action_code_distances=None,
     )
 
     assert output["action_token_kl_loss"].item() == 0
@@ -296,7 +191,7 @@ def test_action_objective_matches_latent_distance_soft_target_kl():
         logits=model.action_classifier(torch.zeros(1, 1)),
         action_tokens=torch.tensor([[3, 4, 5, 0]]),
         action_token_masks=torch.ones(1, 4, dtype=torch.bool),
-        q0_distances=distances,
+        action_code_distances=distances,
     )
 
     assert torch.allclose(output["action_token_kl_loss"], expected_kl)
@@ -329,11 +224,8 @@ def test_inference_uses_complete_logits_condition_without_argmax_token(monkeypat
     )()
     model.rtc_processor = None
     model.vlm_with_expert = _InferenceVLM()
-    model.action_code_map = type(
-        "Map",
-        (),
-        {"action_query_id": 258, "action_class_min": 0, "action_class_max": 255},
-    )()
+    model.action_codebook_size = 256
+    model.action_query_id = 258
     model.action_code_embedding = nn.Embedding(260, 4)
     model.action_classifier = nn.Linear(4, 256)
     with torch.no_grad():

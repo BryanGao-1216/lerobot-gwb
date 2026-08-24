@@ -48,14 +48,17 @@ from lerobot.datasets.rlds_webdataset import (
     transform_openx_tar_episode,
 )
 from lerobot.policies.actionmem.action_vqvae import (
-    ActionVQVAEQ0Encoder,
     load_action_vqvae_q0_encoder,
+)
+from lerobot.policies.smol_actionmem.effect_tokenizer import (
+    load_effect_tokenizer_metadata,
+    load_effect_vqvae_action_encoder,
 )
 from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN,
-    ACTION_TOKEN_Q0_DISTANCES,
-    ACTION_VQVAE_INPUT,
+    ACTION_TOKEN_DISTANCES,
+    ACTION_TOKENIZER_INPUT,
     ACTION_VQVAE_NORMALIZATION_MASK,
     ACTION_VQVAE_Q01,
     ACTION_VQVAE_Q99,
@@ -119,31 +122,67 @@ class RLDSDatasetMetadata:
 
 
 class RLDSActionTokenCollator:
-    """Default-collate an RLDS batch, then encode its q01/q99-normalized action chunks to q0."""
+    """Collate RLDS samples and encode normalized chunks into action codes."""
 
-    def __init__(self, checkpoint_path: str | Path, device: str = "cpu") -> None:
+    def __init__(
+        self,
+        checkpoint_path: str | Path,
+        encoder_kind: str,
+        device: str = "cpu",
+        expected_horizon: int | None = None,
+        expected_action_dim: int | None = None,
+        expected_codebook_size: int | None = None,
+        expected_target_control_hz: float | None = None,
+    ) -> None:
         self.checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
         self.device = torch.device(device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError(
-                f"rlds_q0_device={device!r} requested CUDA, but CUDA is not available in this process."
+                f"rlds_action_tokenizer_device={device!r} requested CUDA, but CUDA is not available."
             )
-        self.encoder: ActionVQVAEQ0Encoder = load_action_vqvae_q0_encoder(self.checkpoint_path)
+        if encoder_kind == "effect":
+            self.encoder = load_effect_vqvae_action_encoder(self.checkpoint_path)
+        elif encoder_kind == "residual_vqvae":
+            self.encoder = load_action_vqvae_q0_encoder(self.checkpoint_path)
+        else:
+            raise ValueError(f"Unsupported action encoder kind {encoder_kind!r}.")
+
+        expected_values = {
+            "horizon": expected_horizon,
+            "action_dim": expected_action_dim,
+            "codebook_size": expected_codebook_size,
+        }
+        mismatches = [
+            f"{name}: checkpoint={getattr(self.encoder, name)}, expected={expected}"
+            for name, expected in expected_values.items()
+            if expected is not None and int(getattr(self.encoder, name)) != int(expected)
+        ]
+        checkpoint_hz = getattr(self.encoder, "target_control_hz", None)
+        target_hz_mismatch = (checkpoint_hz is None) != (expected_target_control_hz is None)
+        if checkpoint_hz is not None and expected_target_control_hz is not None:
+            target_hz_mismatch = not np.isclose(checkpoint_hz, expected_target_control_hz)
+        if encoder_kind == "effect" and target_hz_mismatch:
+            mismatches.append(
+                f"target_control_hz: checkpoint={checkpoint_hz}, expected={expected_target_control_hz}"
+            )
+        if mismatches:
+            raise ValueError(
+                "Action-tokenizer checkpoint is incompatible with the RLDS/policy contract: "
+                + "; ".join(mismatches)
+            )
         self.encoder.to(self.device)
         self.encoder.eval()
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
         batch = default_collate(samples)
-        # Do not remove this tensor after Q0 encoding: Smol ActionMem consumes
-        # this exact same per-source BOUNDS_Q99 action as its flow target.
-        actions = batch[ACTION_VQVAE_INPUT].to(
+        actions = batch[ACTION_TOKENIZER_INPUT].to(
             device=self.device, dtype=torch.float32, non_blocking=True
         )
         with torch.inference_mode():
-            q0_distances = self.encoder.compute_code_distances(actions)
-            q0_codes = q0_distances.argmin(dim=-1)
-        batch[ACTION_TOKEN] = q0_codes.to(device="cpu", dtype=torch.long)
-        batch[ACTION_TOKEN_Q0_DISTANCES] = q0_distances.to(device="cpu", dtype=torch.float32)
+            code_distances = self.encoder.compute_code_distances(actions)
+            codes = code_distances.argmin(dim=-1)
+        batch[ACTION_TOKEN] = codes.to(device="cpu", dtype=torch.long)
+        batch[ACTION_TOKEN_DISTANCES] = code_distances.to(device="cpu", dtype=torch.float32)
         return batch
 
 
@@ -296,13 +335,14 @@ def _denormalize_trajectory(trajectory: dict[str, Any], statistics: Mapping[str,
     return trajectory
 
 
-def _attach_normalized_action_vqvae_input(trajectory: dict[str, Any], statistics: Mapping[str, Any], tf: Any):
-    """Keep the q01/q99-normalized action shared by Q0 encoding and flow matching.
+def _attach_normalized_action_tokenizer_input(
+    trajectory: dict[str, Any], statistics: Mapping[str, Any], tf: Any
+):
+    """Keep the per-source q01/q99-normalized action for action-code encoding.
 
     ``trajectory["action"]`` remains in the canonical, unnormalized ActionMem
-    action space for metadata and environment post-processing. Smol ActionMem
-    deliberately reads ``ACTION_VQVAE_INPUT`` as its flow target so Q0 and flow
-    cannot drift into different action coordinate systems.
+    action space for metadata and environment post-processing. The flow target
+    is normalized separately by the policy preprocessor.
     """
     action = tf.cast(trajectory["action"], tf.float32)
     action_stats = statistics["action"]
@@ -318,7 +358,7 @@ def _attach_normalized_action_vqvae_input(trajectory: dict[str, Any], statistics
     minimum = tf.convert_to_tensor(action_stats["min"], dtype=tf.float32)
     maximum = tf.convert_to_tensor(action_stats["max"], dtype=tf.float32)
     normalized_action = tf.where(tf.equal(minimum, maximum), tf.zeros_like(action), normalized_action)
-    trajectory[ACTION_VQVAE_INPUT] = normalized_action
+    trajectory[ACTION_TOKENIZER_INPUT] = normalized_action
     action_shape = tf.shape(action)
     trajectory[ACTION_VQVAE_Q01] = tf.broadcast_to(low, action_shape)
     trajectory[ACTION_VQVAE_Q99] = tf.broadcast_to(high, action_shape)
@@ -329,7 +369,7 @@ def _attach_normalized_action_vqvae_input(trajectory: dict[str, Any], statistics
 def _filter_vqvla_action_chunk(frame: Mapping[str, Any], chunk_filter_fn: Callable) -> Any:
     """Run VQ-VLA's source filter against its expected BOUNDS_Q99 action."""
     filter_frame = dict(frame)
-    filter_frame["action"] = frame[ACTION_VQVAE_INPUT]
+    filter_frame["action"] = frame[ACTION_TOKENIZER_INPUT]
     return chunk_filter_fn(filter_frame)
 
 
@@ -363,7 +403,7 @@ def _validate_statistics(
     if actual_action_dim != action_dim:
         raise ValueError(
             f"RLDS dataset {dataset_name!r} has action dimension {actual_action_dim}, but the "
-            f"ActionMem VQ-VAE expects {action_dim}."
+            f"ActionMem action tokenizer expects {action_dim}."
         )
     actual_state_dim = np.asarray(statistics["proprio"]["mean"]).size
     if actual_state_dim > state_dim:
@@ -474,7 +514,9 @@ class ActionMemRLDSDataset(IterableDataset):
         action_horizon: int,
         action_dim: int,
         state_dim: int,
-        action_vqvae_checkpoint_path: str | Path,
+        action_tokenizer_checkpoint_path: str | Path,
+        action_encoder_kind: str,
+        action_codebook_size: int,
         seed: int,
     ) -> None:
         super().__init__()
@@ -570,8 +612,13 @@ class ActionMemRLDSDataset(IterableDataset):
             fps=self.target_control_hz or 1.0,
         )
         self.collate_fn = RLDSActionTokenCollator(
-            checkpoint_path=action_vqvae_checkpoint_path,
-            device=dataset_config.rlds_q0_device,
+            checkpoint_path=action_tokenizer_checkpoint_path,
+            device=dataset_config.rlds_action_tokenizer_device,
+            encoder_kind=action_encoder_kind,
+            expected_horizon=action_horizon,
+            expected_action_dim=action_dim,
+            expected_codebook_size=action_codebook_size,
+            expected_target_control_hz=self.target_control_hz,
         )
 
         logging.info(
@@ -748,7 +795,7 @@ class ActionMemRLDSDataset(IterableDataset):
             )
             source = source.traj_map(
                 partial(
-                    _attach_normalized_action_vqvae_input,
+                    _attach_normalized_action_tokenizer_input,
                     statistics=statistics,
                     tf=self.backend.tf,
                 ),
@@ -873,7 +920,7 @@ class ActionMemRLDSDataset(IterableDataset):
                         "observation": frame_observation,
                         "task": {"language_instruction": language[frame_index]},
                         "action": action_chunk,
-                        ACTION_VQVAE_INPUT: normalized_chunk,
+                        ACTION_TOKENIZER_INPUT: normalized_chunk,
                         ACTION_VQVAE_Q01: np.broadcast_to(q01, action_chunk.shape),
                         ACTION_VQVAE_Q99: np.broadcast_to(q99, action_chunk.shape),
                         ACTION_VQVAE_NORMALIZATION_MASK: np.broadcast_to(
@@ -963,11 +1010,11 @@ class ActionMemRLDSDataset(IterableDataset):
             raise ValueError(
                 f"Expected RLDS action chunk {(self.action_horizon, self.action_dim)}, got {action.shape}."
             )
-        action_vqvae_input = np.asarray(frame[ACTION_VQVAE_INPUT], dtype=np.float32)
-        if action_vqvae_input.shape != (self.action_horizon, self.action_dim):
+        action_tokenizer_input = np.asarray(frame[ACTION_TOKENIZER_INPUT], dtype=np.float32)
+        if action_tokenizer_input.shape != (self.action_horizon, self.action_dim):
             raise ValueError(
-                "Expected q01/q99-normalized RLDS VQ-VAE action chunk "
-                f"{(self.action_horizon, self.action_dim)}, got {action_vqvae_input.shape}."
+                "Expected q01/q99-normalized RLDS action-tokenizer chunk "
+                f"{(self.action_horizon, self.action_dim)}, got {action_tokenizer_input.shape}."
             )
         action_vqvae_q01 = np.asarray(frame[ACTION_VQVAE_Q01], dtype=np.float32)[0]
         action_vqvae_q99 = np.asarray(frame[ACTION_VQVAE_Q99], dtype=np.float32)[0]
@@ -982,7 +1029,7 @@ class ActionMemRLDSDataset(IterableDataset):
         sample: dict[str, Any] = {
             OBS_STATE: torch.from_numpy(state),
             ACTION: torch.from_numpy(action.copy()),
-            ACTION_VQVAE_INPUT: torch.from_numpy(action_vqvae_input.copy()),
+            ACTION_TOKENIZER_INPUT: torch.from_numpy(action_tokenizer_input.copy()),
             ACTION_VQVAE_Q01: torch.from_numpy(action_vqvae_q01.copy()),
             ACTION_VQVAE_Q99: torch.from_numpy(action_vqvae_q99.copy()),
             ACTION_VQVAE_NORMALIZATION_MASK: torch.from_numpy(action_vqvae_mask.copy()),
@@ -1030,10 +1077,6 @@ def resolve_actionmem_token_metadata(policy_config: Any) -> SimpleNamespace:
         token_map_path = str(companion_path.resolve())
         policy_config.action_token_map_path = token_map_path
 
-    if policy_config.type == "smol_actionmem":
-        from lerobot.policies.smol_actionmem.tokenization_smol_actionmem import SmolActionMemTokenMap
-
-        return SmolActionMemTokenMap.from_json(token_map_path)
     if policy_config.type == "actionmem":
         from lerobot.policies.actionmem.tokenization_actionmem import ActionMemTokenMap
 
@@ -1046,24 +1089,63 @@ def resolve_actionmem_token_metadata(policy_config: Any) -> SimpleNamespace:
 
 
 def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
-    token_metadata = resolve_actionmem_token_metadata(cfg.trainable_config)
-    checkpoint_path = (
-        cfg.dataset.rlds_action_vqvae_checkpoint_path
-        or getattr(cfg.trainable_config, "action_vqvae_checkpoint_path", None)
-        or token_metadata.vqvae_checkpoint_path
-    )
-    if checkpoint_path is None:
-        raise ValueError(
-            "RLDS action-token generation needs a VQ-VAE checkpoint. Set "
-            "--dataset.rlds_action_vqvae_checkpoint_path or policy.action_vqvae_checkpoint_path, "
-            "or store checkpoint_path in token_map.json."
+    policy_config = cfg.trainable_config
+    if policy_config.type == "smol_actionmem":
+        checkpoint_path = (
+            cfg.dataset.rlds_effect_tokenizer_checkpoint_path
+            or policy_config.effect_tokenizer_checkpoint_path
         )
-    action_horizon = int(token_metadata.action_horizon)
-    action_dim = int(token_metadata.action_dim)
+        if checkpoint_path is None:
+            raise ValueError(
+                "Smol ActionMem RLDS training requires an effect-tokenizer checkpoint. Set "
+                "--dataset.rlds_effect_tokenizer_checkpoint_path or "
+                "--policy.effect_tokenizer_checkpoint_path."
+            )
+        metadata = load_effect_tokenizer_metadata(checkpoint_path)
+        action_horizon = metadata.horizon
+        action_dim = metadata.action_dim
+        requested_hz = (
+            float(cfg.dataset.rlds_target_control_hz)
+            if cfg.dataset.rlds_target_control_hz > 0
+            else None
+        )
+        frequency_mismatch = (metadata.target_control_hz is None) != (requested_hz is None)
+        if metadata.target_control_hz is not None and requested_hz is not None:
+            frequency_mismatch = not np.isclose(metadata.target_control_hz, requested_hz)
+        if frequency_mismatch:
+            raise ValueError(
+                f"dataset.rlds_target_control_hz={requested_hz} does not match effect-tokenizer "
+                f"target_control_hz={metadata.target_control_hz}."
+            )
+        action_codebook_size = int(policy_config.action_codebook_size)
+        if action_codebook_size != metadata.codebook_size:
+            raise ValueError(
+                f"Policy action_codebook_size={action_codebook_size} does not match effect-tokenizer "
+                f"codebook_size={metadata.codebook_size}."
+            )
+        action_encoder_kind = "effect"
+    else:
+        token_metadata = resolve_actionmem_token_metadata(policy_config)
+        checkpoint_path = (
+            cfg.dataset.rlds_action_vqvae_checkpoint_path
+            or getattr(policy_config, "action_vqvae_checkpoint_path", None)
+            or token_metadata.vqvae_checkpoint_path
+        )
+        if checkpoint_path is None:
+            raise ValueError(
+                "RLDS action-token generation needs a residual VQ-VAE checkpoint. Set "
+                "--dataset.rlds_action_vqvae_checkpoint_path or policy.action_vqvae_checkpoint_path, "
+                "or store checkpoint_path in token_map.json."
+            )
+        action_horizon = int(token_metadata.action_horizon)
+        action_dim = int(token_metadata.action_dim)
+        action_codebook_size = int(token_metadata.codebook_size)
+        action_encoder_kind = "residual_vqvae"
+
     configured_chunk_size = int(getattr(cfg.trainable_config, "chunk_size", action_horizon))
     if configured_chunk_size != action_horizon:
         raise ValueError(
-            f"Policy chunk_size={configured_chunk_size} must match VQ-VAE horizon={action_horizon}."
+            f"Policy chunk_size={configured_chunk_size} must match action-tokenizer horizon={action_horizon}."
         )
     state_dim = cfg.dataset.rlds_state_dim or int(getattr(cfg.trainable_config, "max_state_dim", 32))
     return ActionMemRLDSDataset(
@@ -1071,6 +1153,8 @@ def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
         action_horizon=action_horizon,
         action_dim=action_dim,
         state_dim=state_dim,
-        action_vqvae_checkpoint_path=checkpoint_path,
+        action_tokenizer_checkpoint_path=checkpoint_path,
+        action_encoder_kind=action_encoder_kind,
+        action_codebook_size=action_codebook_size,
         seed=cfg.seed if cfg.seed is not None else 0,
     )

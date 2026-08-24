@@ -28,8 +28,8 @@ from lerobot.types import TransitionKey
 from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN,
-    ACTION_TOKEN_Q0_DISTANCES,
-    ACTION_VQVAE_INPUT,
+    ACTION_TOKEN_DISTANCES,
+    ACTION_TOKENIZER_INPUT,
     DONE,
     OBS_STATE,
     OBS_STR,
@@ -258,8 +258,8 @@ def test_batch_to_transition_preserves_action_token():
         ACTION: torch.randn(2, 4),
         "task": ["pick_cube", "place_cube"],
         ACTION_TOKEN: torch.tensor([[0], [255]], dtype=torch.int64),
-        ACTION_TOKEN_Q0_DISTANCES: torch.randn(2, 256),
-        ACTION_VQVAE_INPUT: torch.randn(2, 16, 7),
+        ACTION_TOKEN_DISTANCES: torch.randn(2, 256),
+        ACTION_TOKENIZER_INPUT: torch.randn(2, 16, 7),
     }
 
     transition = batch_to_transition(batch)
@@ -267,10 +267,10 @@ def test_batch_to_transition_preserves_action_token():
 
     assert torch.equal(comp_data[ACTION_TOKEN], batch[ACTION_TOKEN])
     assert torch.equal(
-        comp_data[ACTION_TOKEN_Q0_DISTANCES],
-        batch[ACTION_TOKEN_Q0_DISTANCES],
+        comp_data[ACTION_TOKEN_DISTANCES],
+        batch[ACTION_TOKEN_DISTANCES],
     )
-    assert torch.equal(comp_data[ACTION_VQVAE_INPUT], batch[ACTION_VQVAE_INPUT])
+    assert torch.equal(comp_data[ACTION_TOKENIZER_INPUT], batch[ACTION_TOKENIZER_INPUT])
 
 
 def testtransition_to_batch_with_index_fields():

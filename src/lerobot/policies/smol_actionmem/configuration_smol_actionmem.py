@@ -28,9 +28,9 @@ from ..smolvla.configuration_smolvla import SmolVLAConfig
 class SmolActionMemConfig(SmolVLAConfig):
     """SmolVLA with a continuous flow condition derived from 256 action logits."""
 
-    chunk_size: int = 16
-    n_action_steps: int = 16
-    drop_n_last_frames: int = 15
+    chunk_size: int = 10
+    n_action_steps: int = 10
+    drop_n_last_frames: int = 9
     num_inference_steps: int = 10
     time_sampling_beta_alpha: float = 1.5
     time_sampling_beta_beta: float = 1.0
@@ -38,17 +38,20 @@ class SmolActionMemConfig(SmolVLAConfig):
     time_sampling_offset: float = 0.001
 
     # Keep the tokenizer used for task strings separate from the VLM checkpoint.
-    # The processor maps q0 codes to IDs in a model-local action embedding table;
+    # The processor maps endpoint-effect codes to a model-local action embedding table;
     # these IDs never enter the SmolVLM tokenizer or language vocabulary.
     tokenizer_name: str | None = None
-    action_token_map_path: str | None = None
-    # Retained for compatibility with existing policy configs and token-map
-    # metadata. The policy no longer loads the VQ-VAE decoder at runtime.
-    action_vqvae_checkpoint_path: str | None = None
+    # The endpoint-effect tokenizer is used only by the training data collator.
+    # Inference consumes the learned classifier and does not load this file.
+    effect_tokenizer_checkpoint_path: str | None = None
+    action_codebook_size: int = 256
+    action_code_invalid_value: int = -1
     # Initialization used only by the new action-code embedding and classifier.
     action_code_init_std: float = 0.02
     # Temperature of y_k = softmax(-||E(A) - e_k||^2 / T).
-    action_token_soft_target_temperature: float = 1.0
+    # Spherical latent/codebook distances lie in [0, 4]; 0.1 provides an
+    # informative soft target without reducing it to a hard one-hot label.
+    action_token_soft_target_temperature: float = 0.1
     # Map normalized 256-way logits to residual FiLM parameters for every flow
     # prediction. The final projection is zero-initialized so an old checkpoint
     # starts from the unconditioned flow field and learns the new condition
@@ -56,19 +59,9 @@ class SmolActionMemConfig(SmolVLAConfig):
     action_condition_hidden_dim: int = 256
     action_condition_scale: float = 1.0
 
-    # Legacy decoded-flow-source fields. They remain loadable so existing
-    # checkpoints do not require config migration, but the Gaussian-source
-    # conditional-flow implementation does not consume them.
-    action_vqvae_input_q01: list[float] | None = None
-    action_vqvae_input_q99: list[float] | None = None
-    action_vqvae_input_mask: list[bool] | None = None
-    action_vqvae_flow_mean: list[float] | None = None
-    action_vqvae_flow_std: list[float] | None = None
-    action_vqvae_flow_normalization_eps: float = 1e-8
-
     # ActionMem training objectives.
     flow_loss_weight: float = 1.0
-    # Q0 KL is auxiliary: flow generation consumes predicted continuous logits,
+    # Action-code KL is auxiliary: flow generation consumes predicted continuous logits,
     # never a ground-truth or argmax action token.
     action_token_loss_weight: float = 0.1
     training_stage: str = "joint"
@@ -127,34 +120,12 @@ class SmolActionMemConfig(SmolVLAConfig):
         ):
             raise ValueError("joint training requires at least one non-zero loss weight.")
 
-        if (self.action_vqvae_input_q01 is None) != (self.action_vqvae_input_q99 is None):
-            raise ValueError(
-                "action_vqvae_input_q01 and action_vqvae_input_q99 must either both be set or both be None."
-            )
-        if self.action_vqvae_input_q01 is not None:
-            if len(self.action_vqvae_input_q01) != len(self.action_vqvae_input_q99):
-                raise ValueError("action_vqvae_input_q01 and action_vqvae_input_q99 must match in length.")
-            if self.action_vqvae_input_mask is None or len(self.action_vqvae_input_mask) != len(
-                self.action_vqvae_input_q01
-            ):
-                raise ValueError(
-                    "action_vqvae_input_mask must be set and match the q01/q99 dimension."
-                )
-        if (self.action_vqvae_flow_mean is None) != (self.action_vqvae_flow_std is None):
-            raise ValueError(
-                "action_vqvae_flow_mean and action_vqvae_flow_std must either both be set or both be None."
-            )
-        if self.action_vqvae_flow_mean is not None and len(self.action_vqvae_flow_mean) != len(
-            self.action_vqvae_flow_std
-        ):
-            raise ValueError("action_vqvae_flow_mean and action_vqvae_flow_std must have the same length.")
-        if self.action_vqvae_flow_normalization_eps <= 0:
-            raise ValueError(
-                "action_vqvae_flow_normalization_eps must be positive, got "
-                f"{self.action_vqvae_flow_normalization_eps}."
-            )
         if self.action_code_init_std <= 0:
             raise ValueError(f"action_code_init_std must be positive, got {self.action_code_init_std}.")
+        if self.action_codebook_size < 2:
+            raise ValueError(
+                f"action_codebook_size must be at least 2, got {self.action_codebook_size}."
+            )
         if self.action_token_soft_target_temperature <= 0:
             raise ValueError(
                 "action_token_soft_target_temperature must be positive, got "

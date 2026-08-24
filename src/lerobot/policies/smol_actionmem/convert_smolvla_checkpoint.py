@@ -21,15 +21,13 @@ Example:
 python -m lerobot.policies.smol_actionmem.convert_smolvla_checkpoint \
   --source lerobot/smolvla_base \
   --output-dir /path/to/models/smol_actionmem-base \
-  --source-token-map /path/to/actionmem_token_map.json \
-  --vqvae-checkpoint /path/to/action_vqvae.pt
+  --effect-tokenizer-checkpoint /path/to/effect_vqvae.pt
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
-import json
 import logging
 from dataclasses import fields
 from pathlib import Path
@@ -40,6 +38,7 @@ from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 from .configuration_smol_actionmem import SmolActionMemConfig
+from .effect_tokenizer import EffectTokenizerMetadata, load_effect_tokenizer_metadata
 from .modeling_smol_actionmem import SmolActionMemPolicy
 from .processor_smol_actionmem import make_smol_actionmem_pre_post_processors
 
@@ -48,11 +47,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default="lerobot/smolvla_base")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--source-token-map", type=Path, required=True)
-    parser.add_argument("--vqvae-checkpoint", type=Path)
+    parser.add_argument("--effect-tokenizer-checkpoint", type=Path, required=True)
     parser.add_argument("--tokenizer-source")
-    parser.add_argument("--chunk-size", type=int, default=16)
-    parser.add_argument("--n-action-steps", type=int, default=16)
+    parser.add_argument("--n-action-steps", type=int)
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -71,66 +68,18 @@ def _prepare_output_directory(path: Path, overwrite: bool) -> Path:
     return path
 
 
-def _create_tokenizer_and_map(
-    *,
-    tokenizer_source: str,
-    source_token_map_path: Path,
-    output_dir: Path,
-    vqvae_checkpoint: Path | None,
-) -> Path:
+def _copy_tokenizer_assets(*, tokenizer_source: str, output_dir: Path) -> None:
     from transformers import AutoProcessor
-
-    with source_token_map_path.expanduser().resolve().open(encoding="utf-8") as file:
-        source_map = json.load(file)
-    vqvae = copy.deepcopy(source_map["vqvae"])
-    codebook_size = int(vqvae["codebook_size"])
 
     processor = AutoProcessor.from_pretrained(tokenizer_source)
     processor.save_pretrained(output_dir)
-
-    if vqvae_checkpoint is not None:
-        vqvae["checkpoint_path"] = str(vqvae_checkpoint.expanduser().resolve())
-
-    token_map = {
-        "format_version": 2,
-        "name": "smol_actionmem_q0_class_map",
-        "description": (
-            "Describes the first residual VQ codebook used by Smol ActionMem's "
-            "independent classifier and embedding table."
-        ),
-        "vqvae": vqvae,
-        "smolvlm": {
-            "tokenizer_source": tokenizer_source,
-            "vocabulary_strategy": "independent_action_vocabulary",
-            "language_vocabulary_modified": False,
-        },
-        "action_classes": {
-            "count": codebook_size,
-            "class_id_min": 0,
-            "class_id_max": codebook_size - 1,
-            "mapping_formula": "class_id = q0_code_id - vqvae.code_id_min",
-        },
-        "action_context": {
-            "embedding_size": codebook_size + 4,
-            "memory_start_id": codebook_size,
-            "memory_end_id": codebook_size + 1,
-            "action_query_id": codebook_size + 2,
-            "padding_id": codebook_size + 3,
-        },
-    }
-    token_map_path = output_dir / "token_map.json"
-    with token_map_path.open("w", encoding="utf-8") as file:
-        json.dump(token_map, file, indent=2, ensure_ascii=False)
-        file.write("\n")
-    return token_map_path
 
 
 def _make_target_config(
     source_policy: SmolVLAPolicy,
     *,
-    token_map_path: Path,
-    chunk_size: int,
-    n_action_steps: int,
+    effect_metadata: EffectTokenizerMetadata,
+    n_action_steps: int | None,
 ) -> SmolActionMemConfig:
     target_field_names = {field.name for field in fields(SmolActionMemConfig)}
     source_config = source_policy.config
@@ -141,16 +90,12 @@ def _make_target_config(
     }
     values.update(
         {
-            "chunk_size": chunk_size,
-            "n_action_steps": n_action_steps,
+            "chunk_size": effect_metadata.horizon,
+            "n_action_steps": n_action_steps or effect_metadata.horizon,
+            "drop_n_last_frames": effect_metadata.horizon - 1,
             "num_inference_steps": int(getattr(source_config, "num_steps", 10)),
-            "action_token_map_path": str(token_map_path),
-            "action_vqvae_checkpoint_path": None,
-            "action_vqvae_input_q01": None,
-            "action_vqvae_input_q99": None,
-            "action_vqvae_input_mask": None,
-            "action_vqvae_flow_mean": None,
-            "action_vqvae_flow_std": None,
+            "effect_tokenizer_checkpoint_path": effect_metadata.checkpoint_path,
+            "action_codebook_size": effect_metadata.codebook_size,
             "training_stage": "joint",
             "train_expert_only": False,
             "gradient_checkpointing": False,
@@ -207,16 +152,11 @@ def convert(args: argparse.Namespace) -> Path:
     logging.info("Loading source SmolVLA policy from %s", args.source)
     source_policy = SmolVLAPolicy.from_pretrained(args.source)
     tokenizer_source = args.tokenizer_source or source_policy.config.vlm_model_name
-    token_map_path = _create_tokenizer_and_map(
-        tokenizer_source=tokenizer_source,
-        source_token_map_path=args.source_token_map,
-        output_dir=output_dir,
-        vqvae_checkpoint=args.vqvae_checkpoint,
-    )
+    _copy_tokenizer_assets(tokenizer_source=tokenizer_source, output_dir=output_dir)
+    effect_metadata = load_effect_tokenizer_metadata(args.effect_tokenizer_checkpoint)
     target_config = _make_target_config(
         source_policy,
-        token_map_path=token_map_path,
-        chunk_size=args.chunk_size,
+        effect_metadata=effect_metadata,
         n_action_steps=args.n_action_steps,
     )
     target_policy = SmolActionMemPolicy(target_config)

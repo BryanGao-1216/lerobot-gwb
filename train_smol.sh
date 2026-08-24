@@ -1,6 +1,8 @@
+EFFECT_TOKENIZER_CHECKPOINT="${EFFECT_TOKENIZER_CHECKPOINT:-/mnt/data27T/media/gwb/MyStudy/effectTokenizer/outputs/effect_vqvae.pt}"
+
 lerobot-train \
   --policy.path=/mnt/data27T/media/gwb/models/smol_actionmem-base \
-  --policy.action_vqvae_checkpoint_path=/mnt/data27T/media/gwb/MyStudy/myStudy/scripts/outputs/action_vqvae.pt \
+  --policy.effect_tokenizer_checkpoint_path="${EFFECT_TOKENIZER_CHECKPOINT}" \
   --policy.train_expert_only=false \
   --policy.training_stage=vlm_only \
   --policy.input_features=null \
@@ -10,7 +12,7 @@ lerobot-train \
   --policy.drop_n_last_frames=9 \
   --dataset.rlds_target_control_hz=10 \
   --dataset.repo_id=action_tokenizer_plus \
-  --policy.action_token_soft_target_temperature=1 \
+  --policy.action_token_soft_target_temperature=0.1 \
   --dataset_type=rlds \
   --dataset.rlds_storage_format=hybrid \
   --dataset.root=/mnt/data27T/media/gwb/datasets/OpenX \
@@ -22,4 +24,4 @@ lerobot-train \
   --eval_step=0 \
   --policy.gradient_checkpointing=false \
   --policy.tensorboard_enable=true \
-  --policy.push_to_hub=false 
+  --policy.push_to_hub=false
