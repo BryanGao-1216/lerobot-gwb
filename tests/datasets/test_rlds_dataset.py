@@ -44,9 +44,6 @@ from lerobot.datasets.rlds_webdataset import (
 from lerobot.utils.constants import (
     ACTION_TOKEN_DISTANCES,
     ACTION_TOKENIZER_INPUT,
-    ACTION_VQVAE_NORMALIZATION_MASK,
-    ACTION_VQVAE_Q01,
-    ACTION_VQVAE_Q99,
 )
 
 
@@ -356,7 +353,7 @@ def test_weighted_action_stats_preserve_oxe_normalization_mask():
     assert torch.equal(result["mask"], torch.tensor([True, False]))
 
 
-def test_rlds_statistics_must_match_vqvae_action_dimension():
+def test_rlds_statistics_must_match_effect_tokenizer_action_dimension():
     statistics = {
         "action": {"mean": np.zeros(8)},
         "proprio": {"mean": np.zeros(7)},
@@ -366,7 +363,7 @@ def test_rlds_statistics_must_match_vqvae_action_dimension():
         _validate_statistics("droid", statistics, action_dim=7, state_dim=32)
 
 
-def test_action_tokenizer_input_matches_vqvla_q01_q99_and_preserves_gripper():
+def test_action_tokenizer_input_matches_oxe_q01_q99_and_preserves_gripper():
     raw_action = np.array(
         [[[0.0, 2.0, -3.0], [1.0, 3.0, 4.0]]],
         dtype=np.float32,
@@ -389,9 +386,6 @@ def test_action_tokenizer_input_matches_vqvla_q01_q99_and_preserves_gripper():
         result[ACTION_TOKENIZER_INPUT],
         [[[-0.0, 0.0, -3.0], [1.0, 1.0, 4.0]]],
     )
-    assert np.array_equal(result[ACTION_VQVAE_NORMALIZATION_MASK][0, 0], [True, True, False])
-    assert np.array_equal(result[ACTION_VQVAE_Q01][0, 0], [-1.0, 1.0, -1.0])
-    assert np.array_equal(result[ACTION_VQVAE_Q99][0, 0], [1.0, 3.0, 1.0])
 
 
 def test_rlds_collator_encodes_only_normalized_action_tokenizer_input():
@@ -416,9 +410,6 @@ def test_rlds_collator_encodes_only_normalized_action_tokenizer_input():
             {
                 "action": raw_action,
                 ACTION_TOKENIZER_INPUT: normalized_action,
-                ACTION_VQVAE_Q01: torch.tensor([-1.0, 0.0, 0.0]),
-                ACTION_VQVAE_Q99: torch.tensor([1.0, 1.0, 1.0]),
-                ACTION_VQVAE_NORMALIZATION_MASK: torch.tensor([True, True, False]),
             }
         ]
     )
@@ -428,7 +419,6 @@ def test_rlds_collator_encodes_only_normalized_action_tokenizer_input():
     assert torch.equal(batch["action_token"], torch.tensor([17]))
     assert batch[ACTION_TOKEN_DISTANCES].shape == (1, 256)
     assert batch[ACTION_TOKEN_DISTANCES][0].argmin().item() == 17
-    assert torch.equal(batch[ACTION_VQVAE_NORMALIZATION_MASK], torch.tensor([[True, True, False]]))
     assert torch.equal(batch[ACTION_TOKENIZER_INPUT], normalized_action.unsqueeze(0))
 
 
@@ -459,9 +449,6 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
     frame = {
         "action": np.zeros((16, 7), dtype=np.float32),
         ACTION_TOKENIZER_INPUT: np.full((16, 7), 0.25, dtype=np.float32),
-        ACTION_VQVAE_Q01: np.tile(np.arange(7, dtype=np.float32), (16, 1)),
-        ACTION_VQVAE_Q99: np.tile(np.arange(7, dtype=np.float32) + 1, (16, 1)),
-        ACTION_VQVAE_NORMALIZATION_MASK: np.tile(np.array([True] * 6 + [False]), (16, 1)),
         "dataset_name": b"droid",
         "task": {"language_instruction": b"pick up the cup"},
         "observation": {
@@ -479,8 +466,6 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
 
     assert sample["action"].shape == (16, 7)
     assert torch.all(sample[ACTION_TOKENIZER_INPUT] == 0.25)
-    assert torch.equal(sample[ACTION_VQVAE_Q01], torch.arange(7, dtype=torch.float32))
-    assert sample[ACTION_VQVAE_NORMALIZATION_MASK][-1].item() is False
     assert sample["observation.state"].shape == (10,)
     assert sample["observation.images.image"].shape == (3, 8, 8)
     assert sample["observation.images.image3_padding_mask"].item() is False

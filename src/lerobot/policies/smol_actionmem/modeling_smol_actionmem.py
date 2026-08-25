@@ -37,6 +37,12 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.import_utils import require_package
 
+from ..action_code import (
+    ActionCodeLayout,
+    compute_action_code_objective,
+    condition_flow_hidden,
+    validate_action_code_sequence,
+)
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
 from ..pretrained import PreTrainedPolicy
 from ..smolvla.modeling_smolvla import (
@@ -61,10 +67,13 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         self.config = config
         self.rtc_processor = rtc_processor
 
-        self.action_codebook_size = config.action_codebook_size
-        self.action_query_id = self.action_codebook_size + 2
-        self.action_padding_id = self.action_codebook_size + 3
-        action_context_size = self.action_codebook_size + 4
+        self.action_code_layout = ActionCodeLayout(
+            codebook_size=config.action_codebook_size,
+            invalid_value=config.action_code_invalid_value,
+        )
+        self.action_codebook_size = self.action_code_layout.codebook_size
+        self.action_query_id = self.action_code_layout.action_query_id
+        self.action_padding_id = self.action_code_layout.padding_id
 
         self.vlm_with_expert = SmolActionMemVLMWithExpertModel(
             model_id=config.vlm_model_name,
@@ -82,7 +91,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
 
         hidden_size = self.vlm_with_expert.config.text_config.hidden_size
         self.action_code_embedding = nn.Embedding(
-            action_context_size,
+            self.action_code_layout.context_size,
             hidden_size,
             padding_idx=self.action_padding_id,
         )
@@ -215,30 +224,12 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         )
 
     def _validate_action_token_sequence(self, action_tokens, action_token_masks) -> None:
-        if action_tokens is None or action_token_masks is None:
-            raise ValueError("Smol ActionMem requires action_tokens and action_token_masks.")
-        if action_tokens.shape != action_token_masks.shape or action_tokens.ndim != 2:
-            raise ValueError(
-                "action_tokens and action_token_masks must have shape [B, T], got "
-                f"{tuple(action_tokens.shape)} and {tuple(action_token_masks.shape)}."
-            )
-        if action_tokens.shape[1] < 2:
-            raise ValueError("Smol ActionMem requires ACTION_QUERY plus a target slot.")
-        invalid_query = (~action_token_masks[:, -2].bool()) | (
-            action_tokens[:, -2] != self.action_query_id
+        validate_action_code_sequence(
+            action_tokens,
+            action_token_masks,
+            self.action_code_layout,
+            policy_name="Smol ActionMem",
         )
-        if torch.any(invalid_query):
-            raise ValueError(
-                "The penultimate action token must be the valid ACTION_QUERY token "
-                f"{self.action_query_id}."
-            )
-        targets = action_tokens[:, -1]
-        target_masks = action_token_masks[:, -1].bool()
-        invalid_targets = target_masks & ((targets < 0) | (targets >= self.action_codebook_size))
-        if torch.any(invalid_targets):
-            raise ValueError(
-                f"Action-class targets must be in [0, {self.action_codebook_size - 1}]."
-            )
 
     def embed_prefix(
         self,
@@ -360,34 +351,12 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         suffix_out: Tensor,
         action_logits: Tensor,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        """Apply logit-conditioned FiLM without sending flow gradients into the logits branch."""
-        # The action-token classifier and its VLM representation are supervised
-        # exclusively by the KL objective. Flow still consumes their prediction
-        # as a condition, but must not optimize that prediction through this
-        # branch. The separate VLM-prefix/KV -> action-expert path is deliberately
-        # left intact.
-        action_logits = action_logits.detach()
-        projection_dtype = next(self.action_condition_proj.parameters()).dtype
-        # Bounding FiLM prevents a heterogeneous OXE batch from amplifying the
-        # expert hidden state without limit. ``action_condition_scale`` remains
-        # the explicit knob for widening the modulation range.
-        film = torch.tanh(self.action_condition_proj(action_logits.to(dtype=projection_dtype))).float()
-        gamma, beta = film.chunk(2, dim=-1)
-        scale = self.config.action_condition_scale
-        gamma = gamma * scale
-        beta = beta * scale
-        conditioned = suffix_out.float() * (1.0 + gamma[:, None, :]) + beta[:, None, :]
-        probabilities = torch.softmax(action_logits.float(), dim=-1)
-        predicted_entropy = -(
-            probabilities * probabilities.clamp_min(torch.finfo(probabilities.dtype).tiny).log()
-        ).sum(dim=-1)
-        metrics = {
-            "action_condition_gamma_rms": gamma.float().square().mean().sqrt(),
-            "action_condition_beta_rms": beta.float().square().mean().sqrt(),
-            "action_condition_logit_std": action_logits.float().std(dim=-1, unbiased=False).mean(),
-            "action_condition_predicted_entropy": predicted_entropy.mean(),
-        }
-        return conditioned, metrics
+        return condition_flow_hidden(
+            suffix_out,
+            action_logits,
+            self.action_condition_proj,
+            scale=self.config.action_condition_scale,
+        )
 
     def _compute_action_token_objective(
         self,
@@ -396,63 +365,14 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         action_token_masks: Tensor,
         action_code_distances: Tensor | None,
     ) -> dict[str, Tensor]:
-        target_mask = action_token_masks[:, -1].bool()
-        safe_targets = torch.where(target_mask, action_tokens[:, -1], 0)
-        if torch.any(target_mask):
-            if action_code_distances is None:
-                raise ValueError(
-                    "Smol ActionMem soft-token training requires "
-                    f"'{ACTION_TOKEN_DISTANCES}' in the processed batch. Use the RLDS effect-tokenizer "
-                    "collator or provide squared distances from the frozen effect encoder latent to "
-                    "all codebook centers."
-                )
-            if action_code_distances.shape != logits.shape:
-                raise ValueError(
-                    f"Expected action-code distances with shape {tuple(logits.shape)}, got "
-                    f"{tuple(action_code_distances.shape)}."
-                )
-            distances = action_code_distances.to(device=logits.device, dtype=torch.float32)
-            if not torch.isfinite(distances).all():
-                raise ValueError("Action-code latent distances must contain only finite values.")
-            soft_targets = torch.softmax(
-                -distances / self.config.action_token_soft_target_temperature,
-                dim=-1,
-            )
-            log_predictions = F.log_softmax(logits.float(), dim=-1)
-            per_sample = F.kl_div(log_predictions, soft_targets, reduction="none").sum(dim=-1)
-            target_entropy_per_sample = -(
-                soft_targets * soft_targets.clamp_min(torch.finfo(soft_targets.dtype).tiny).log()
-            ).sum(dim=-1)
-            target_peak_per_sample = soft_targets.max(dim=-1).values
-        else:
-            per_sample = torch.zeros(logits.shape[0], device=logits.device, dtype=torch.float32)
-            target_entropy_per_sample = torch.zeros_like(per_sample)
-            target_peak_per_sample = torch.zeros_like(per_sample)
-
-        mask = target_mask.to(dtype=per_sample.dtype)
-        valid_count = mask.sum().clamp_min(1)
-        per_sample = per_sample * mask
-        mean_loss = per_sample.sum() / valid_count
-        accuracy = ((logits.argmax(dim=-1) == safe_targets) & target_mask).float().sum() / valid_count
-        target_logits = logits.float().gather(dim=-1, index=safe_targets.unsqueeze(-1)).squeeze(-1)
-        greater_count = (logits.float() > target_logits.unsqueeze(-1)).sum(dim=-1)
-        equal_count = (logits.float() == target_logits.unsqueeze(-1)).sum(dim=-1)
-        # Use the average occupied rank for exact ties. With ordinary floating-point
-        # logits ties are rare, while this keeps an all-equal prediction at the
-        # uninformative midpoint instead of reporting rank 1.
-        target_rank_per_sample = greater_count.float() + (equal_count.float() + 1.0) / 2.0
-        target_rank = (target_rank_per_sample * mask).sum() / valid_count
-        target_entropy = (target_entropy_per_sample * mask).sum() / valid_count
-        target_peak_probability = (target_peak_per_sample * mask).sum() / valid_count
-        return {
-            "action_token_loss_per_sample": per_sample,
-            "action_token_target_mask": target_mask,
-            "action_token_kl_loss": mean_loss,
-            "action_token_accuracy": accuracy,
-            "action_token_target_rank": target_rank,
-            "action_token_soft_target_entropy": target_entropy,
-            "action_token_soft_target_peak_probability": target_peak_probability,
-        }
+        return compute_action_code_objective(
+            logits,
+            action_tokens,
+            action_token_masks,
+            action_code_distances,
+            temperature=self.config.action_token_soft_target_temperature,
+            policy_name="Smol ActionMem",
+        )
 
     def forward(
         self,

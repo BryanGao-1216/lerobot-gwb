@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from lerobot.policies.smol_actionmem.effect_tokenizer import (
+from lerobot.policies.effect_tokenizer import (
     EFFECT_DESCRIPTOR_NAMES,
     EFFECT_NORMALIZATION_CONTRACT,
     EffectVQVAEActionEncoder,

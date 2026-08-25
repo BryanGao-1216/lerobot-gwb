@@ -1,105 +1,56 @@
-import json
-
 import pytest
 import torch
 
 from lerobot.policies.actionmem.processor_actionmem import ActionMemActionTokenProcessorStep
 from lerobot.processor.converters import create_transition
 from lerobot.types import TransitionKey
-from lerobot.utils.constants import (
-    ACTION_TOKEN,
-    ACTION_TOKEN_MASK,
-    ACTION_TOKENS,
-    OBS_LANGUAGE_TOKENS,
-)
+from lerobot.utils.constants import ACTION_TOKEN, ACTION_TOKEN_MASK, ACTION_TOKENS, OBS_LANGUAGE_TOKENS
 
 
-def _write_token_map(tmp_path):
-    token_map_path = tmp_path / "actionmem_token_map.json"
-    token_map_path.write_text(
-        json.dumps(
-            {
-                "vqvae": {
-                    "codebook_size": 256,
-                    "code_id_min": 0,
-                    "code_id_max": 255,
-                    "invalid_value": -1,
-                    "action_horizon": 16,
-                    "action_dim": 7,
-                },
-                "action_tokens": {
-                    "anchor_token_id": 257023,
-                    "token_id_min": 256768,
-                    "token_id_max": 257023,
-                },
-                "control_tokens": {
-                    "action_memory_start": {"token_id": 7},
-                    "action_memory_end": {"token_id": 8},
-                    "action_query": {"token_id": 9},
-                },
-                "padding": {"token_id": 0},
-            }
-        ),
-        encoding="utf-8",
-    )
-    return token_map_path
-
-
-def _make_transition(q0=None, batch_size=2):
+def _make_transition(codes=None, batch_size=2):
     complementary_data = {"task": ["pick"] * batch_size}
-    if q0 is not None:
-        complementary_data[ACTION_TOKEN] = q0
+    if codes is not None:
+        complementary_data[ACTION_TOKEN] = codes
     return create_transition(
         observation={OBS_LANGUAGE_TOKENS: torch.ones(batch_size, 4, dtype=torch.long)},
         complementary_data=complementary_data,
     )
 
 
-def test_actionmem_action_token_processor_maps_q0(tmp_path):
-    step = ActionMemActionTokenProcessorStep(token_map_path=str(_write_token_map(tmp_path)))
-    transition = _make_transition(torch.tensor([[0], [255]], dtype=torch.long))
-
-    output = step(transition)
-    complementary_data = output[TransitionKey.COMPLEMENTARY_DATA]
+def test_actionmem_action_code_processor_keeps_local_code_ids():
+    step = ActionMemActionTokenProcessorStep(codebook_size=256, invalid_value=-1)
+    output = step(_make_transition(torch.tensor([[0], [255]])))[TransitionKey.COMPLEMENTARY_DATA]
 
     assert torch.equal(
-        complementary_data[ACTION_TOKENS],
-        torch.tensor([[7, 8, 9, 257023], [7, 8, 9, 256768]], dtype=torch.long),
+        output[ACTION_TOKENS],
+        torch.tensor([[256, 257, 258, 0], [256, 257, 258, 255]]),
+    )
+    assert output[ACTION_TOKEN_MASK].all()
+
+
+def test_actionmem_action_code_processor_masks_invalid_and_inference_targets():
+    step = ActionMemActionTokenProcessorStep(codebook_size=256, invalid_value=-1)
+
+    invalid = step(_make_transition(torch.tensor([[-1], [42]])))[TransitionKey.COMPLEMENTARY_DATA]
+    assert torch.equal(
+        invalid[ACTION_TOKENS],
+        torch.tensor([[256, 257, 258, 259], [256, 257, 258, 42]]),
     )
     assert torch.equal(
-        complementary_data[ACTION_TOKEN_MASK],
-        torch.tensor([[True, True, True, True], [True, True, True, True]]),
-    )
-
-
-def test_actionmem_action_token_processor_masks_invalid_and_inference_targets(tmp_path):
-    step = ActionMemActionTokenProcessorStep(token_map_path=str(_write_token_map(tmp_path)))
-
-    invalid_output = step(_make_transition(torch.tensor([[-1], [42]], dtype=torch.long)))
-    invalid_data = invalid_output[TransitionKey.COMPLEMENTARY_DATA]
-    assert torch.equal(
-        invalid_data[ACTION_TOKENS],
-        torch.tensor([[7, 8, 9, 0], [7, 8, 9, 256981]], dtype=torch.long),
-    )
-    assert torch.equal(
-        invalid_data[ACTION_TOKEN_MASK],
+        invalid[ACTION_TOKEN_MASK],
         torch.tensor([[True, True, True, False], [True, True, True, True]]),
     )
 
-    inference_output = step(_make_transition(q0=None))
-    inference_data = inference_output[TransitionKey.COMPLEMENTARY_DATA]
+    inference = step(_make_transition())[TransitionKey.COMPLEMENTARY_DATA]
     assert torch.equal(
-        inference_data[ACTION_TOKENS],
-        torch.tensor([[7, 8, 9, 0], [7, 8, 9, 0]], dtype=torch.long),
+        inference[ACTION_TOKENS],
+        torch.tensor([[256, 257, 258, 259], [256, 257, 258, 259]]),
     )
-    assert torch.equal(
-        inference_data[ACTION_TOKEN_MASK],
-        torch.tensor([[True, True, True, False], [True, True, True, False]]),
-    )
+    assert not inference[ACTION_TOKEN_MASK][:, -1].any()
 
 
-def test_actionmem_action_token_processor_rejects_out_of_range_q0(tmp_path):
-    step = ActionMemActionTokenProcessorStep(token_map_path=str(_write_token_map(tmp_path)))
+def test_actionmem_action_code_processor_rejects_out_of_range_codes():
+    step = ActionMemActionTokenProcessorStep(codebook_size=256, invalid_value=-1)
 
     with pytest.raises(ValueError, match=r"must be in \[0, 255\]"):
-        step(_make_transition(torch.tensor([[256], [0]], dtype=torch.long)))
+        step(_make_transition(torch.tensor([[256], [0]])))

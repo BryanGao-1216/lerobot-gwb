@@ -1,14 +1,20 @@
+#!/usr/bin/env bash
+
+EFFECT_TOKENIZER_CHECKPOINT="${EFFECT_TOKENIZER_CHECKPOINT:-/mnt/data27T/media/gwb/MyStudy/effectTokenizer/outputs/effect_vqvae.pt}"
+
 lerobot-train \
-  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/pi05-base \
-  --policy.action_vqvae_checkpoint_path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/MyStudy/myStudy/scripts/outputs/action_vqvae.pt \
+  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/pi05_actionmem-base \
+  --policy.effect_tokenizer_checkpoint_path="${EFFECT_TOKENIZER_CHECKPOINT}" \
   --policy.train_expert_only=false \
   --policy.training_stage=vlm_only \
   --peft.method_type=LORA \
-  --peft.target_modules='(.*\.paligemma_with_expert\.(paligemma\.(model\.language_model\.(layers\.[0-9]+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)|embed_tokens)|lm_head)|gemma_expert\.model\.layers\.[0-9]+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj))|model\.(state_token_proj|state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out))' \
   --policy.input_features=null \
   --policy.output_features=null \
+  --policy.chunk_size=10 \
+  --policy.n_action_steps=10 \
   --dataset.repo_id=libero_test_0805 \
   --dataset_type=rlds \
+  --dataset.rlds_target_control_hz=10 \
   --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/Libero \
   --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/pi05-50000 \
   --steps=50000 \
@@ -17,4 +23,4 @@ lerobot-train \
   --eval_step=0 \
   --policy.gradient_checkpointing=true \
   --policy.tensorboard_enable=true \
-  --policy.push_to_hub=false 
+  --policy.push_to_hub=false

@@ -73,8 +73,6 @@ class DatasetConfig:
     # for ``oxe``; neither value bypasses the OXE standardizer itself.
     rlds_action_transform: str = "oxe"
     rlds_effect_tokenizer_checkpoint_path: str | None = None
-    # Used only by the residual-VQ ActionMem and PI05ActionMem policies.
-    rlds_action_vqvae_checkpoint_path: str | None = None
     # Action-code encoding runs inside the main-process collate function. CPU
     # saves GPU memory; CUDA is faster when memory permits.
     rlds_action_tokenizer_device: str = "cpu"

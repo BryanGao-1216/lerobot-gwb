@@ -34,11 +34,11 @@ from pathlib import Path
 
 import torch
 
+from lerobot.policies.effect_tokenizer import EffectTokenizerMetadata, load_effect_tokenizer_metadata
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 from .configuration_smol_actionmem import SmolActionMemConfig
-from .effect_tokenizer import EffectTokenizerMetadata, load_effect_tokenizer_metadata
 from .modeling_smol_actionmem import SmolActionMemPolicy
 from .processor_smol_actionmem import make_smol_actionmem_pre_post_processors
 

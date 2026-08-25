@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 import lerobot.policies.smol_actionmem.modeling_smol_actionmem as modeling_smol_actionmem
+from lerobot.policies.action_code import ActionCodeLayout
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.smol_actionmem.configuration_smol_actionmem import SmolActionMemConfig
 from lerobot.policies.smol_actionmem.modeling_smol_actionmem import (
@@ -159,6 +160,7 @@ def test_action_objective_is_exactly_256_way():
 def test_action_objective_ignores_out_of_range_local_padding_class():
     model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
+    model.config = type("Config", (), {"action_token_soft_target_temperature": 1.0})()
     model.action_classifier = nn.Linear(4, 256)
 
     output = model._compute_action_token_objective(
@@ -245,6 +247,7 @@ def test_inference_uses_complete_logits_condition_without_argmax_token(monkeypat
     )()
     model.rtc_processor = None
     model.vlm_with_expert = _InferenceVLM()
+    model.action_code_layout = ActionCodeLayout()
     model.action_codebook_size = 256
     model.action_query_id = 258
     model.action_code_embedding = nn.Embedding(260, 4)

@@ -33,8 +33,8 @@ class ActionMemConfig(PreTrainedConfig):
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
     n_obs_steps: int = 1
-    chunk_size: int = 16  # Must match the VQ-VAE action horizon in the token map
-    n_action_steps: int = 16  # Number of action steps to execute
+    chunk_size: int = 10  # Must match the endpoint-effect tokenizer horizon
+    n_action_steps: int = 10  # Number of action steps to execute
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -108,23 +108,17 @@ class ActionMemConfig(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     tokenizer_max_length: int = 48  # see openpi `__post_init__`
-    action_token_map_path: str | None = None
-    # Frozen action VQ-VAE used to decode q0 into the flow-matching source chunk.
-    # When omitted, ActionMem falls back to vqvae.checkpoint_path in the token map.
-    action_vqvae_checkpoint_path: str | None = None
-    # VQ-VLA trains the action VQ-VAE in per-dataset BOUNDS_Q99 space while
-    # leaving the OXE gripper dimension unchanged. These statistics first map
-    # a decoded proposal back to the OXE action space.
-    action_vqvae_input_q01: list[float] | None = None
-    action_vqvae_input_q99: list[float] | None = None
-    action_vqvae_input_mask: list[bool] | None = None
-    # LeRobot action statistics then map that OXE action into the policy's
-    # MEAN_STD flow-target space. All values are serialized for inference.
-    action_vqvae_flow_mean: list[float] | None = None
-    action_vqvae_flow_std: list[float] | None = None
-    action_vqvae_flow_normalization_eps: float = 1e-8
+    # Used only by the RLDS collator during training; inference uses the learned
+    # classifier and starts flow matching from Gaussian noise.
+    effect_tokenizer_checkpoint_path: str | None = None
+    action_codebook_size: int = 256
+    action_code_invalid_value: int = -1
+    action_code_init_std: float = 0.02
+    action_token_soft_target_temperature: float = 0.1
+    action_condition_hidden_dim: int = 256
+    action_condition_scale: float = 1.0
     flow_loss_weight: float = 1.0
-    action_token_loss_weight: float = 1.0
+    action_token_loss_weight: float = 0.1
 
     # TensorBoard settings. Logging is performed by lerobot-train on the main
     # process, while these policy fields keep ActionMem runs self-contained and
@@ -175,19 +169,6 @@ class ActionMemConfig(PreTrainedConfig):
             raise ValueError(
                 f"action_token_loss_weight must be non-negative, got {self.action_token_loss_weight}"
             )
-        if (self.action_vqvae_input_q01 is None) != (self.action_vqvae_input_q99 is None):
-            raise ValueError(
-                "action_vqvae_input_q01 and action_vqvae_input_q99 must either both be set or both be None."
-            )
-        if self.action_vqvae_input_q01 is not None:
-            if len(self.action_vqvae_input_q01) != len(self.action_vqvae_input_q99):
-                raise ValueError("action_vqvae_input_q01 and action_vqvae_input_q99 must match in length.")
-            if self.action_vqvae_input_mask is None or len(self.action_vqvae_input_mask) != len(
-                self.action_vqvae_input_q01
-            ):
-                raise ValueError(
-                    "action_vqvae_input_mask must be set and match the q01/q99 dimension."
-                )
         if self.training_stage == "vlm_only" and self.action_token_loss_weight == 0:
             raise ValueError("vlm_only training requires action_token_loss_weight > 0.")
         if self.training_stage == "action_expert_only" and self.flow_loss_weight == 0:
@@ -199,18 +180,22 @@ class ActionMemConfig(PreTrainedConfig):
         ):
             raise ValueError("joint training requires at least one non-zero loss weight.")
 
-        if (self.action_vqvae_flow_mean is None) != (self.action_vqvae_flow_std is None):
+        if self.action_codebook_size < 2:
+            raise ValueError(f"action_codebook_size must be at least 2, got {self.action_codebook_size}.")
+        if self.action_code_init_std <= 0:
+            raise ValueError(f"action_code_init_std must be positive, got {self.action_code_init_std}.")
+        if self.action_token_soft_target_temperature <= 0:
             raise ValueError(
-                "action_vqvae_flow_mean and action_vqvae_flow_std must either both be set or both be None."
+                "action_token_soft_target_temperature must be positive, got "
+                f"{self.action_token_soft_target_temperature}."
             )
-        if self.action_vqvae_flow_mean is not None and len(self.action_vqvae_flow_mean) != len(
-            self.action_vqvae_flow_std
-        ):
-            raise ValueError("action_vqvae_flow_mean and action_vqvae_flow_std must have the same length.")
-        if self.action_vqvae_flow_normalization_eps <= 0:
+        if self.action_condition_hidden_dim <= 0:
             raise ValueError(
-                "action_vqvae_flow_normalization_eps must be positive, got "
-                f"{self.action_vqvae_flow_normalization_eps}."
+                f"action_condition_hidden_dim must be positive, got {self.action_condition_hidden_dim}."
+            )
+        if self.action_condition_scale < 0:
+            raise ValueError(
+                f"action_condition_scale must be non-negative, got {self.action_condition_scale}."
             )
 
         if self.tensorboard_log_freq <= 0:

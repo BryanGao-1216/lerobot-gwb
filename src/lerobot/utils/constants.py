@@ -40,11 +40,6 @@ ACTION_TOKEN_DISTANCES = ACTION + ".token_distances"
 # tokenizer. It is separate from ``ACTION`` so the generic policy normalizer
 # cannot apply the mixed-dataset MEAN_STD transform to it a second time.
 ACTION_TOKENIZER_INPUT = ACTION + ".tokenizer_input"
-# Per-sample VQ-VLA normalization metadata used to map a q0 reconstruction
-# back through the source dataset's OXE action space during mixed-RLDS training.
-ACTION_VQVAE_Q01 = ACTION + ".vqvae_q01"
-ACTION_VQVAE_Q99 = ACTION + ".vqvae_q99"
-ACTION_VQVAE_NORMALIZATION_MASK = ACTION + ".vqvae_normalization_mask"
 REWARD = "next.reward"
 TRUNCATED = "next.truncated"
 DONE = "next.done"

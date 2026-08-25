@@ -14,9 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import shutil
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -35,8 +33,8 @@ class PI05ActionMemConfig(PreTrainedConfig):
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
     n_obs_steps: int = 1
-    chunk_size: int = 16  # Must match the VQ-VAE action horizon in the token map
-    n_action_steps: int = 16  # Number of action steps to execute
+    chunk_size: int = 10  # Must match the endpoint-effect tokenizer horizon
+    n_action_steps: int = 10  # Number of action steps to execute
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -111,22 +109,15 @@ class PI05ActionMemConfig(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     tokenizer_max_length: int = 200  # PI0.5 prompt also contains discretized state
-    action_token_map_path: str | None = None
-    # Frozen action VQ-VAE used to decode q0 into the flow-matching source chunk.
-    # When omitted, PI05ActionMem falls back to vqvae.checkpoint_path in the token map.
-    action_vqvae_checkpoint_path: str | None = None
-    # VQ-VLA BOUNDS_Q99 input statistics and OXE normalization mask.
-    action_vqvae_input_q01: list[float] | None = None
-    action_vqvae_input_q99: list[float] | None = None
-    action_vqvae_input_mask: list[bool] | None = None
-    # LeRobot action statistics used after restoring the decoded OXE action.
-    action_vqvae_flow_mean: list[float] | None = None
-    action_vqvae_flow_std: list[float] | None = None
-    action_vqvae_flow_q01: list[float] | None = None
-    action_vqvae_flow_q99: list[float] | None = None
-    action_vqvae_flow_normalization_eps: float = 1e-8
+    effect_tokenizer_checkpoint_path: str | None = None
+    action_codebook_size: int = 256
+    action_code_invalid_value: int = -1
+    action_code_init_std: float = 0.02
+    action_token_soft_target_temperature: float = 0.1
+    action_condition_hidden_dim: int = 256
+    action_condition_scale: float = 1.0
     flow_loss_weight: float = 1.0
-    action_token_loss_weight: float = 1.0
+    action_token_loss_weight: float = 0.1
 
     # TensorBoard settings. Logging is performed by lerobot-train on the main
     # process, while these policy fields keep PI05ActionMem runs self-contained and
@@ -188,39 +179,22 @@ class PI05ActionMemConfig(PreTrainedConfig):
         ):
             raise ValueError("joint training requires at least one non-zero loss weight.")
 
-        if (self.action_vqvae_input_q01 is None) != (self.action_vqvae_input_q99 is None):
+        if self.action_codebook_size < 2:
+            raise ValueError(f"action_codebook_size must be at least 2, got {self.action_codebook_size}.")
+        if self.action_code_init_std <= 0:
+            raise ValueError(f"action_code_init_std must be positive, got {self.action_code_init_std}.")
+        if self.action_token_soft_target_temperature <= 0:
             raise ValueError(
-                "action_vqvae_input_q01 and action_vqvae_input_q99 must either both be set or both be None."
+                "action_token_soft_target_temperature must be positive, got "
+                f"{self.action_token_soft_target_temperature}."
             )
-        if self.action_vqvae_input_q01 is not None:
-            if len(self.action_vqvae_input_q01) != len(self.action_vqvae_input_q99):
-                raise ValueError("action_vqvae_input_q01 and action_vqvae_input_q99 must match in length.")
-            if self.action_vqvae_input_mask is None or len(self.action_vqvae_input_mask) != len(
-                self.action_vqvae_input_q01
-            ):
-                raise ValueError(
-                    "action_vqvae_input_mask must be set and match the q01/q99 dimension."
-                )
-        if (self.action_vqvae_flow_mean is None) != (self.action_vqvae_flow_std is None):
+        if self.action_condition_hidden_dim <= 0:
             raise ValueError(
-                "action_vqvae_flow_mean and action_vqvae_flow_std must either both be set or both be None."
+                f"action_condition_hidden_dim must be positive, got {self.action_condition_hidden_dim}."
             )
-        if self.action_vqvae_flow_mean is not None and len(self.action_vqvae_flow_mean) != len(
-            self.action_vqvae_flow_std
-        ):
-            raise ValueError("action_vqvae_flow_mean and action_vqvae_flow_std must have the same length.")
-        if (self.action_vqvae_flow_q01 is None) != (self.action_vqvae_flow_q99 is None):
+        if self.action_condition_scale < 0:
             raise ValueError(
-                "action_vqvae_flow_q01 and action_vqvae_flow_q99 must either both be set or both be None."
-            )
-        if self.action_vqvae_flow_q01 is not None and len(self.action_vqvae_flow_q01) != len(
-            self.action_vqvae_flow_q99
-        ):
-            raise ValueError("action_vqvae_flow_q01 and action_vqvae_flow_q99 must have the same length.")
-        if self.action_vqvae_flow_normalization_eps <= 0:
-            raise ValueError(
-                "action_vqvae_flow_normalization_eps must be positive, got "
-                f"{self.action_vqvae_flow_normalization_eps}."
+                f"action_condition_scale must be non-negative, got {self.action_condition_scale}."
             )
 
         if self.tensorboard_log_freq <= 0:
@@ -274,26 +248,6 @@ class PI05ActionMemConfig(PreTrainedConfig):
             num_warmup_steps=self.scheduler_warmup_steps,
             num_decay_steps=self.scheduler_decay_steps,
         )
-
-    def _save_pretrained(self, save_directory: Path) -> None:
-        """Save a portable config together with its token-map companion file."""
-        source_path = (
-            Path(self.action_token_map_path).expanduser().resolve()
-            if self.action_token_map_path is not None
-            else None
-        )
-        original_path = self.action_token_map_path
-        try:
-            if source_path is not None and source_path.is_file():
-                self.action_token_map_path = "token_map.json"
-            super()._save_pretrained(save_directory)
-        finally:
-            self.action_token_map_path = original_path
-
-        if source_path is not None and source_path.is_file():
-            destination = Path(save_directory) / "token_map.json"
-            if source_path != destination.resolve():
-                shutil.copy2(source_path, destination)
 
     @property
     def observation_delta_indices(self) -> None:

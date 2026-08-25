@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 
-"""Measure per-dataset ActionMem q0 usage with the training RLDS/OXE pipeline.
+"""Measure per-dataset endpoint-effect code usage with the training RLDS/OXE pipeline.
 
 The script deliberately constructs each OXE source through ``ActionMemRLDSDataset``.
 Consequently it uses the same storage selection, OXE standardizer, per-source
-q01/q99 action normalization, invalid-chunk filtering, and frozen VQ-VAE encoder
-as ``lerobot-train``.  Sources are visited separately so their q0 distributions
+q01/q99 action normalization, invalid-chunk filtering, and frozen effectTokenizer
+encoder as ``lerobot-train``. Sources are visited separately so code distributions
 can be compared instead of being hidden by the weighted mixture sampler.
 """
 
@@ -41,7 +41,7 @@ class DatasetCodeStatistics:
     normalized_entropy: float
     top_code: int
     top_probability: float
-    mean_nearest_q0_distance: float
+    mean_nearest_code_distance: float
     mean_soft_target_entropy: float
     mean_soft_target_peak_probability: float
 
@@ -49,7 +49,7 @@ class DatasetCodeStatistics:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot the q0 code distribution of every OXE subset using exactly the "
+            "Plot the endpoint-effect code distribution of every OXE subset using exactly the "
             "ActionMem RLDS action preprocessing used by lerobot-train."
         )
     )
@@ -71,7 +71,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional explicit subset names. Each receives mixture weight 1.0.",
     )
-    parser.add_argument("--vqvae-checkpoint", type=Path, required=True)
+    parser.add_argument("--effect-tokenizer-checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--rlds-storage-format",
@@ -134,7 +134,7 @@ def _safe_filename(value: str) -> str:
 def _distribution_metrics(counts: np.ndarray) -> tuple[np.ndarray, int, float, float, int, float]:
     total = int(counts.sum())
     if total <= 0:
-        raise ValueError("Cannot summarize an empty q0 distribution.")
+        raise ValueError("Cannot summarize an empty action-code distribution.")
     probabilities = counts.astype(np.float64) / total
     nonzero = probabilities > 0
     entropy = float(-(probabilities[nonzero] * np.log(probabilities[nonzero])).sum())
@@ -207,7 +207,7 @@ def _analyze_dataset(
             distances = encoder.compute_code_distances(actions).float()
             if distances.ndim != 2 or distances.shape[1] != codebook_size:
                 raise ValueError(
-                    f"Expected q0 distances [B, {codebook_size}], got {tuple(distances.shape)} for {dataset_name}."
+                    f"Expected code distances [B, {codebook_size}], got {tuple(distances.shape)} for {dataset_name}."
                 )
             codes = distances.argmin(dim=-1)
             counts += torch.bincount(codes, minlength=codebook_size).cpu().numpy()
@@ -236,7 +236,7 @@ def _analyze_dataset(
         normalized_entropy=normalized_entropy,
         top_code=top_code,
         top_probability=top_probability,
-        mean_nearest_q0_distance=distance_sum / sampled,
+        mean_nearest_code_distance=distance_sum / sampled,
         mean_soft_target_entropy=entropy_sum / sampled,
         mean_soft_target_peak_probability=peak_sum / sampled,
     )
@@ -300,26 +300,26 @@ def _plot_distributions(
     figure_height = max(5.0, 0.42 * len(statistics) + 2.0)
     fig, ax = plt.subplots(figsize=(18, figure_height))
     image = ax.imshow(np.log10(probabilities + 1e-6), aspect="auto", cmap="magma", vmin=-6, vmax=0)
-    ax.set_xlabel("Q0 code ID")
+    ax.set_xlabel("Effect code ID")
     ax.set_ylabel("OXE subset")
-    ax.set_title("Per-subset Q0 distribution (color = log10(probability + 1e-6))")
+    ax.set_title("Per-subset endpoint-effect code distribution (color = log10(probability + 1e-6))")
     ax.set_yticks(np.arange(len(dataset_names)), labels=dataset_names)
     ax.set_xticks(np.arange(0, probabilities.shape[1], 16))
     colorbar = fig.colorbar(image, ax=ax, pad=0.01)
     colorbar.set_label("log10 probability")
     fig.tight_layout()
-    fig.savefig(output_dir / "q0_distribution_heatmap.png", dpi=180)
+    fig.savefig(output_dir / "action_code_distribution_heatmap.png", dpi=180)
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(18, 5))
     ax.bar(np.arange(len(aggregate)), aggregate, width=1.0)
     ax.set_xlim(-0.5, len(aggregate) - 0.5)
-    ax.set_xlabel("Q0 code ID")
+    ax.set_xlabel("Effect code ID")
     ax.set_ylabel("Probability")
-    ax.set_title("Training-weighted aggregate Q0 distribution")
+    ax.set_title("Training-weighted aggregate endpoint-effect code distribution")
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
-    fig.savefig(output_dir / "q0_distribution_training_weighted.png", dpi=180)
+    fig.savefig(output_dir / "action_code_distribution_training_weighted.png", dpi=180)
     plt.close(fig)
 
     per_dataset_dir = output_dir / "per_dataset"
@@ -328,7 +328,7 @@ def _plot_distributions(
         fig, ax = plt.subplots(figsize=(18, 4.5))
         ax.bar(np.arange(len(item.probabilities)), item.probabilities, width=1.0)
         ax.set_xlim(-0.5, len(item.probabilities) - 0.5)
-        ax.set_xlabel("Q0 code ID")
+        ax.set_xlabel("Effect code ID")
         ax.set_ylabel("Probability")
         ax.set_title(
             f"{item.dataset} | n={item.sampled_chunks:,}, used={item.used_codes}/{len(item.counts)}, "
@@ -361,18 +361,19 @@ def main() -> None:
 
     from lerobot.configs.default import DatasetConfig
     from lerobot.datasets.rlds_dataset import (
-        _ACTION_VQVAE_INPUT,
         ActionMemRLDSDataset,
         _load_mixture_spec,
         _load_rlds_backend,
     )
+    from lerobot.policies.effect_tokenizer import load_effect_tokenizer_metadata
+    from lerobot.utils.constants import ACTION_TOKENIZER_INPUT
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"--device={args.device!r} requested CUDA, but PyTorch cannot access CUDA.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = args.vqvae_checkpoint.expanduser().resolve()
+    checkpoint = args.effect_tokenizer_checkpoint.expanduser().resolve()
     if not checkpoint.is_file():
-        raise FileNotFoundError(f"VQ-VAE checkpoint does not exist: {checkpoint}")
+        raise FileNotFoundError(f"Effect-tokenizer checkpoint does not exist: {checkpoint}")
 
     backend = _load_rlds_backend()
     mixture_config = DatasetConfig(
@@ -388,25 +389,17 @@ def main() -> None:
         else _load_mixture_spec(mixture_config, backend.named_mixtures)
     )
 
-    # Read the checkpoint metadata without constructing a second encoder model.
-    from lerobot.policies.actionmem.action_vqvae import _load_checkpoint
-
-    checkpoint_payload = _load_checkpoint(checkpoint)
-    checkpoint_config = checkpoint_payload.get("config")
-    if not isinstance(checkpoint_config, Mapping):
-        raise ValueError(f"VQ-VAE checkpoint {checkpoint} has no config mapping.")
-    action_horizon = int(checkpoint_config["horizon"])
-    action_dim = int(checkpoint_config["action_dim"])
-    codebook_size = int(checkpoint_config.get("codebook_size", 256))
-    del checkpoint_payload
-    gc.collect()
+    metadata = load_effect_tokenizer_metadata(checkpoint)
+    action_horizon = metadata.horizon
+    action_dim = metadata.action_dim
+    codebook_size = metadata.codebook_size
 
     results: list[DatasetCodeStatistics] = []
     errors: dict[str, str] = {}
     device = torch.device(args.device)
     root = args.data_root_dir.expanduser().resolve()
     logging.info(
-        "Analyzing %d OXE subsets with horizon=%d, action_dim=%d, q0_size=%d",
+        "Analyzing %d OXE subsets with horizon=%d, action_dim=%d, codebook_size=%d",
         len(mixture_spec),
         action_horizon,
         action_dim,
@@ -427,7 +420,8 @@ def main() -> None:
                 rlds_skip_unlabeled=True,
                 rlds_num_parallel_calls=args.rlds_num_parallel_calls,
                 rlds_storage_format=args.rlds_storage_format,
-                rlds_q0_device=args.device,
+                rlds_target_control_hz=metadata.target_control_hz or 0.0,
+                rlds_action_tokenizer_device=args.device,
                 rlds_state_dim=args.state_dim,
             )
             dataset = ActionMemRLDSDataset(
@@ -435,7 +429,8 @@ def main() -> None:
                 action_horizon=action_horizon,
                 action_dim=action_dim,
                 state_dim=args.state_dim,
-                action_vqvae_checkpoint_path=checkpoint,
+                action_tokenizer_checkpoint_path=checkpoint,
+                action_codebook_size=codebook_size,
                 seed=args.seed,
             )
             if len(dataset.dataset_names) != 1:
@@ -451,11 +446,11 @@ def main() -> None:
                 temperature=args.soft_target_temperature,
                 device=device,
                 progress_every=args.progress_every,
-                action_key=_ACTION_VQVAE_INPUT,
+                action_key=ACTION_TOKENIZER_INPUT,
             )
             if len(result.counts) != codebook_size:
                 raise ValueError(
-                    f"Checkpoint declares {codebook_size} q0 codes but encoder returned {len(result.counts)}."
+                    f"Checkpoint declares {codebook_size} codes but encoder returned {len(result.counts)}."
                 )
             results.append(result)
             logging.info(
@@ -495,7 +490,7 @@ def main() -> None:
             "data_mix": args.data_mix,
             "mixture_path": str(args.mixture_path.expanduser().resolve()) if args.mixture_path else None,
             "rlds_storage_format": args.rlds_storage_format,
-            "vqvae_checkpoint": str(checkpoint),
+            "effect_tokenizer_checkpoint": str(checkpoint),
             "action_horizon": action_horizon,
             "action_dim": action_dim,
             "codebook_size": codebook_size,
@@ -518,7 +513,7 @@ def main() -> None:
             json.dumps(errors, indent=2, ensure_ascii=False), encoding="utf-8"
         )
     _plot_distributions(args.output_dir, results, aggregate)
-    logging.info("Wrote q0 distribution results to %s", args.output_dir.resolve())
+    logging.info("Wrote endpoint-effect code distribution results to %s", args.output_dir.resolve())
 
 
 if __name__ == "__main__":

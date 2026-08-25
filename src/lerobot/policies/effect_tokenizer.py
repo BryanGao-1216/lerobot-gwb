@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen encoder for the endpoint-effect tokenizer used by Smol ActionMem.
+"""Frozen encoder for the endpoint-effect tokenizer shared by ActionMem policies.
 
 The checkpoint contract is defined by ``scripts/effectTokenizer``.  That
 tokenizer is trained on per-dataset q01/q99-normalized OXE action chunks, but

@@ -73,13 +73,14 @@ lerobot-train \
   --dataset.root=/data/open_x_embodiment \
   --rlds-storage-format=hybrid \
   --dataset.rlds_mixture_path=/path/to/lerobot-gwb/examples/training/actionmem_rlds_mix.json \
-  --dataset.rlds_action_vqvae_checkpoint_path=/path/to/action_vqvae.pt \
-  --dataset.rlds_q0_device=cpu \
+  --dataset.rlds_effect_tokenizer_checkpoint_path=/path/to/effect_vqvae.pt \
+  --dataset.rlds_action_tokenizer_device=cpu \
+  --dataset.rlds_target_control_hz=10 \
   --dataset.rlds_state_dim=32 \
   --dataset.rlds_camera_views='["primary","secondary","wrist"]' \
   --policy.path=/path/to/smol-actionmem-base \
-  --policy.chunk_size=16 \
-  --policy.n_action_steps=16 \
+  --policy.chunk_size=10 \
+  --policy.n_action_steps=10 \
   --output_dir=/path/to/output \
   --batch_size=8 \
   --steps=100000 \
@@ -89,9 +90,10 @@ lerobot-train \
 ```
 
 The adapter uses the vendored OXE registry and trajectory transforms, then emits the same
-keys that the existing ActionMem/SmolActionMem preprocessors consume. It forms complete 16-step
-chunks, removes each episode's padded tail, and encodes q0 online in the collate function. The
-VQ-VAE is frozen and is not part of the policy optimizer or checkpoint.
+keys that the ActionMem preprocessors consume. It forms complete chunks at the horizon stored in
+the effectTokenizer checkpoint, removes each episode's padded tail, and encodes endpoint-effect
+codes plus prototype distances online in the collate function. The effectTokenizer is frozen and
+is not part of the policy optimizer or policy checkpoint.
 
 Action preprocessing follows VQ-VLA exactly: each source first uses its registered OXE
 standardizer, the non-gripper EEF dimensions are normalized with that source's q01/q99 statistics,

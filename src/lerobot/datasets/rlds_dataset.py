@@ -47,10 +47,7 @@ from lerobot.datasets.rlds_webdataset import (
     resolve_openx_tar_paths,
     transform_openx_tar_episode,
 )
-from lerobot.policies.actionmem.action_vqvae import (
-    load_action_vqvae_q0_encoder,
-)
-from lerobot.policies.smol_actionmem.effect_tokenizer import (
+from lerobot.policies.effect_tokenizer import (
     load_effect_tokenizer_metadata,
     load_effect_vqvae_action_encoder,
 )
@@ -59,9 +56,6 @@ from lerobot.utils.constants import (
     ACTION_TOKEN,
     ACTION_TOKEN_DISTANCES,
     ACTION_TOKENIZER_INPUT,
-    ACTION_VQVAE_NORMALIZATION_MASK,
-    ACTION_VQVAE_Q01,
-    ACTION_VQVAE_Q99,
     OBS_STATE,
 )
 
@@ -127,7 +121,6 @@ class RLDSActionTokenCollator:
     def __init__(
         self,
         checkpoint_path: str | Path,
-        encoder_kind: str,
         device: str = "cpu",
         expected_horizon: int | None = None,
         expected_action_dim: int | None = None,
@@ -140,12 +133,7 @@ class RLDSActionTokenCollator:
             raise RuntimeError(
                 f"rlds_action_tokenizer_device={device!r} requested CUDA, but CUDA is not available."
             )
-        if encoder_kind == "effect":
-            self.encoder = load_effect_vqvae_action_encoder(self.checkpoint_path)
-        elif encoder_kind == "residual_vqvae":
-            self.encoder = load_action_vqvae_q0_encoder(self.checkpoint_path)
-        else:
-            raise ValueError(f"Unsupported action encoder kind {encoder_kind!r}.")
+        self.encoder = load_effect_vqvae_action_encoder(self.checkpoint_path)
 
         expected_values = {
             "horizon": expected_horizon,
@@ -161,7 +149,7 @@ class RLDSActionTokenCollator:
         target_hz_mismatch = (checkpoint_hz is None) != (expected_target_control_hz is None)
         if checkpoint_hz is not None and expected_target_control_hz is not None:
             target_hz_mismatch = not np.isclose(checkpoint_hz, expected_target_control_hz)
-        if encoder_kind == "effect" and target_hz_mismatch:
+        if target_hz_mismatch:
             mismatches.append(
                 f"target_control_hz: checkpoint={checkpoint_hz}, expected={expected_target_control_hz}"
             )
@@ -359,10 +347,6 @@ def _attach_normalized_action_tokenizer_input(
     maximum = tf.convert_to_tensor(action_stats["max"], dtype=tf.float32)
     normalized_action = tf.where(tf.equal(minimum, maximum), tf.zeros_like(action), normalized_action)
     trajectory[ACTION_TOKENIZER_INPUT] = normalized_action
-    action_shape = tf.shape(action)
-    trajectory[ACTION_VQVAE_Q01] = tf.broadcast_to(low, action_shape)
-    trajectory[ACTION_VQVAE_Q99] = tf.broadcast_to(high, action_shape)
-    trajectory[ACTION_VQVAE_NORMALIZATION_MASK] = tf.broadcast_to(mask, action_shape)
     return trajectory
 
 
@@ -515,7 +499,6 @@ class ActionMemRLDSDataset(IterableDataset):
         action_dim: int,
         state_dim: int,
         action_tokenizer_checkpoint_path: str | Path,
-        action_encoder_kind: str,
         action_codebook_size: int,
         seed: int,
     ) -> None:
@@ -614,7 +597,6 @@ class ActionMemRLDSDataset(IterableDataset):
         self.collate_fn = RLDSActionTokenCollator(
             checkpoint_path=action_tokenizer_checkpoint_path,
             device=dataset_config.rlds_action_tokenizer_device,
-            encoder_kind=action_encoder_kind,
             expected_horizon=action_horizon,
             expected_action_dim=action_dim,
             expected_codebook_size=action_codebook_size,
@@ -921,11 +903,6 @@ class ActionMemRLDSDataset(IterableDataset):
                         "task": {"language_instruction": language[frame_index]},
                         "action": action_chunk,
                         ACTION_TOKENIZER_INPUT: normalized_chunk,
-                        ACTION_VQVAE_Q01: np.broadcast_to(q01, action_chunk.shape),
-                        ACTION_VQVAE_Q99: np.broadcast_to(q99, action_chunk.shape),
-                        ACTION_VQVAE_NORMALIZATION_MASK: np.broadcast_to(
-                            normalization_mask, action_chunk.shape
-                        ),
                         "dataset_name": source["name"],
                     }
             if not yielded_in_epoch:
@@ -1016,23 +993,10 @@ class ActionMemRLDSDataset(IterableDataset):
                 "Expected q01/q99-normalized RLDS action-tokenizer chunk "
                 f"{(self.action_horizon, self.action_dim)}, got {action_tokenizer_input.shape}."
             )
-        action_vqvae_q01 = np.asarray(frame[ACTION_VQVAE_Q01], dtype=np.float32)[0]
-        action_vqvae_q99 = np.asarray(frame[ACTION_VQVAE_Q99], dtype=np.float32)[0]
-        action_vqvae_mask = np.asarray(frame[ACTION_VQVAE_NORMALIZATION_MASK], dtype=bool)[0]
-        for name, value in (
-            (ACTION_VQVAE_Q01, action_vqvae_q01),
-            (ACTION_VQVAE_Q99, action_vqvae_q99),
-            (ACTION_VQVAE_NORMALIZATION_MASK, action_vqvae_mask),
-        ):
-            if value.shape != (self.action_dim,):
-                raise ValueError(f"Expected {name} shape {(self.action_dim,)}, got {value.shape}.")
         sample: dict[str, Any] = {
             OBS_STATE: torch.from_numpy(state),
             ACTION: torch.from_numpy(action.copy()),
             ACTION_TOKENIZER_INPUT: torch.from_numpy(action_tokenizer_input.copy()),
-            ACTION_VQVAE_Q01: torch.from_numpy(action_vqvae_q01.copy()),
-            ACTION_VQVAE_Q99: torch.from_numpy(action_vqvae_q99.copy()),
-            ACTION_VQVAE_NORMALIZATION_MASK: torch.from_numpy(action_vqvae_mask.copy()),
             "action_is_pad": torch.zeros(self.action_horizon, dtype=torch.bool),
             "task": _decode_text(frame["task"]["language_instruction"]),
             "dataset_name": _decode_text(frame["dataset_name"]),
@@ -1066,81 +1030,40 @@ class ActionMemRLDSDataset(IterableDataset):
         raise NotImplementedError("ActionMemRLDSDataset is an infinite IterableDataset.")
 
 
-def resolve_actionmem_token_metadata(policy_config: Any) -> SimpleNamespace:
-    """Resolve the token map without importing the heavy policy model."""
-    token_map_path = getattr(policy_config, "action_token_map_path", None)
-    pretrained_path = getattr(policy_config, "pretrained_path", None)
-    companion_path = (
-        Path(pretrained_path).expanduser() / "token_map.json" if pretrained_path is not None else None
-    )
-    if companion_path is not None and companion_path.is_file():
-        token_map_path = str(companion_path.resolve())
-        policy_config.action_token_map_path = token_map_path
-
-    if policy_config.type == "actionmem":
-        from lerobot.policies.actionmem.tokenization_actionmem import ActionMemTokenMap
-
-        return ActionMemTokenMap.from_json(token_map_path)
-    if policy_config.type == "pi05_actionmem":
-        from lerobot.policies.pi05_actionmem.tokenization_pi05_actionmem import PI05ActionMemTokenMap
-
-        return PI05ActionMemTokenMap.from_json(token_map_path)
-    raise ValueError(f"RLDS ActionMem backend does not support policy type {policy_config.type!r}.")
-
-
 def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
     policy_config = cfg.trainable_config
-    if policy_config.type == "smol_actionmem":
-        checkpoint_path = (
-            cfg.dataset.rlds_effect_tokenizer_checkpoint_path
-            or policy_config.effect_tokenizer_checkpoint_path
+    checkpoint_path = (
+        cfg.dataset.rlds_effect_tokenizer_checkpoint_path
+        or policy_config.effect_tokenizer_checkpoint_path
+    )
+    if checkpoint_path is None:
+        raise ValueError(
+            f"{policy_config.type} RLDS training requires an effect-tokenizer checkpoint. Set "
+            "--dataset.rlds_effect_tokenizer_checkpoint_path or "
+            "--policy.effect_tokenizer_checkpoint_path."
         )
-        if checkpoint_path is None:
-            raise ValueError(
-                "Smol ActionMem RLDS training requires an effect-tokenizer checkpoint. Set "
-                "--dataset.rlds_effect_tokenizer_checkpoint_path or "
-                "--policy.effect_tokenizer_checkpoint_path."
-            )
-        metadata = load_effect_tokenizer_metadata(checkpoint_path)
-        action_horizon = metadata.horizon
-        action_dim = metadata.action_dim
-        requested_hz = (
-            float(cfg.dataset.rlds_target_control_hz)
-            if cfg.dataset.rlds_target_control_hz > 0
-            else None
+    metadata = load_effect_tokenizer_metadata(checkpoint_path)
+    action_horizon = metadata.horizon
+    action_dim = metadata.action_dim
+    requested_hz = (
+        float(cfg.dataset.rlds_target_control_hz)
+        if cfg.dataset.rlds_target_control_hz > 0
+        else None
+    )
+    frequency_mismatch = (metadata.target_control_hz is None) != (requested_hz is None)
+    if metadata.target_control_hz is not None and requested_hz is not None:
+        frequency_mismatch = not np.isclose(metadata.target_control_hz, requested_hz)
+    if frequency_mismatch:
+        raise ValueError(
+            f"dataset.rlds_target_control_hz={requested_hz} does not match effect-tokenizer "
+            f"target_control_hz={metadata.target_control_hz}."
         )
-        frequency_mismatch = (metadata.target_control_hz is None) != (requested_hz is None)
-        if metadata.target_control_hz is not None and requested_hz is not None:
-            frequency_mismatch = not np.isclose(metadata.target_control_hz, requested_hz)
-        if frequency_mismatch:
-            raise ValueError(
-                f"dataset.rlds_target_control_hz={requested_hz} does not match effect-tokenizer "
-                f"target_control_hz={metadata.target_control_hz}."
-            )
-        action_codebook_size = int(policy_config.action_codebook_size)
-        if action_codebook_size != metadata.codebook_size:
-            raise ValueError(
-                f"Policy action_codebook_size={action_codebook_size} does not match effect-tokenizer "
-                f"codebook_size={metadata.codebook_size}."
-            )
-        action_encoder_kind = "effect"
-    else:
-        token_metadata = resolve_actionmem_token_metadata(policy_config)
-        checkpoint_path = (
-            cfg.dataset.rlds_action_vqvae_checkpoint_path
-            or getattr(policy_config, "action_vqvae_checkpoint_path", None)
-            or token_metadata.vqvae_checkpoint_path
+    action_codebook_size = int(policy_config.action_codebook_size)
+    if action_codebook_size != metadata.codebook_size:
+        raise ValueError(
+            f"Policy action_codebook_size={action_codebook_size} does not match effect-tokenizer "
+            f"codebook_size={metadata.codebook_size}."
         )
-        if checkpoint_path is None:
-            raise ValueError(
-                "RLDS action-token generation needs a residual VQ-VAE checkpoint. Set "
-                "--dataset.rlds_action_vqvae_checkpoint_path or policy.action_vqvae_checkpoint_path, "
-                "or store checkpoint_path in token_map.json."
-            )
-        action_horizon = int(token_metadata.action_horizon)
-        action_dim = int(token_metadata.action_dim)
-        action_codebook_size = int(token_metadata.codebook_size)
-        action_encoder_kind = "residual_vqvae"
 
     configured_chunk_size = int(getattr(cfg.trainable_config, "chunk_size", action_horizon))
     if configured_chunk_size != action_horizon:
@@ -1154,7 +1077,6 @@ def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
         action_dim=action_dim,
         state_dim=state_dim,
         action_tokenizer_checkpoint_path=checkpoint_path,
-        action_encoder_kind=action_encoder_kind,
         action_codebook_size=action_codebook_size,
         seed=cfg.seed if cfg.seed is not None else 0,
     )
