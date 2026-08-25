@@ -1,22 +1,26 @@
-EFFECT_TOKENIZER_CHECKPOINT="${EFFECT_TOKENIZER_CHECKPOINT:-/mnt/data27T/media/gwb/MyStudy/effectTokenizer/outputs/effect_vqvae.pt}"
+export CUDA_VISIBLE_DEVICES=3,5
 
-lerobot-train \
-  --policy.path=/mnt/data27T/media/gwb/models/smol_actionmem-finall/checkpoints/last/pretrained_model \
-  --policy.effect_tokenizer_checkpoint_path="${EFFECT_TOKENIZER_CHECKPOINT}" \
+accelerate launch \
+  --multi_gpu \
+  --num_processes=2 \
+  --num_machines=1 \
+  --main_process_port=29501 \
+  "$(which lerobot-train)" \
+  --policy.path=/data1/gaowenbing/WorkSpace/models/smol_actionmem-pretrained/checkpoints/last/pretrained_model \
+  --policy.effect_tokenizer_checkpoint_path=/data1/gaowenbing/WorkSpace/MyStudy/effectTokenizer/outputs/effect_vqvae.pt \
   --policy.train_expert_only=false \
   --policy.training_stage=vlm_only \
   --policy.input_features=null \
   --policy.output_features=null \
   --policy.chunk_size=10 \
   --policy.n_action_steps=10 \
-  --policy.drop_n_last_frames=9 \
   --dataset.rlds_target_control_hz=10 \
-  --dataset.repo_id=libero_test_0805 \
+  --dataset.repo_id=libero_only \
   --policy.action_token_soft_target_temperature=0.1 \
   --dataset_type=rlds \
   --dataset.rlds_storage_format=hybrid \
-  --dataset.root=/mnt/data27T/media/gwb/datasets/OpenX \
-  --output_dir=/mnt/data27T/media/gwb/models/smol_actionmem-final \
+  --dataset.root=/data1/gaowenbing/WorkSpace/datasets/OpenX \
+  --output_dir=/data1/gaowenbing/WorkSpace/models/smol_actionmem-final \
   --steps=100000 \
   --policy.tensorboard_log_freq=10 \
   --policy.optimizer_lr=3e-5 \
@@ -24,7 +28,7 @@ lerobot-train \
   --policy.scheduler_warmup_steps=5000 \
   --policy.scheduler_decay_steps=100000 \
   --policy.scheduler_decay_lr=5e-6 \
-  --batch_size=32 \
+  --batch_size=16 \
   --eval_step=0 \
   --policy.gradient_checkpointing=false \
   --policy.tensorboard_enable=true \
