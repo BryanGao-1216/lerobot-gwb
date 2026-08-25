@@ -10,13 +10,14 @@ lerobot-train \
   --policy.chunk_size=10 \
   --policy.n_action_steps=10 \
   --policy.drop_n_last_frames=9 \
+  --dataset.rlds_overfit_num_samples=100 \
   --dataset.rlds_target_control_hz=10 \
   --dataset.repo_id=action_tokenizer_plus \
   --policy.action_token_soft_target_temperature=0.1 \
   --dataset_type=rlds \
   --dataset.rlds_storage_format=hybrid \
   --dataset.root=/mnt/data27T/media/gwb/datasets/OpenX \
-  --output_dir=/mnt/data27T/media/gwb/models/smol_actionmem-finall \
+  --output_dir=/mnt/data27T/media/gwb/models/smol_actionmem-overfit \
   --steps=100000 \
   --policy.tensorboard_log_freq=10 \
   --policy.optimizer_lr=3e-5 \
