@@ -19,7 +19,11 @@ lerobot-train \
   --output_dir=/mnt/data27T/media/gwb/models/smol_actionmem-finall \
   --steps=100000 \
   --policy.tensorboard_log_freq=10 \
+  --policy.optimizer_lr=3e-5 \
   --policy.optimizer_grad_clip_norm=5 \
+  --policy.scheduler_warmup_steps=5000 \
+  --policy.scheduler_decay_steps=100000 \
+  --policy.scheduler_decay_lr=5e-6 \
   --batch_size=32 \
   --eval_step=0 \
   --policy.gradient_checkpointing=false \
