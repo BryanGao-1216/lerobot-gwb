@@ -510,11 +510,28 @@ class ActionMemRLDSDataset(IterableDataset):
         self.seed = seed
         self.backend = _load_rlds_backend()
         self.rank, self.world_size = _resolve_rank_and_world_size()
+        self._overfit_global_num_samples = dataset_config.rlds_overfit_num_samples
+        self._overfit_num_samples: int | None = None
+        self._overfit_samples: tuple[dict[str, Any], ...] | None = None
+        if self._overfit_global_num_samples is not None:
+            if self._overfit_global_num_samples < self.world_size:
+                raise ValueError(
+                    "rlds_overfit_num_samples must be at least the distributed world size "
+                    f"({self.world_size}), got {self._overfit_global_num_samples}."
+                )
+            base_samples, remainder = divmod(self._overfit_global_num_samples, self.world_size)
+            self._overfit_num_samples = base_samples + int(self.rank < remainder)
         self.backend.tf.random.set_seed(seed)
         self._webdataset_sources: list[dict[str, Any]] = []
         self._webdataset_sample_weights = np.empty(0, dtype=np.float64)
         self._hybrid_backend_weights = np.empty(0, dtype=np.float64)
-        self._webdataset_shuffle_buffer_size = dataset_config.rlds_shuffle_buffer_size
+        self._stream_shuffle_buffer_size = dataset_config.rlds_shuffle_buffer_size
+        if self._overfit_num_samples is not None:
+            self._stream_shuffle_buffer_size = min(
+                self._stream_shuffle_buffer_size,
+                self._overfit_num_samples,
+            )
+        self._webdataset_shuffle_buffer_size = self._stream_shuffle_buffer_size
         self.target_control_hz = (
             float(dataset_config.rlds_target_control_hz)
             if dataset_config.rlds_target_control_hz > 0
@@ -554,6 +571,11 @@ class ActionMemRLDSDataset(IterableDataset):
             max(size / weight for size, weight in zip(valid_sizes, effective_weights, strict=True))
         )
         self.num_episodes = sum(int(stats.get("num_trajectories", 0)) for stats in all_statistics)
+        if self._overfit_global_num_samples is not None:
+            self.num_frames = self._overfit_global_num_samples
+            # MetricsTracker needs a non-zero episode count. Treat one pass
+            # over the fixed debug cache as one synthetic episode/epoch.
+            self.num_episodes = 1
         self.episodes = None
         self.absolute_to_relative_idx = None
 
@@ -626,6 +648,14 @@ class ActionMemRLDSDataset(IterableDataset):
             )
         else:
             logging.info("OXE control-frequency alignment is disabled; using native source rates.")
+        if self._overfit_num_samples is not None:
+            logging.warning(
+                "RLDS overfit mode is enabled: rank %d will cache %d fixed samples "
+                "(%d globally) and repeat only those samples.",
+                self.rank,
+                self._overfit_num_samples,
+                self._overfit_global_num_samples,
+            )
 
     def _build_interleaved_dataset(
         self,
@@ -724,17 +754,14 @@ class ActionMemRLDSDataset(IterableDataset):
             self._hybrid_backend_weights = np.asarray(
                 [webdataset_weight, tfds_weight], dtype=np.float64
             )
-            webdataset_buffer_size = int(
-                round(self.dataset_config.rlds_shuffle_buffer_size * webdataset_weight)
-            )
+            webdataset_buffer_size = int(round(self._stream_shuffle_buffer_size * webdataset_weight))
             self._webdataset_shuffle_buffer_size = max(1, webdataset_buffer_size)
             tfds_shuffle_buffer_size = max(
                 1,
-                self.dataset_config.rlds_shuffle_buffer_size
-                - self._webdataset_shuffle_buffer_size,
+                self._stream_shuffle_buffer_size - self._webdataset_shuffle_buffer_size,
             )
         else:
-            tfds_shuffle_buffer_size = self.dataset_config.rlds_shuffle_buffer_size
+            tfds_shuffle_buffer_size = self._stream_shuffle_buffer_size
 
         if not tfds_indices:
             return None, all_statistics, effective_weights, valid_sizes
@@ -946,6 +973,11 @@ class ActionMemRLDSDataset(IterableDataset):
                     self._webdataset_shuffle_buffer_size,
                 )
         logging.info("OpenX tar shuffle buffer is ready.")
+        if self._overfit_num_samples is not None:
+            # Let fixed-cache mode see each initially buffered frame once
+            # before normal replacement sampling can introduce duplicates.
+            for buffer_index in rng.permutation(len(shuffle_buffer)):
+                yield self._materialize_webdataset_frame(shuffle_buffer[int(buffer_index)])
         while True:
             buffer_index = int(rng.integers(len(shuffle_buffer)))
             frame = shuffle_buffer[buffer_index]
@@ -1013,15 +1045,46 @@ class ActionMemRLDSDataset(IterableDataset):
             sample[f"{target_key}_padding_mask"] = torch.tensor(mask, dtype=torch.bool)
         return sample
 
-    def __iter__(self):
+    def _iter_source_frames(self):
         if self._webdataset_sources and self._dataset is not None:
-            frames = self._iter_hybrid_frames()
-        elif self._webdataset_sources:
-            frames = self._iter_weighted_webdatasets()
-        else:
-            frames = self._iter_tfds_frames()
-        for frame in frames:
-            yield self._to_lerobot_sample(frame)
+            return self._iter_hybrid_frames()
+        if self._webdataset_sources:
+            return self._iter_weighted_webdatasets()
+        return self._iter_tfds_frames()
+
+    def __iter__(self):
+        frames = self._iter_source_frames()
+        if self._overfit_num_samples is None:
+            for frame in frames:
+                yield self._to_lerobot_sample(frame)
+            return
+
+        if self._overfit_samples is None:
+            cached_samples: list[dict[str, Any]] = []
+            for frame in frames:
+                cached_samples.append(self._to_lerobot_sample(frame))
+                if len(cached_samples) == self._overfit_num_samples:
+                    break
+            if len(cached_samples) != self._overfit_num_samples:
+                raise RuntimeError(
+                    f"RLDS overfit cache expected {self._overfit_num_samples} samples on rank "
+                    f"{self.rank}, but collected {len(cached_samples)}."
+                )
+            self._overfit_samples = tuple(cached_samples)
+            logging.warning(
+                "RLDS overfit cache is ready on rank %d: %d fixed samples.",
+                self.rank,
+                len(self._overfit_samples),
+            )
+
+        epoch = 0
+        while True:
+            order = np.random.default_rng(self.seed + 104_729 * self.rank + epoch).permutation(
+                len(self._overfit_samples)
+            )
+            for sample_index in order:
+                yield self._overfit_samples[int(sample_index)]
+            epoch += 1
 
     def __len__(self) -> int:
         return self.num_frames

@@ -616,7 +616,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             position=0,
             leave=True,
         )
-        dataset_description = "an infinite weighted RLDS mixture" if is_rlds_dataset else "a fixed dataset"
+        if is_rlds_dataset and cfg.dataset.rlds_overfit_num_samples is not None:
+            dataset_description = (
+                f"a fixed {cfg.dataset.rlds_overfit_num_samples}-sample RLDS overfit cache"
+            )
+        else:
+            dataset_description = "an infinite weighted RLDS mixture" if is_rlds_dataset else "a fixed dataset"
         logging.info(
             f"Start offline training on {dataset_description}, with effective batch size: {effective_batch_size}"
         )

@@ -197,6 +197,30 @@ def test_hybrid_iterator_preserves_total_backend_weights():
     assert webdataset_fraction == pytest.approx(0.3, abs=0.015)
 
 
+def test_rlds_overfit_iterator_caches_and_repeats_only_fixed_samples():
+    dataset = object.__new__(ActionMemRLDSDataset)
+    dataset._overfit_num_samples = 3
+    dataset._overfit_samples = None
+    dataset.rank = 0
+    dataset.seed = 7
+    consumed = []
+
+    def source_frames():
+        for value in range(10):
+            consumed.append(value)
+            yield {"value": value}
+
+    dataset._iter_source_frames = source_frames
+    dataset._to_lerobot_sample = lambda frame: {"value": frame["value"]}
+
+    iterator = iter(dataset)
+    values = [next(iterator)["value"] for _ in range(9)]
+
+    assert consumed == [0, 1, 2]
+    assert len(dataset._overfit_samples) == 3
+    assert all(set(values[offset : offset + 3]) == {0, 1, 2} for offset in (0, 3, 6))
+
+
 def test_bridge_tar_uses_openx_schema_for_action_images_and_state(tmp_path):
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()

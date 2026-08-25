@@ -89,6 +89,16 @@ lerobot-train \
   --policy.push_to_hub=false
 ```
 
+For a fixed 100-sample overfit check, add:
+
+```bash
+--dataset.rlds_overfit_num_samples=100
+```
+
+This debugging option caches the first fixed set of fully preprocessed samples and
+reshuffles/repeats only that cache, so `epch` advances once per 100 global samples. Remove the
+option for normal infinite-mixture training.
+
 The adapter uses the vendored OXE registry and trajectory transforms, then emits the same
 keys that the ActionMem preprocessors consume. It forms complete chunks at the horizon stored in
 the effectTokenizer checkpoint, removes each episode's padded tail, and encodes endpoint-effect

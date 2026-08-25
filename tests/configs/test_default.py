@@ -68,6 +68,12 @@ def test_target_control_hz_cli_alias_matches_mystudy():
     ]
 
 
+def test_rlds_overfit_num_samples_cli_alias():
+    assert normalize_cli_aliases(["--rlds-overfit-num-samples=100"]) == [
+        "--dataset.rlds_overfit_num_samples=100"
+    ]
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -77,6 +83,7 @@ def test_target_control_hz_cli_alias_matches_mystudy():
         ({"rlds_storage_format": "pickle"}, "storage_format"),
         ({"rlds_action_tokenizer_device": "mps"}, "action_tokenizer_device"),
         ({"rlds_target_control_hz": -1}, "target_control_hz"),
+        ({"rlds_overfit_num_samples": 0}, "overfit_num_samples"),
         ({"rlds_camera_views": ("primary", "overhead")}, "camera_views"),
     ],
 )

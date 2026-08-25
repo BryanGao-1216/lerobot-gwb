@@ -73,6 +73,9 @@ class DatasetConfig:
     # for ``oxe``; neither value bypasses the OXE standardizer itself.
     rlds_action_transform: str = "oxe"
     rlds_effect_tokenizer_checkpoint_path: str | None = None
+    # Debug-only mode: cache this many fixed RLDS samples, then reshuffle and
+    # repeat only that cache forever. None keeps the normal infinite stream.
+    rlds_overfit_num_samples: int | None = None
     # Action-code encoding runs inside the main-process collate function. CPU
     # saves GPU memory; CUDA is faster when memory permits.
     rlds_action_tokenizer_device: str = "cpu"
@@ -121,6 +124,11 @@ class DatasetConfig:
             )
         if self.rlds_state_dim is not None and self.rlds_state_dim <= 0:
             raise ValueError(f"rlds_state_dim must be positive when set, got {self.rlds_state_dim}")
+        if self.rlds_overfit_num_samples is not None and self.rlds_overfit_num_samples <= 0:
+            raise ValueError(
+                "rlds_overfit_num_samples must be positive when set, got "
+                f"{self.rlds_overfit_num_samples}"
+            )
         unknown_camera_views = set(self.rlds_camera_views) - {"primary", "secondary", "wrist"}
         if unknown_camera_views:
             raise ValueError(
