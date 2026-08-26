@@ -1,30 +1,40 @@
-lerobot-train \
- --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/actionmem-base \
- --policy.training_stage=vlm_only \
- --policy.repo_id=actionmem \
- --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/actionmem-0730 \
- --dataset.repo_id=lqs \
- --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/LIBERO-90 \
- --policy.output_features=null \
- --policy.input_features=null \
- --policy.optimizer_lr=1e-4 \
- --policy.scheduler_decay_lr=1e-5 \
- --eval_step=0 \
- --steps=10000 \
- --batch_size=4 \
- --policy.gradient_checkpointing=true \
- --policy.chunk_size=16 \
- --policy.n_action_steps=16 \
- --peft.method_type=LORA \
- --peft.target_modules='(.*\.paligemma_with_expert\.(paligemma\.(model\.language_model\.(layers\.[0-9]+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)|embed_tokens)|lm_head)|gemma_expert\.model\.layers\.[0-9]+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj))|model\.(state_token_proj|state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out))' \
- --policy.push_to_hub=false \
- --policy.tensorboard_enable=true \
- --policy.tensorboard_log_dir=tensorboard \
- --policy.tensorboard_log_freq=10 \
- --policy.tensorboard_flush_secs=30 \
- --policy.tensorboard_max_queue=10 \
- --policy.tensorboard_filename_suffix=.actionmem \
- --policy.tensorboard_log_parameters=false \
- --policy.tensorboard_log_gradients=false \
- --policy.tensorboard_histogram_freq=1000 \
- 
+#!/bin/sh
+
+export CUDA_VISIBLE_DEVICES=3,5
+
+accelerate launch \
+  --multi_gpu \
+  --num_processes=2 \
+  --num_machines=1 \
+  --main_process_port=29502 \
+  -m lerobot.scripts.lerobot_train \
+  --policy.path=/data1/gaowenbing/WorkSpace/models/actionmem-pretrained/checkpoints/last/pretrained_model \
+  --policy.effect_tokenizer_checkpoint_path=/data1/gaowenbing/WorkSpace/MyStudy/effectTokenizer/outputs/effect_vqvae.pt \
+  --policy.use_peft=false \
+  --policy.train_expert_only=false \
+  --policy.training_stage=vlm_only \
+  --policy.freeze_vision_encoder=false \
+  --policy.dtype=bfloat16 \
+  --policy.input_features=null \
+  --policy.output_features=null \
+  --policy.chunk_size=10 \
+  --policy.n_action_steps=10 \
+  --dataset.rlds_target_control_hz=10 \
+  --dataset.repo_id=libero_only \
+  --policy.action_token_soft_target_temperature=0.1 \
+  --dataset_type=rlds \
+  --dataset.rlds_storage_format=hybrid \
+  --dataset.root=/data1/gaowenbing/WorkSpace/datasets/OpenX \
+  --output_dir=/data1/gaowenbing/WorkSpace/models/actionmem-final \
+  --steps=100000 \
+  --policy.tensorboard_log_freq=10 \
+  --policy.optimizer_lr=3e-5 \
+  --policy.optimizer_grad_clip_norm=5 \
+  --policy.scheduler_warmup_steps=5000 \
+  --policy.scheduler_decay_steps=100000 \
+  --policy.scheduler_decay_lr=5e-6 \
+  --batch_size=1 \
+  --eval_step=0 \
+  --policy.gradient_checkpointing=true \
+  --policy.tensorboard_enable=true \
+  --policy.push_to_hub=false

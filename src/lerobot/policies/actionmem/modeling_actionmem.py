@@ -592,7 +592,11 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
         action_token_masks=None,
         state=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images/task/memory/state/query/target in causal order."""
+        """Embed images/task/memory/state/query in causal order.
+
+        The current action code is supervision only and must be removed by the
+        caller. ACTION_QUERY is therefore always the final prefix token.
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -674,8 +678,12 @@ class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
             pad_masks.append(state_token_mask)
             att_masks += [1]
 
-            # ACTION_QUERY and its training target remain causal. The query can
-            # attend to memory and state but not to the target appended after it.
+            if query_index != action_token_emb.shape[1] - 1:
+                raise ValueError("ACTION_QUERY must be the final ActionMem prefix token.")
+
+            # ACTION_QUERY can attend to memory and state and is permanently
+            # the final prefix token. The current action-code target is never
+            # embedded into this prefix.
             embs.append(action_token_emb[:, query_index:])
             pad_masks.append(action_token_masks[:, query_index:].bool())
             att_masks += [1] * (action_token_emb.shape[1] - query_index)

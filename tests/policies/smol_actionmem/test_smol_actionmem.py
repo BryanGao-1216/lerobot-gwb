@@ -111,24 +111,26 @@ def test_prefix_uses_independent_action_embedding_and_keeps_state_before_query()
             torch.arange(260, dtype=torch.float32)[:, None].expand(-1, 4)
         )
     model.add_image_special_tokens = False
-    model.prefix_length = -1
+    model.prefix_length = 12
     model.state_proj = nn.Linear(2, 4, bias=False)
     model.state_proj.weight.data.copy_(torch.eye(4, 2))
 
-    embeddings, _, _, query_positions = model.embed_prefix(
+    embeddings, padding_masks, _ = model.embed_prefix(
         images=[torch.ones(1, 2, 4)],
         img_masks=[torch.tensor([True])],
         lang_tokens=torch.tensor([[10, 11, 2]]),
         lang_masks=torch.tensor([[True, True, False]]),
-        action_tokens=torch.tensor([[256, 257, 258, 3]]),
-        action_token_masks=torch.ones(1, 4, dtype=torch.bool),
+        action_tokens=torch.tensor([[256, 257, 258]]),
+        action_token_masks=torch.ones(1, 3, dtype=torch.bool),
         state=torch.tensor([[1.0, 2.0]]),
     )
 
     assert torch.equal(embeddings[0, 5:7, 0] / math.sqrt(4), torch.tensor([256.0, 257.0]))
     assert torch.equal(embeddings[0, 7], torch.tensor([1.0, 2.0, 0.0, 0.0]))
-    assert torch.equal(embeddings[0, 8:10, 0] / math.sqrt(4), torch.tensor([258.0, 3.0]))
-    assert query_positions.item() == 8
+    assert embeddings.shape[1] == 12
+    assert not padding_masks[0, 8:11].any()
+    assert padding_masks[0, -1]
+    assert embeddings[0, -1, 0].item() / math.sqrt(4) == 258.0
 
 
 def test_action_objective_is_exactly_256_way():
@@ -142,8 +144,7 @@ def test_action_objective_is_exactly_256_way():
         model.action_classifier.weight[3, 0] = 5.0
 
     logits = model._compute_action_logits(
-        prefix_out=torch.tensor([[[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]]),
-        query_positions=torch.tensor([1]),
+        prefix_out=torch.tensor([[[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]])
     )
     output = model._compute_action_token_objective(
         logits=logits,
@@ -267,8 +268,7 @@ def test_inference_uses_complete_logits_condition_without_argmax_token(monkeypat
     model.sample_noise = lambda shape, device: expected_noise
     received_logits = []
     model._denoise_step_with_action_condition = lambda **kwargs: (
-        received_logits.append(kwargs["action_logits"].detach().clone())
-        or torch.zeros_like(kwargs["x_t"])
+        received_logits.append(kwargs["action_logits"].detach().clone()) or torch.zeros_like(kwargs["x_t"])
     )
     monkeypatch.setattr(
         modeling_smol_actionmem,
@@ -368,8 +368,7 @@ def test_training_stage_handles_new_action_modules(stage, classifier_trainable, 
         parameter.requires_grad is expert_trainable for parameter in model.action_out_proj.parameters()
     )
     assert all(
-        parameter.requires_grad is expert_trainable
-        for parameter in model.action_condition_proj.parameters()
+        parameter.requires_grad is expert_trainable for parameter in model.action_condition_proj.parameters()
     )
     assert all(parameter.requires_grad for parameter in model.action_code_embedding.parameters())
     assert not any(parameter.requires_grad for parameter in model.vlm_with_expert.vlm.lm_head.parameters())

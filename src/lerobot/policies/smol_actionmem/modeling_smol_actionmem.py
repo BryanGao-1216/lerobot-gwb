@@ -50,7 +50,6 @@ from ..smolvla.modeling_smolvla import (
     SmolVLAPolicy,
     VLAFlowMatching,
     make_att_2d_masks,
-    pad_tensor,
 )
 from .configuration_smol_actionmem import SmolActionMemConfig
 from .smolvlm_with_expert import SmolActionMemVLMWithExpertModel
@@ -241,11 +240,11 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         action_token_masks,
         state=None,
     ):
-        """Embed image/task/action-memory/state/query/target in that order.
+        """Embed image/task/action-memory/state/query in that order.
 
-        ACTION_QUERY is causal and therefore cannot observe the current target
-        appended after it, but it can observe action memory and the current
-        robot state placed immediately before it.
+        The current action code is supervision only and is removed by the
+        caller. ACTION_QUERY can observe action memory and the current robot
+        state and is always the final prefix token.
         """
         embs = []
         pad_masks = []
@@ -290,15 +289,15 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         action_token_emb = self.action_code_embedding(action_tokens)
         action_token_emb = action_token_emb * math.sqrt(action_token_emb.shape[-1])
         action_token_emb = action_token_emb.to(dtype=lang_emb.dtype)
-        query_offsets = (
-            (action_tokens == self.action_query_id) & action_token_masks.bool()
-        ).to(torch.int64)
+        query_offsets = ((action_tokens == self.action_query_id) & action_token_masks.bool()).to(torch.int64)
         if not torch.all(query_offsets.sum(dim=1) == 1):
             raise ValueError("Each Smol ActionMem prefix must contain exactly one valid ACTION_QUERY.")
         query_indices = query_offsets.argmax(dim=1)
         if not torch.all(query_indices == query_indices[0]):
             raise ValueError("ACTION_QUERY must have the same sequence position across a batch.")
         query_index = int(query_indices[0].item())
+        if query_index != action_token_emb.shape[1] - 1:
+            raise ValueError("ACTION_QUERY must be the final Smol ActionMem prefix token.")
 
         # Keep memory/control tokens after the task, then insert the current
         # state immediately before ACTION_QUERY.
@@ -322,8 +321,6 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             )
             att_masks += [1] * state_emb.shape[1]
 
-        action_base_position = sum(embedding.shape[1] for embedding in embs)
-        query_positions = torch.full_like(query_indices, action_base_position)
         embs.append(action_token_emb[:, query_index:])
         pad_masks.append(action_token_masks[:, query_index:].bool())
         att_masks += [1] * (action_token_emb.shape[1] - query_index)
@@ -334,16 +331,39 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         attention_blocks = attention_blocks.expand(embeddings.shape[0], -1)
 
         if self.prefix_length > 0 and embeddings.shape[1] < self.prefix_length:
-            embeddings = pad_tensor(embeddings, self.prefix_length, pad_value=0)
-            padding_masks = pad_tensor(padding_masks, self.prefix_length, pad_value=0)
-            attention_blocks = pad_tensor(attention_blocks, self.prefix_length, pad_value=0)
+            # Keep ACTION_QUERY physically last even with a fixed prefix
+            # length. Insert masked padding immediately before it rather than
+            # appending padding after it.
+            padding_length = self.prefix_length - embeddings.shape[1]
+            embedding_padding = torch.zeros(
+                embeddings.shape[0],
+                padding_length,
+                embeddings.shape[2],
+                dtype=embeddings.dtype,
+                device=embeddings.device,
+            )
+            mask_padding = torch.zeros(
+                padding_masks.shape[0],
+                padding_length,
+                dtype=padding_masks.dtype,
+                device=padding_masks.device,
+            )
+            attention_padding = torch.zeros(
+                attention_blocks.shape[0],
+                padding_length,
+                dtype=attention_blocks.dtype,
+                device=attention_blocks.device,
+            )
+            embeddings = torch.cat([embeddings[:, :-1], embedding_padding, embeddings[:, -1:]], dim=1)
+            padding_masks = torch.cat([padding_masks[:, :-1], mask_padding, padding_masks[:, -1:]], dim=1)
+            attention_blocks = torch.cat(
+                [attention_blocks[:, :-1], attention_padding, attention_blocks[:, -1:]], dim=1
+            )
 
-        return embeddings, padding_masks, attention_blocks, query_positions
+        return embeddings, padding_masks, attention_blocks
 
-    def _compute_action_logits(self, prefix_out: Tensor, query_positions: Tensor) -> Tensor:
-        batch_indices = torch.arange(prefix_out.shape[0], device=prefix_out.device)
-        query_hidden = prefix_out[batch_indices, query_positions]
-        query_hidden = query_hidden.to(dtype=self.action_classifier.weight.dtype)
+    def _compute_action_logits(self, prefix_out: Tensor) -> Tensor:
+        query_hidden = prefix_out[:, -1, :].to(dtype=self.action_classifier.weight.dtype)
         return self.action_classifier(query_hidden)
 
     def _condition_flow_hidden(
@@ -403,7 +423,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             # ACTION_QUERY position.
             action_prompt_tokens = action_tokens[:, :-1]
             action_prompt_masks = action_token_masks[:, :-1]
-            prefix_embs, prefix_pad_masks, prefix_att_masks, query_positions = self.embed_prefix(
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
                 images,
                 img_masks,
                 lang_tokens,
@@ -423,7 +443,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
                 # Token-only execution must use all VLM self-attention layers.
                 fill_kv_cache=True,
             )
-            logits = self._compute_action_logits(prefix_out, query_positions)
+            logits = self._compute_action_logits(prefix_out)
             return self._compute_action_token_objective(
                 logits,
                 action_tokens,
@@ -444,7 +464,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         # vector through a stop-gradient continuous residual FiLM path.
         action_prompt_tokens = action_tokens[:, :-1]
         action_prompt_masks = action_token_masks[:, :-1]
-        prefix_embs, prefix_pad_masks, prefix_att_masks, query_positions = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images,
             img_masks,
             lang_tokens,
@@ -467,7 +487,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             fill_kv_cache=False,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
-        logits = self._compute_action_logits(prefix_out, query_positions)
+        logits = self._compute_action_logits(prefix_out)
         suffix_out, condition_metrics = self._condition_flow_hidden(suffix_out, logits)
         flow_losses = F.mse_loss(u_t, self.action_out_proj(suffix_out), reduction="none")
 
@@ -503,7 +523,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
         # First pass: generate from ACTION_QUERY conditioned on the current state.
         action_prompt_tokens = action_tokens[:, :-1]
         action_prompt_masks = action_token_masks[:, :-1]
-        prefix_embs, prefix_pad_masks, prefix_att_masks, query_positions = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images,
             img_masks,
             lang_tokens,
@@ -522,7 +542,7 @@ class SmolActionMemFlowMatching(VLAFlowMatching):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
-        logits = self._compute_action_logits(prefix_out, query_positions)
+        logits = self._compute_action_logits(prefix_out)
 
         if noise is None:
             noise = self.sample_noise(
@@ -718,9 +738,7 @@ class SmolActionMemPolicy(SmolVLAPolicy):
                     "action_condition_gamma_rms": output["action_condition_gamma_rms"].item(),
                     "action_condition_beta_rms": output["action_condition_beta_rms"].item(),
                     "action_condition_logit_std": output["action_condition_logit_std"].item(),
-                    "action_condition_predicted_entropy": output[
-                        "action_condition_predicted_entropy"
-                    ].item(),
+                    "action_condition_predicted_entropy": output["action_condition_predicted_entropy"].item(),
                 }
             )
 
@@ -740,9 +758,7 @@ class SmolActionMemPolicy(SmolVLAPolicy):
                     ).item(),
                     "action_token_accuracy": output["action_token_accuracy"].item(),
                     "action_token_target_rank": output["action_token_target_rank"].item(),
-                    "action_token_soft_target_entropy": output[
-                        "action_token_soft_target_entropy"
-                    ].item(),
+                    "action_token_soft_target_entropy": output["action_token_soft_target_entropy"].item(),
                     "action_token_soft_target_peak_probability": output[
                         "action_token_soft_target_peak_probability"
                     ].item(),

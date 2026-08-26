@@ -55,22 +55,22 @@ def test_embed_prefix_places_state_immediately_before_local_action_query():
         [torch.tensor([True])],
         torch.tensor([[10, 11, 0]]),
         torch.tensor([[True, True, False]]),
-        torch.tensor([[256, 257, 258, 42]]),
-        torch.tensor([[True, True, True, True]]),
+        torch.tensor([[256, 257, 258]]),
+        torch.tensor([[True, True, True]]),
         state=torch.tensor([[3.0, 4.0]]),
     )
 
-    assert embeddings.shape == (1, 10, 2)
+    assert embeddings.shape == (1, 9, 2)
     assert torch.equal(embeddings[0, 5:7, 0], torch.tensor([256.0, 257.0]))
     assert torch.equal(embeddings[0, 7], torch.tensor([3.0, 4.0]))
-    assert torch.equal(embeddings[0, 8:, 0], torch.tensor([258.0, 42.0]))
+    assert embeddings[0, -1, 0].item() == 258.0
     assert torch.equal(
         pad_masks,
-        torch.tensor([[True, True, True, True, False, True, True, True, True, True]]),
+        torch.tensor([[True, True, True, True, False, True, True, True, True]]),
     )
     assert torch.equal(
         attention_blocks,
-        torch.tensor([[False, False, False, False, False, True, True, True, True, True]]),
+        torch.tensor([[False, False, False, False, False, True, True, True, True]]),
     )
 
 
@@ -115,6 +115,29 @@ def test_vlm_only_core_forward_conditions_on_state_and_passes_prototype_distance
     assert output is expected
     assert torch.equal(captured["state"], torch.ones(2, 4))
     assert captured["distances"] is distances
+
+
+def test_action_classifier_reads_final_action_query_hidden_state():
+    model = ActionMemPytorch.__new__(ActionMemPytorch)
+    nn.Module.__init__(model)
+    model.action_classifier = nn.Linear(4, 256)
+    with torch.no_grad():
+        model.action_classifier.weight.zero_()
+        model.action_classifier.bias.zero_()
+        model.action_classifier.weight[7, 2] = 5.0
+        model.action_classifier.weight[8, 2] = -5.0
+
+    logits = model._compute_action_logits(
+        prefix_out=torch.tensor(
+            [
+                [[9.0, 9.0, -9.0, 9.0], [0.0, 0.0, 1.0, 0.0]],
+                [[9.0, 9.0, -9.0, 9.0], [0.0, 0.0, 1.0, 0.0]],
+            ]
+        )
+    )
+
+    assert logits.shape == (2, 256)
+    assert torch.equal(logits.argmax(dim=-1), torch.tensor([7, 7]))
 
 
 def test_gradient_checkpointing_configures_paligemma_decoder_layers():
@@ -295,6 +318,8 @@ def test_actionmem_config_and_stage_specific_trainability():
 
     vlm = StageModel("vlm_only")
     vlm.configure_training_stage()
+    assert vlm.paligemma_with_expert.paligemma.weight.requires_grad
+    assert not vlm.paligemma_with_expert.gemma_expert.weight.requires_grad
     assert vlm.action_classifier.weight.requires_grad
     assert not vlm.action_condition_proj.weight.requires_grad
 
@@ -302,6 +327,10 @@ def test_actionmem_config_and_stage_specific_trainability():
     expert.configure_training_stage()
     assert not expert.action_classifier.weight.requires_grad
     assert expert.action_condition_proj.weight.requires_grad
+
+    joint = StageModel("joint")
+    joint.configure_training_stage()
+    assert all(parameter.requires_grad for parameter in joint.parameters())
 
 
 @pytest.mark.parametrize("stage", ["vlm_only", "action_expert_only", "joint"])
