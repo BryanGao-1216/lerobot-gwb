@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=3,5
+export CUDA_VISIBLE_DEVICES=2,5
 
 accelerate launch \
   --multi_gpu \
@@ -21,14 +21,14 @@ accelerate launch \
   --dataset.rlds_storage_format=hybrid \
   --dataset.root=/data1/gaowenbing/WorkSpace/datasets/OpenX \
   --output_dir=/data1/gaowenbing/WorkSpace/models/smol_actionmem-final \
-  --steps=100000 \
+  --steps=50000 \
   --policy.tensorboard_log_freq=10 \
   --policy.optimizer_lr=3e-5 \
   --policy.optimizer_grad_clip_norm=5 \
   --policy.scheduler_warmup_steps=5000 \
   --policy.scheduler_decay_steps=100000 \
   --policy.scheduler_decay_lr=5e-6 \
-  --batch_size=16 \
+  --batch_size=100 \
   --eval_step=0 \
   --policy.gradient_checkpointing=false \
   --policy.tensorboard_enable=true \
