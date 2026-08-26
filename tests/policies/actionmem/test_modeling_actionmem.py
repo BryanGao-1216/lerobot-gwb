@@ -7,7 +7,11 @@ from transformers.models.gemma.configuration_gemma import GemmaConfig
 
 from lerobot.policies.action_code import ActionCodeLayout
 from lerobot.policies.actionmem.configuration_actionmem import ActionMemConfig
-from lerobot.policies.actionmem.modeling_actionmem import ActionMemPolicy, ActionMemPytorch
+from lerobot.policies.actionmem.modeling_actionmem import (
+    ActionMemPolicy,
+    ActionMemPytorch,
+    PaliGemmaWithExpertModel,
+)
 from lerobot.policies.pi_gemma import PiGemmaModel
 from lerobot.utils.constants import (
     ACTION,
@@ -27,6 +31,28 @@ class _DummyPaliGemma:
     def embed_language_tokens(self, tokens):
         values = tokens.to(torch.float32)
         return torch.stack([values, values], dim=-1)
+
+
+def test_actionmem_fsdp_keeps_uniform_fp32_master_parameters(monkeypatch):
+    model = PaliGemmaWithExpertModel.__new__(PaliGemmaWithExpertModel)
+    nn.Module.__init__(model)
+    model.projection = nn.Linear(2, 2)
+
+    monkeypatch.setenv("ACCELERATE_USE_FSDP", "true")
+    model.to_bfloat16_for_selected_params("bfloat16")
+
+    assert model.projection.weight.dtype == torch.float32
+
+
+def test_actionmem_non_fsdp_uses_configured_bfloat16(monkeypatch):
+    model = PaliGemmaWithExpertModel.__new__(PaliGemmaWithExpertModel)
+    nn.Module.__init__(model)
+    model.projection = nn.Linear(2, 2)
+
+    monkeypatch.delenv("ACCELERATE_USE_FSDP", raising=False)
+    model.to_bfloat16_for_selected_params("bfloat16")
+
+    assert model.projection.weight.dtype == torch.bfloat16
 
 
 class _CodeEmbedding(nn.Module):
@@ -270,6 +296,8 @@ def test_policy_training_stages_select_effect_code_and_flow_objectives(
     policy._preprocess_images = lambda batch: ([], [])
     policy.prepare_state = lambda batch: batch[OBS_STATE]
     policy.prepare_action = lambda batch: batch[ACTION]
+    module_forward_calls = []
+    policy.model.register_forward_pre_hook(lambda *_: module_forward_calls.append(True))
     distances = torch.rand(2, 256)
     batch = {
         OBS_LANGUAGE_TOKENS: torch.ones(2, 3, dtype=torch.long),
@@ -287,6 +315,7 @@ def test_policy_training_stages_select_effect_code_and_flow_objectives(
     assert scalar_loss.item() == expected_scalar
     assert torch.equal(per_sample_loss, expected_per_sample)
     assert policy.model.calls == [expected_call, expected_call]
+    assert len(module_forward_calls) == 2
     assert all(value is distances for value in policy.model.distances)
     if stage != "action_expert_only":
         assert metrics["action_token_kl_loss"] == 3.0

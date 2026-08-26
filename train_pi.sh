@@ -2,17 +2,27 @@
 
 export CUDA_VISIBLE_DEVICES=3,5
 
+# 可切换为 joint、vlm_only 或 action_expert_only；三种模式均使用下面的 FULL_SHARD FSDP。
 accelerate launch \
-  --multi_gpu \
+  --use_fsdp \
   --num_processes=2 \
   --num_machines=1 \
+  --mixed_precision=bf16 \
+  --fsdp_version=1 \
+  --fsdp_sharding_strategy=FULL_SHARD \
+  --fsdp_auto_wrap_policy=TRANSFORMER_BASED_WRAP \
+  --fsdp_transformer_layer_cls_to_wrap=ActionMemPytorch \
+  --fsdp_backward_prefetch=BACKWARD_PRE \
+  --fsdp_forward_prefetch=false \
+  --fsdp_use_orig_params=true \
+  --fsdp_state_dict_type=FULL_STATE_DICT \
   --main_process_port=29502 \
   -m lerobot.scripts.lerobot_train \
   --policy.path=/data1/gaowenbing/WorkSpace/models/actionmem-pretrained/checkpoints/last/pretrained_model \
   --policy.effect_tokenizer_checkpoint_path=/data1/gaowenbing/WorkSpace/MyStudy/effectTokenizer/outputs/effect_vqvae.pt \
   --policy.use_peft=false \
   --policy.train_expert_only=false \
-  --policy.training_stage=vlm_only \
+  --policy.training_stage=joint \
   --policy.freeze_vision_encoder=false \
   --policy.dtype=bfloat16 \
   --policy.input_features=null \

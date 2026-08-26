@@ -16,6 +16,7 @@
 
 import builtins
 import logging
+import os
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, Unpack
@@ -256,6 +257,17 @@ class PaliGemmaWithExpertModel(
 
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
+            if os.environ.get("ACCELERATE_USE_FSDP", "false").lower() == "true":
+                # ActionMemPytorch is deliberately wrapped as one FSDP unit.
+                # FSDP1 requires every parameter flattened into that unit to
+                # have one storage dtype. Keep the initialized/master weights
+                # uniformly fp32; Accelerate's FSDP mixed-precision policy
+                # casts gathered parameters to bf16 for forward/backward.
+                logging.info(
+                    "Keeping ActionMem parameters in float32 before FSDP sharding; "
+                    "FSDP mixed precision will execute the model in bfloat16."
+                )
+                return
             self.to(dtype=torch.bfloat16)
         elif precision == "float32":
             self.to(dtype=torch.float32)
@@ -295,10 +307,13 @@ class PaliGemmaWithExpertModel(
             self.paligemma.eval()
 
     def embed_image(self, image: torch.Tensor):
-        # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32). Align with PI05.
+        # Outside FSDP the vision tower is deliberately fp32. With FSDP mixed
+        # precision, its gathered parameter view is bf16, so match the live
+        # parameter dtype instead of assuming fp32.
         out_dtype = image.dtype
-        if image.dtype != torch.float32:
-            image = image.to(torch.float32)
+        vision_dtype = next(self.paligemma.model.vision_tower.parameters()).dtype
+        if image.dtype != vision_dtype:
+            image = image.to(vision_dtype)
         image_outputs = self.paligemma.model.get_image_features(image)
         features = image_outputs.pooler_output
         if features.dtype != out_dtype:
@@ -412,7 +427,14 @@ class PaliGemmaWithExpertModel(
 
 
 class ActionMemPytorch(nn.Module):  # see openpi `PI0Pytorch`
-    """Core ActionMem PyTorch model."""
+    """Core ActionMem model and the supported FSDP auto-wrap boundary.
+
+    The joint PI0 layer path intentionally couples PaliGemma and the action
+    expert by reading both decoder layers inside one computation. Wrapping the
+    individual decoder layers with FSDP would therefore bypass their FSDP
+    ``forward`` hooks. Wrap this complete class instead: every parameter access
+    for all three training stages then occurs inside one FSDP-managed forward.
+    """
 
     def __init__(self, config: ActionMemConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
@@ -1499,7 +1521,11 @@ class ActionMemPolicy(PreTrainedPolicy):
         time = self.model.sample_time(actions.shape[0], actions.device) if compute_flow else None
 
         # Compute loss
-        model_output = self.model.forward(
+        # Enter through Module.__call__. Besides regular PyTorch hooks, this is
+        # the boundary used when ActionMemPytorch is auto-wrapped as one FSDP
+        # unit. Calling the unwrapped core's forward directly would bypass that
+        # module boundary in distributed full-parameter training.
+        model_output = self.model(
             images,
             img_masks,
             lang_tokens,
