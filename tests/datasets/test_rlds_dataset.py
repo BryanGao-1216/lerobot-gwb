@@ -32,7 +32,9 @@ from lerobot.datasets.rlds_dataset import (
     _attach_normalized_action_tokenizer_input,
     _filter_vqvla_action_chunk,
     _load_mixture_spec,
+    _repeat_last_action_for_padded_targets,
     _resolve_rlds_source_format,
+    _slice_action_chunk_with_last_frame,
     _validate_statistics,
 )
 from lerobot.datasets.rlds_webdataset import (
@@ -82,6 +84,10 @@ class _NumpyTensorFlow:
     @staticmethod
     def broadcast_to(value, shape):
         return np.broadcast_to(value, shape)
+
+    @staticmethod
+    def range(limit):
+        return np.arange(limit)
 
 
 def test_load_explicit_rlds_mixture(tmp_path):
@@ -460,6 +466,40 @@ def test_vqvla_chunk_filter_reads_shared_normalized_action_without_overwriting_r
     assert _filter_vqvla_action_chunk(frame, chunk_filter)
     assert np.all(observed["action"] == 0.25)
     assert np.all(frame["action"] == 10.0)
+
+
+def test_tfds_tail_chunks_repeat_final_action_in_every_dimension():
+    trajectory = {
+        "action": np.array(
+            [
+                [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [0.0, 0.0]],
+                [[2.0, 20.0], [3.0, 30.0], [0.0, 0.0], [0.0, 0.0]],
+                [[3.0, 30.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+            ],
+            dtype=np.float32,
+        )
+    }
+
+    result = _repeat_last_action_for_padded_targets(trajectory, horizon=4, tf=_NumpyTensorFlow)
+
+    assert np.array_equal(
+        result["action"],
+        [
+            [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [3.0, 30.0]],
+            [[2.0, 20.0], [3.0, 30.0], [3.0, 30.0], [3.0, 30.0]],
+            [[3.0, 30.0], [3.0, 30.0], [3.0, 30.0], [3.0, 30.0]],
+        ],
+    )
+
+
+def test_webdataset_tail_chunks_repeat_final_action_and_keep_last_start():
+    action = np.array([[1.0], [2.0], [3.0]], dtype=np.float32)
+
+    penultimate = _slice_action_chunk_with_last_frame(action, start=1, horizon=4)
+    final = _slice_action_chunk_with_last_frame(action, start=2, horizon=4)
+
+    assert np.array_equal(penultimate[:, 0], [2.0, 3.0, 3.0, 3.0])
+    assert np.array_equal(final[:, 0], [3.0, 3.0, 3.0, 3.0])
 
 
 def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():

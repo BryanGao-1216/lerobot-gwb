@@ -357,9 +357,33 @@ def _filter_vqvla_action_chunk(frame: Mapping[str, Any], chunk_filter_fn: Callab
     return chunk_filter_fn(filter_frame)
 
 
-def _trim_invalid_chunk_targets(trajectory: dict[str, Any], horizon: int, tf: Any):
-    valid_length = tf.maximum(tf.shape(trajectory["action"])[0] - horizon + 1, 0)
-    return tf.nest.map_structure(lambda value: value[:valid_length], trajectory)
+def _repeat_last_action_for_padded_targets(trajectory: dict[str, Any], horizon: int, tf: Any):
+    """Replace every future action past the episode boundary with its final action.
+
+    The vendored OXE chunk transform normally makes out-of-range relative
+    actions neutral (zero) and absolute actions repeat. ActionMem instead uses
+    one endpoint-effect code for the complete chunk, so all action dimensions
+    follow one unambiguous rule: clamp future indices to the episode's final
+    action. No frame at the end of the episode is discarded.
+    """
+    action = trajectory["action"]
+    trajectory_length = tf.shape(action)[0]
+    future_indices = tf.range(trajectory_length)[:, None] + tf.range(horizon)[None, :]
+    is_past_episode = future_indices >= trajectory_length
+    final_action = action[-1, 0]
+    trajectory["action"] = tf.where(is_past_episode[:, :, None], final_action[None, None], action)
+    return trajectory
+
+
+def _slice_action_chunk_with_last_frame(action: np.ndarray, start: int, horizon: int) -> np.ndarray:
+    """Slice a future action chunk and repeat its final available frame to ``horizon``."""
+    chunk = action[start : start + horizon]
+    if chunk.shape[0] == 0:
+        raise ValueError("Cannot construct an action chunk from an empty episode.")
+    missing = horizon - chunk.shape[0]
+    if missing > 0:
+        chunk = np.concatenate([chunk, np.repeat(chunk[-1:], missing, axis=0)], axis=0)
+    return chunk
 
 
 def _pad_trajectory_proprio(trajectory: dict[str, Any], state_dim: int, tf: Any):
@@ -700,13 +724,9 @@ class ActionMemRLDSDataset(IterableDataset):
                 kwargs["name"], statistics, action_dim=self.action_dim, state_dim=self.state_dim
             )
             all_statistics.append(statistics)
-            valid_sizes.append(
-                max(
-                    int(statistics["num_transitions"])
-                    - (self.action_horizon - 1) * int(statistics["num_trajectories"]),
-                    1,
-                )
-            )
+            # Every transition is now a valid chunk start because future
+            # indices beyond an episode repeat that episode's final action.
+            valid_sizes.append(max(int(statistics["num_transitions"]), 1))
 
         effective_weights = base_weights.copy()
         if self.dataset_config.rlds_balance_weights:
@@ -804,14 +824,18 @@ class ActionMemRLDSDataset(IterableDataset):
             )
             source = source.traj_map(
                 partial(
-                    _attach_normalized_action_tokenizer_input,
-                    statistics=statistics,
+                    _repeat_last_action_for_padded_targets,
+                    horizon=self.action_horizon,
                     tf=self.backend.tf,
                 ),
                 threads_per_dataset,
             )
             source = source.traj_map(
-                partial(_trim_invalid_chunk_targets, horizon=self.action_horizon, tf=self.backend.tf),
+                partial(
+                    _attach_normalized_action_tokenizer_input,
+                    statistics=statistics,
+                    tf=self.backend.tf,
+                ),
                 threads_per_dataset,
             ).flatten(num_parallel_calls=threads_per_dataset)
             if chunk_filter_fn is not None:
@@ -883,13 +907,16 @@ class ActionMemRLDSDataset(IterableDataset):
                     _decode_text(value) for value in language
                 ):
                     continue
-                valid_length = action.shape[0] - self.action_horizon + 1
-                if valid_length <= 0:
+                if action.shape[0] == 0:
                     continue
-                frame_indices = np.arange(valid_length)
+                frame_indices = np.arange(action.shape[0])
                 frame_rng.shuffle(frame_indices)
                 for frame_index in frame_indices:
-                    action_chunk = action[frame_index : frame_index + self.action_horizon]
+                    action_chunk = _slice_action_chunk_with_last_frame(
+                        action,
+                        int(frame_index),
+                        self.action_horizon,
+                    )
                     normalized_chunk = np.clip(
                         2.0 * (action_chunk - q01) / (q99 - q01 + 1e-8) - 1.0,
                         -1.0,

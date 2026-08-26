@@ -19,11 +19,14 @@ from lerobot.policies.smol_actionmem.processor_smol_actionmem import (
 from lerobot.processor.converters import create_transition
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import (
+    ACTION,
     ACTION_TOKEN,
     ACTION_TOKEN_MASK,
     ACTION_TOKENIZER_INPUT,
     ACTION_TOKENS,
+    OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
 )
 
 
@@ -47,6 +50,12 @@ def test_policy_is_independently_registered():
 def test_config_rejects_non_positive_soft_target_temperature():
     with pytest.raises(ValueError, match="action_token_soft_target_temperature"):
         SmolActionMemConfig(action_token_soft_target_temperature=0)
+
+
+def test_config_keeps_all_tail_chunk_starts_for_old_checkpoints():
+    config = SmolActionMemConfig(drop_n_last_frames=9)
+
+    assert config.drop_n_last_frames == 0
 
 
 def test_processor_emits_local_classes_instead_of_language_token_ids():
@@ -98,6 +107,56 @@ def test_flow_target_uses_preprocessor_action_not_tokenizer_input():
     assert torch.equal(target[..., :7], processed_actions)
     assert not torch.equal(target[..., :7], tokenizer_actions)
     assert torch.count_nonzero(target[..., 7:]) == 0
+
+
+def test_flow_loss_includes_last_frame_repeated_tail_targets():
+    class _FlowModel(nn.Module):
+        @staticmethod
+        def sample_time(batch_size, device):
+            return torch.ones(batch_size, device=device)
+
+        def forward(self, *args, **kwargs):
+            del args, kwargs
+            zero = torch.tensor(0.0)
+            return {
+                "flow_losses": torch.tensor([[[1.0], [4.0], [9.0]]]),
+                "action_condition_gamma_rms": zero,
+                "action_condition_beta_rms": zero,
+                "action_condition_logit_std": zero,
+                "action_condition_predicted_entropy": zero,
+            }
+
+    policy = SmolActionMemPolicy.__new__(SmolActionMemPolicy)
+    nn.Module.__init__(policy)
+    policy.config = type(
+        "Config",
+        (),
+        {
+            "adapt_to_pi_aloha": False,
+            "training_stage": "action_expert_only",
+            "action_feature": type("Feature", (), {"shape": (1,)})(),
+            "flow_loss_weight": 1.0,
+            "action_token_loss_weight": 0.1,
+        },
+    )()
+    policy.model = _FlowModel()
+    policy.prepare_images = lambda batch: ([], [])
+    policy.prepare_state = lambda batch: batch[OBS_STATE]
+    policy.prepare_action = lambda batch: batch[ACTION]
+    batch = {
+        ACTION: torch.zeros(1, 3, 1),
+        "action_is_pad": torch.tensor([[False, True, True]]),
+        OBS_STATE: torch.zeros(1, 1),
+        OBS_LANGUAGE_TOKENS: torch.ones(1, 2, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 2, dtype=torch.bool),
+        ACTION_TOKENS: torch.zeros(1, 4, dtype=torch.long),
+        ACTION_TOKEN_MASK: torch.ones(1, 4, dtype=torch.bool),
+    }
+
+    loss, metrics = policy.forward(batch)
+
+    assert loss.item() == pytest.approx((1.0 + 4.0 + 9.0) / 3)
+    assert metrics["flow_loss"] == pytest.approx((1.0 + 4.0 + 9.0) / 3)
 
 
 def test_prefix_uses_independent_action_embedding_and_keeps_state_before_query():

@@ -717,17 +717,12 @@ class SmolActionMemPolicy(SmolVLAPolicy):
         if compute_flow:
             action_dim = self.config.action_feature.shape[0]
             flow_losses = output["flow_losses"][:, :, :action_dim]
-            actions_is_pad = batch.get("action_is_pad")
-            if actions_is_pad is None:
-                flow_loss = flow_losses.mean()
-                per_sample_flow = flow_losses.mean(dim=(1, 2))
-            else:
-                valid = (~actions_is_pad).unsqueeze(-1).to(flow_losses.dtype)
-                masked_flow = flow_losses * valid
-                flow_loss = masked_flow.sum() / (valid.sum() * flow_losses.shape[-1]).clamp_min(1)
-                per_sample_flow = masked_flow.sum(dim=(1, 2)) / (
-                    valid.sum(dim=(1, 2)) * flow_losses.shape[-1]
-                ).clamp_min(1)
+            # Dataset queries clamp future indices to the final episode frame.
+            # These positions are deliberate training targets rather than
+            # missing data, even if a LeRobot dataset still exposes the
+            # historical action_is_pad marker for the clamped indices.
+            flow_loss = flow_losses.mean()
+            per_sample_flow = flow_losses.mean(dim=(1, 2))
             scalar_terms.append(self.config.flow_loss_weight * flow_loss)
             per_sample_terms.append(self.config.flow_loss_weight * per_sample_flow)
             metrics.update(

@@ -92,7 +92,7 @@ def _make_target_config(
         {
             "chunk_size": effect_metadata.horizon,
             "n_action_steps": n_action_steps or effect_metadata.horizon,
-            "drop_n_last_frames": effect_metadata.horizon - 1,
+            "drop_n_last_frames": 0,
             "num_inference_steps": int(getattr(source_config, "num_steps", 10)),
             "effect_tokenizer_checkpoint_path": effect_metadata.checkpoint_path,
             "action_codebook_size": effect_metadata.codebook_size,
