@@ -21,7 +21,7 @@ accelerate launch \
   --dataset.rlds_storage_format=hybrid \
   --dataset.root=/data1/gaowenbing/WorkSpace/datasets/OpenX \
   --output_dir=/data1/gaowenbing/WorkSpace/models/smol_actionmem-final \
-  --steps=50000 \
+  --steps=60000 \
   --policy.tensorboard_log_freq=10 \
   --policy.optimizer_lr=3e-5 \
   --policy.optimizer_grad_clip_norm=5 \
