@@ -1,7 +1,6 @@
 #!/bin/sh
 
 export CUDA_VISIBLE_DEVICES=0
-export MPLBACKEND=Agg
 
 python action_token_eval/evaluate_action_tokens.py \
   --policy-path=/data1/gaowenbing/WorkSpace/models/smol_actionmem-final/checkpoints/last/pretrained_model \

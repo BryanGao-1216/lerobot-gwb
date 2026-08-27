@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smol ActionMem action-token evaluation</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page: light-dark(#f7f8fb, #111318);
+      --surface: light-dark(#ffffff, #1a1d24);
+      --surface-2: light-dark(#f1f3f7, #232731);
+      --text: light-dark(#18202a, #edf1f7);
+      --muted: light-dark(#637083, #aab4c3);
+      --border: light-dark(#d8dde6, #39404d);
+      --grid: light-dark(#e3e7ee, #333946);
+      --truth: #ff006e;
+      --series-1: #0077bb;
+      --series-2: #33aa55;
+      --series-3: #ee7733;
+      --series-4: #aa4499;
+      --series-5: #00a6a6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--text);
+      font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    #action-token-report { max-width: 1720px; margin: 0 auto; padding: 22px; }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: clamp(22px, 2.5vw, 34px); letter-spacing: -0.025em; }
+    .subtitle { color: var(--muted); margin-top: 5px; }
+    .navigation { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    button, select {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      min-height: 36px;
+      padding: 7px 11px;
+      border-radius: 7px;
+      font: inherit;
+    }
+    button { cursor: pointer; }
+    button:hover { border-color: var(--muted); }
+    button:disabled { cursor: default; opacity: .45; }
+    .sample-meta {
+      display: grid;
+      grid-template-columns: minmax(180px, .7fr) minmax(320px, 2fr);
+      gap: 10px 24px;
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 10px;
+      margin-bottom: 12px;
+    }
+    .meta-label { display: block; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    .meta-value { display: block; margin-top: 3px; overflow-wrap: anywhere; }
+    .legend { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 16px; min-height: 42px; }
+    .legend button {
+      min-height: 30px;
+      padding: 3px 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .legend button[aria-pressed="false"] { opacity: .34; text-decoration: line-through; }
+    .swatch { width: 21px; height: 4px; border-radius: 2px; flex: 0 0 auto; }
+    .charts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .chart {
+      min-width: 0;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .chart-header { padding: 11px 13px 0; }
+    .chart-title { font-weight: 650; }
+    .chart-hint { color: var(--muted); font-size: 12px; margin-top: 2px; min-height: 18px; }
+    canvas { display: block; width: 100%; height: 440px; touch-action: none; }
+    .footnote { color: var(--muted); margin: 13px 2px 0; font-size: 12px; }
+    .tooltip {
+      position: fixed;
+      z-index: 20;
+      display: none;
+      pointer-events: none;
+      max-width: 310px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: 0 8px 24px #0003;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .tooltip strong { display: block; margin-bottom: 3px; }
+    @media (max-width: 1080px) {
+      header { align-items: start; flex-direction: column; }
+      .charts { grid-template-columns: 1fr; }
+      canvas { height: 390px; }
+    }
+    @media (max-width: 620px) {
+      #action-token-report { padding: 12px; }
+      .sample-meta { grid-template-columns: 1fr; }
+      canvas { height: 350px; }
+    }
+  </style>
+</head>
+<body>
+  <main id="action-token-report">
+    <header>
+      <div>
+        <h1>Smol ActionMem action-token evaluation</h1>
+        <div class="subtitle" id="run-summary"></div>
+      </div>
+      <div class="navigation">
+        <button type="button" id="previous-sample" aria-label="Previous sample">← Previous</button>
+        <select id="sample-selector" aria-label="Select evaluation sample"></select>
+        <button type="button" id="next-sample" aria-label="Next sample">Next →</button>
+      </div>
+    </header>
+
+    <section class="sample-meta" aria-live="polite">
+      <div><span class="meta-label">Dataset</span><span class="meta-value" id="dataset-name"></span></div>
+      <div><span class="meta-label">Task</span><span class="meta-value" id="task-name"></span></div>
+    </section>
+
+    <nav class="legend" id="series-legend" aria-label="Toggle action trajectories"></nav>
+
+    <section class="charts">
+      <article class="chart">
+        <div class="chart-header">
+          <div class="chart-title">End-effector position change</div>
+          <div class="chart-hint">Drag to rotate · wheel to zoom · double-click to reset</div>
+        </div>
+        <canvas id="position-chart" aria-label="Interactive three-dimensional XYZ position trajectory"></canvas>
+      </article>
+      <article class="chart">
+        <div class="chart-header">
+          <div class="chart-title">End-effector angle change</div>
+          <div class="chart-hint">Drag to rotate · wheel to zoom · double-click to reset</div>
+        </div>
+        <canvas id="rotation-chart" aria-label="Interactive three-dimensional roll pitch yaw trajectory"></canvas>
+      </article>
+      <article class="chart">
+        <div class="chart-header">
+          <div class="chart-title">Gripper opening change</div>
+          <div class="chart-hint">Move the pointer across steps to compare all visible trajectories</div>
+        </div>
+        <canvas id="gripper-chart" aria-label="Interactive gripper opening trajectory by action step"></canvas>
+      </article>
+    </section>
+    <div class="footnote">Coordinates are per-dataset q01/q99-normalized OXE endpoint effects. Token prototypes are straight endpoint paths; ground truth is the accumulated action chunk.</div>
+    <div class="tooltip" id="chart-tooltip" role="tooltip"></div>
+  </main>
+
+  <script id="action-token-data" type="application/json">__ACTION_TOKEN_EVAL_DATA__</script>
+  <script>
+  (() => {
+    "use strict";
+    const report = JSON.parse(document.getElementById("action-token-data").textContent);
+    const root = document.getElementById("action-token-report");
+    const tooltip = document.getElementById("chart-tooltip");
+    const selector = document.getElementById("sample-selector");
+    const previousButton = document.getElementById("previous-sample");
+    const nextButton = document.getElementById("next-sample");
+    const legend = document.getElementById("series-legend");
+    const truthColor = "#ff006e";
+    const predictionColors = ["#0077bb", "#33aa55", "#ee7733", "#aa4499", "#00a6a6"];
+    let selectedIndex = 0;
+    let visible = new Map();
+
+    const colorCache = new Map();
+    const cssColor = name => {
+      if (colorCache.has(name)) return colorCache.get(name);
+      const probe = document.createElement("span");
+      probe.style.color = `var(${name})`; probe.style.display = "none"; root.appendChild(probe);
+      const resolved = getComputedStyle(probe).color; probe.remove(); colorCache.set(name, resolved);
+      return resolved;
+    };
+    const finiteExtent = values => {
+      const finite = values.filter(Number.isFinite);
+      if (!finite.length) return [-1, 1];
+      let lo = Math.min(...finite), hi = Math.max(...finite);
+      if (Math.abs(hi - lo) < 1e-8) { const pad = Math.max(Math.abs(lo) * .2, .1); lo -= pad; hi += pad; }
+      return [lo, hi];
+    };
+    const cumulative3 = (chunk, start) => {
+      const points = [[0, 0, 0]];
+      const total = [0, 0, 0];
+      chunk.forEach(action => {
+        for (let axis = 0; axis < 3; axis++) total[axis] += action[start + axis];
+        points.push([...total]);
+      });
+      return points;
+    };
+    const straight3 = (prototype, start, horizon) => Array.from({length: horizon + 1}, (_, step) => {
+      const progress = step / horizon;
+      return [prototype[start] * progress, prototype[start + 1] * progress, prototype[start + 2] * progress];
+    });
+    const buildSeries = sample => {
+      const horizon = sample.true_action_chunk.length;
+      const initialGripper = sample.true_action_chunk[0][6];
+      const series = [{
+        key: "truth", name: "Ground truth", color: truthColor, truth: true,
+        position: cumulative3(sample.true_action_chunk, 0),
+        rotation: cumulative3(sample.true_action_chunk, 3),
+        gripper: [0, ...sample.true_action_chunk.map(action => action[6] - initialGripper)]
+      }];
+      sample.top_tokens.forEach((token, index) => {
+        const prototype = sample.decoded_effect_prototypes[index];
+        series.push({
+          key: `token-${token}`,
+          name: `Top ${index + 1} · token ${token} · p=${sample.top_probabilities[index].toFixed(4)}`,
+          color: predictionColors[index % predictionColors.length], truth: false,
+          position: straight3(prototype, 0, horizon),
+          rotation: straight3(prototype, 3, horizon),
+          gripper: Array.from({length: horizon + 1}, (_, step) => prototype[6] * step / horizon)
+        });
+      });
+      return series;
+    };
+    const fitCanvas = canvas => {
+      const rect = canvas.getBoundingClientRect();
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const width = Math.max(320, Math.round(rect.width));
+      const height = Math.max(260, Math.round(rect.height));
+      if (canvas.width !== width * ratio || canvas.height !== height * ratio) {
+        canvas.width = width * ratio; canvas.height = height * ratio;
+      }
+      const context = canvas.getContext("2d");
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      return {context, width, height};
+    };
+    const showTooltip = (event, title, lines) => {
+      tooltip.replaceChildren();
+      const strong = document.createElement("strong"); strong.textContent = title; tooltip.appendChild(strong);
+      lines.forEach(line => { const row = document.createElement("div"); row.textContent = line; tooltip.appendChild(row); });
+      tooltip.style.display = "block";
+      const x = Math.min(event.clientX + 14, window.innerWidth - tooltip.offsetWidth - 8);
+      const y = Math.min(event.clientY + 14, window.innerHeight - tooltip.offsetHeight - 8);
+      tooltip.style.left = `${Math.max(8, x)}px`; tooltip.style.top = `${Math.max(8, y)}px`;
+    };
+    const hideTooltip = () => { tooltip.style.display = "none"; };
+
+    class Plot3D {
+      constructor(canvas, field, labels) {
+        this.canvas = canvas; this.field = field; this.labels = labels;
+        this.series = []; this.yaw = -.72; this.pitch = .52; this.zoom = 1; this.drag = null; this.projected = [];
+        canvas.addEventListener("pointerdown", event => { this.drag = {x: event.clientX, y: event.clientY}; canvas.setPointerCapture(event.pointerId); hideTooltip(); });
+        canvas.addEventListener("pointerup", () => { this.drag = null; });
+        canvas.addEventListener("pointercancel", () => { this.drag = null; });
+        canvas.addEventListener("pointermove", event => this.pointerMove(event));
+        canvas.addEventListener("pointerleave", () => { if (!this.drag) hideTooltip(); });
+        canvas.addEventListener("wheel", event => { event.preventDefault(); this.zoom = Math.max(.45, Math.min(4, this.zoom * Math.exp(-event.deltaY * .001))); this.draw(); }, {passive: false});
+        canvas.addEventListener("dblclick", () => { this.yaw = -.72; this.pitch = .52; this.zoom = 1; this.draw(); });
+      }
+      setSeries(series) { this.series = series; this.yaw = -.72; this.pitch = .52; this.zoom = 1; this.draw(); }
+      rotate(point) {
+        const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw), cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
+        const x = cy * point[0] - sy * point[1];
+        const y = sy * point[0] + cy * point[1];
+        return [x, cp * point[2] - sp * y, sp * point[2] + cp * y];
+      }
+      pointerMove(event) {
+        if (this.drag) {
+          this.yaw += (event.clientX - this.drag.x) * .012;
+          this.pitch = Math.max(-1.45, Math.min(1.45, this.pitch + (event.clientY - this.drag.y) * .012));
+          this.drag = {x: event.clientX, y: event.clientY}; this.draw(); return;
+        }
+        const rect = this.canvas.getBoundingClientRect();
+        const x = event.clientX - rect.left, y = event.clientY - rect.top;
+        let nearest = null;
+        this.projected.forEach(point => { const distance = Math.hypot(point.x - x, point.y - y); if (distance < 15 && (!nearest || distance < nearest.distance)) nearest = {...point, distance}; });
+        if (!nearest) { hideTooltip(); return; }
+        showTooltip(event, nearest.name, [`Step ${nearest.step}`, `${this.labels[0]} ${nearest.value[0].toFixed(4)}`, `${this.labels[1]} ${nearest.value[1].toFixed(4)}`, `${this.labels[2]} ${nearest.value[2].toFixed(4)}`]);
+      }
+      draw() {
+        const {context: ctx, width, height} = fitCanvas(this.canvas);
+        ctx.clearRect(0, 0, width, height);
+        const shown = this.series.filter(series => visible.get(series.key) !== false);
+        const rotated = shown.flatMap(series => series[this.field].map(point => this.rotate(point)));
+        if (!rotated.length) return;
+        const xExtent = finiteExtent(rotated.map(point => point[0]));
+        const yExtent = finiteExtent(rotated.map(point => point[1]));
+        const xCenter = (xExtent[0] + xExtent[1]) / 2, yCenter = (yExtent[0] + yExtent[1]) / 2;
+        const span = Math.max(xExtent[1] - xExtent[0], yExtent[1] - yExtent[0], 1e-8);
+        const scale = Math.min(width - 72, height - 68) / span * .78 * this.zoom;
+        const project = point => { const value = this.rotate(point); return [width / 2 + (value[0] - xCenter) * scale, height / 2 - (value[1] - yCenter) * scale]; };
+        ctx.strokeStyle = cssColor("--grid"); ctx.lineWidth = 1;
+        for (let index = 1; index < 5; index++) { const y = 28 + index * (height - 56) / 5; ctx.beginPath(); ctx.moveTo(28, y); ctx.lineTo(width - 20, y); ctx.stroke(); }
+        this.projected = [];
+        shown.slice().reverse().forEach(series => {
+          const points = series[this.field].map(project);
+          ctx.strokeStyle = series.color; ctx.lineWidth = series.truth ? 4 : 2.3;
+          ctx.setLineDash(series.truth ? [9, 6] : []); ctx.beginPath();
+          points.forEach((point, index) => index ? ctx.lineTo(point[0], point[1]) : ctx.moveTo(point[0], point[1])); ctx.stroke(); ctx.setLineDash([]);
+          points.forEach((point, step) => {
+            if (series.truth || step === points.length - 1) {
+              ctx.fillStyle = series.color; ctx.beginPath(); ctx.arc(point[0], point[1], series.truth ? 3.5 : 5, 0, Math.PI * 2); ctx.fill();
+            }
+            this.projected.push({x: point[0], y: point[1], name: series.name, step, value: series[this.field][step]});
+          });
+        });
+        ctx.fillStyle = cssColor("--muted"); ctx.font = "12px system-ui"; ctx.fillText(`${this.labels.join(" / ")} · orthographic view`, 12, height - 12);
+      }
+    }
+
+    class Plot2D {
+      constructor(canvas) {
+        this.canvas = canvas; this.series = []; this.points = [];
+        canvas.addEventListener("pointermove", event => this.pointerMove(event));
+        canvas.addEventListener("pointerleave", hideTooltip);
+      }
+      setSeries(series) { this.series = series; this.draw(); }
+      pointerMove(event) {
+        const rect = this.canvas.getBoundingClientRect(); const x = event.clientX - rect.left;
+        if (!this.points.length) return;
+        const step = Math.max(0, Math.min(this.points[0].values.length - 1, Math.round((x - this.plot.left) / this.plot.width * (this.points[0].values.length - 1))));
+        const lines = this.points.map(series => `${series.name}: ${series.values[step].toFixed(4)}`);
+        showTooltip(event, `Action step ${step}`, lines);
+      }
+      draw() {
+        const {context: ctx, width, height} = fitCanvas(this.canvas);
+        ctx.clearRect(0, 0, width, height);
+        const shown = this.series.filter(series => visible.get(series.key) !== false);
+        this.points = shown.map(series => ({name: series.name, color: series.color, truth: series.truth, values: series.gripper}));
+        if (!shown.length) return;
+        const margin = {left: 63, right: 18, top: 26, bottom: 52};
+        this.plot = {left: margin.left, top: margin.top, width: width - margin.left - margin.right, height: height - margin.top - margin.bottom};
+        const horizon = shown[0].gripper.length - 1;
+        const extent = finiteExtent(shown.flatMap(series => series.gripper));
+        const padding = (extent[1] - extent[0]) * .1;
+        const yMin = extent[0] - padding, yMax = extent[1] + padding;
+        const px = step => this.plot.left + step / horizon * this.plot.width;
+        const py = value => this.plot.top + (yMax - value) / (yMax - yMin) * this.plot.height;
+        ctx.strokeStyle = cssColor("--grid"); ctx.fillStyle = cssColor("--muted"); ctx.lineWidth = 1; ctx.font = "11px system-ui";
+        for (let index = 0; index <= 5; index++) {
+          const value = yMin + (yMax - yMin) * index / 5, y = py(value);
+          ctx.beginPath(); ctx.moveTo(this.plot.left, y); ctx.lineTo(this.plot.left + this.plot.width, y); ctx.stroke();
+          ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillText(value.toFixed(3), this.plot.left - 8, y);
+        }
+        const stepStride = Math.max(1, Math.ceil(horizon / 5));
+        for (let step = 0; step <= horizon; step += stepStride) { ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillText(String(step), px(step), this.plot.top + this.plot.height + 8); }
+        ctx.save(); ctx.translate(15, this.plot.top + this.plot.height / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = "center"; ctx.fillText("ΔGripper", 0, 0); ctx.restore();
+        ctx.textAlign = "center"; ctx.fillText("Action step", this.plot.left + this.plot.width / 2, height - 13);
+        shown.slice().reverse().forEach(series => {
+          ctx.strokeStyle = series.color; ctx.lineWidth = series.truth ? 4 : 2.3; ctx.setLineDash(series.truth ? [9, 6] : []); ctx.beginPath();
+          series.gripper.forEach((value, step) => step ? ctx.lineTo(px(step), py(value)) : ctx.moveTo(px(step), py(value))); ctx.stroke(); ctx.setLineDash([]);
+          series.gripper.forEach((value, step) => { if (series.truth || step === horizon) { ctx.fillStyle = series.color; ctx.beginPath(); ctx.arc(px(step), py(value), series.truth ? 3.5 : 5, 0, Math.PI * 2); ctx.fill(); } });
+        });
+      }
+    }
+
+    const positionPlot = new Plot3D(document.getElementById("position-chart"), "position", ["ΔX", "ΔY", "ΔZ"]);
+    const rotationPlot = new Plot3D(document.getElementById("rotation-chart"), "rotation", ["ΔRoll", "ΔPitch", "ΔYaw"]);
+    const gripperPlot = new Plot2D(document.getElementById("gripper-chart"));
+    const plots = [positionPlot, rotationPlot, gripperPlot];
+
+    const renderLegend = series => {
+      legend.replaceChildren();
+      series.forEach(item => {
+        if (!visible.has(item.key)) visible.set(item.key, true);
+        const button = document.createElement("button"); button.type = "button"; button.setAttribute("aria-pressed", String(visible.get(item.key)));
+        const swatch = document.createElement("span"); swatch.className = "swatch"; swatch.style.background = item.color;
+        const label = document.createElement("span"); label.textContent = item.name;
+        button.append(swatch, label);
+        button.addEventListener("click", () => { visible.set(item.key, !visible.get(item.key)); button.setAttribute("aria-pressed", String(visible.get(item.key))); plots.forEach(plot => plot.draw()); });
+        legend.appendChild(button);
+      });
+    };
+    const showSample = index => {
+      selectedIndex = Math.max(0, Math.min(report.samples.length - 1, index));
+      const sample = report.samples[selectedIndex];
+      selector.value = String(selectedIndex);
+      previousButton.disabled = selectedIndex === 0; nextButton.disabled = selectedIndex === report.samples.length - 1;
+      document.getElementById("dataset-name").textContent = sample.dataset_name;
+      document.getElementById("task-name").textContent = sample.task || "—";
+      const series = buildSeries(sample); visible = new Map(series.map(item => [item.key, true])); renderLegend(series);
+      plots.forEach(plot => plot.setSeries(series)); hideTooltip();
+    };
+
+    document.getElementById("run-summary").textContent = `${report.samples.length} random samples · Top-${report.top_k} · seed ${report.seed}`;
+    report.samples.forEach((sample, index) => { const option = document.createElement("option"); option.value = String(index); option.textContent = `Sample ${String(sample.sample).padStart(2, "0")} · ${sample.dataset_name}`; selector.appendChild(option); });
+    selector.addEventListener("change", () => showSample(Number(selector.value)));
+    previousButton.addEventListener("click", () => showSample(selectedIndex - 1));
+    nextButton.addEventListener("click", () => showSample(selectedIndex + 1));
+    new ResizeObserver(() => plots.forEach(plot => plot.draw())).observe(root);
+    showSample(0);
+  })();
+  </script>
+</body>
+</html>

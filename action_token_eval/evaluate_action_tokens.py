@@ -13,7 +13,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -39,10 +38,7 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
 )
 
-plt.switch_backend("Agg")
-
-_TRUE_COLOR = "#ff006e"
-_PREDICTION_COLORS = ("#0077bb", "#33aa55", "#ee7733", "#aa4499", "#00a6a6")
+_REPORT_TEMPLATE = Path(__file__).with_name("report_template.html")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -106,6 +102,21 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _collate_single_sample(
+    dataset: ActionMemRLDSDataset,
+    sample: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the same RLDS collator used by lerobot-train with batch size one."""
+    batch = dataset.collate_fn([sample])
+    for camera_key in dataset.meta.camera_keys:
+        mask_key = f"{camera_key}_padding_mask"
+        mask = batch.get(mask_key)
+        if not isinstance(mask, torch.Tensor) or mask.shape != (1,):
+            actual = None if not isinstance(mask, torch.Tensor) else tuple(mask.shape)
+            raise ValueError(f"Expected batched image mask '{mask_key}' with shape (1,), got {actual}.")
+    return batch
 
 
 def _make_dataset(
@@ -194,153 +205,28 @@ def _predict_action_logits(policy: SmolActionMemPolicy, batch: dict[str, torch.T
     return policy.model._compute_action_logits(prefix_output).float()  # noqa: SLF001
 
 
-def _true_effect_trajectory(action_chunk: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if action_chunk.ndim != 2 or action_chunk.shape[-1] != 7:
-        raise ValueError(f"Expected one [horizon, 7] action chunk, got {action_chunk.shape}.")
-    zeros = np.zeros((1, 3), dtype=np.float32)
-    position = np.concatenate([zeros, np.cumsum(action_chunk[:, :3], axis=0)], axis=0)
-    rotation = np.concatenate([zeros, np.cumsum(action_chunk[:, 3:6], axis=0)], axis=0)
-    gripper = np.concatenate(
-        [np.zeros(1, dtype=np.float32), action_chunk[:, 6] - action_chunk[0, 6]],
-        axis=0,
-    )
-    return position, rotation, gripper
-
-
-def _straight_prototype_trajectory(prototype: np.ndarray, horizon: int) -> tuple[np.ndarray, ...]:
-    progress = np.linspace(0.0, 1.0, horizon + 1, dtype=np.float32)
-    return (
-        progress[:, None] * prototype[None, :3],
-        progress[:, None] * prototype[None, 3:6],
-        progress * prototype[6],
-    )
-
-
-def _plot_sample(
-    *,
-    output_path: Path,
-    sample_number: int,
-    task: str,
-    dataset_name: str,
-    token_ids: np.ndarray,
-    probabilities: np.ndarray,
-    prototypes: np.ndarray,
-    true_action_chunk: np.ndarray,
-) -> None:
-    horizon = true_action_chunk.shape[0]
-    true_position, true_rotation, true_gripper = _true_effect_trajectory(true_action_chunk)
-    steps = np.arange(horizon + 1)
-
-    figure = plt.figure(figsize=(18, 6.4), constrained_layout=True)
-    position_axis = figure.add_subplot(1, 3, 1, projection="3d")
-    rotation_axis = figure.add_subplot(1, 3, 2, projection="3d")
-    gripper_axis = figure.add_subplot(1, 3, 3)
-    legend_handles = []
-    legend_labels = []
-
-    for rank, (token_id, probability, prototype) in enumerate(
-        zip(token_ids, probabilities, prototypes, strict=True), start=1
-    ):
-        position, rotation, gripper = _straight_prototype_trajectory(prototype, horizon)
-        color = _PREDICTION_COLORS[(rank - 1) % len(_PREDICTION_COLORS)]
-        (handle,) = position_axis.plot(
-            position[:, 0],
-            position[:, 1],
-            position[:, 2],
-            color=color,
-            linewidth=2.2,
-            marker="o",
-            markevery=[-1],
-        )
-        rotation_axis.plot(
-            rotation[:, 0],
-            rotation[:, 1],
-            rotation[:, 2],
-            color=color,
-            linewidth=2.2,
-            marker="o",
-            markevery=[-1],
-        )
-        gripper_axis.plot(steps, gripper, color=color, linewidth=2.2, marker="o", markevery=[-1])
-        legend_handles.append(handle)
-        legend_labels.append(f"Top {rank}: token {int(token_id)}  p={float(probability):.4f}")
-
-    (true_handle,) = position_axis.plot(
-        true_position[:, 0],
-        true_position[:, 1],
-        true_position[:, 2],
-        color=_TRUE_COLOR,
-        linewidth=4.0,
-        linestyle="--",
-        marker="x",
-        markersize=6,
-    )
-    rotation_axis.plot(
-        true_rotation[:, 0],
-        true_rotation[:, 1],
-        true_rotation[:, 2],
-        color=_TRUE_COLOR,
-        linewidth=4.0,
-        linestyle="--",
-        marker="x",
-        markersize=6,
-    )
-    gripper_axis.plot(
-        steps,
-        true_gripper,
-        color=_TRUE_COLOR,
-        linewidth=4.0,
-        linestyle="--",
-        marker="x",
-        markersize=6,
-    )
-    legend_handles.insert(0, true_handle)
-    legend_labels.insert(0, "Ground-truth action chunk")
-
-    position_axis.set_title("End-effector position change")
-    position_axis.set_xlabel("ΔX")
-    position_axis.set_ylabel("ΔY")
-    position_axis.set_zlabel("ΔZ")
-    position_axis.set_box_aspect((1, 1, 1))
-    position_axis.grid(True, alpha=0.3)
-
-    rotation_axis.set_title("End-effector angle change")
-    rotation_axis.set_xlabel("ΔRoll")
-    rotation_axis.set_ylabel("ΔPitch")
-    rotation_axis.set_zlabel("ΔYaw")
-    rotation_axis.set_box_aspect((1, 1, 1))
-    rotation_axis.grid(True, alpha=0.3)
-
-    gripper_axis.set_title("Gripper opening change")
-    gripper_axis.set_xlabel("Action step")
-    gripper_axis.set_ylabel("ΔGripper")
-    gripper_axis.set_xticks(steps)
-    gripper_axis.grid(True, alpha=0.3)
-
-    clean_task = " ".join(task.split())
-    figure.suptitle(
-        f"Sample {sample_number:02d} | dataset={dataset_name} | task={clean_task}\n"
-        "Decoded token prototypes and target use the same OXE-normalized effect coordinates",
-        fontsize=13,
-    )
-    figure.legend(
-        legend_handles,
-        legend_labels,
-        loc="outside lower center",
-        ncols=3,
-        frameon=True,
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=180, bbox_inches="tight")
-    plt.close(figure)
-
-
 def _json_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, (np.integer, np.floating)):
         return value.item()
     return value
+
+
+def _write_interactive_html(output_path: Path, report: dict[str, Any]) -> None:
+    if not _REPORT_TEMPLATE.is_file():
+        raise FileNotFoundError(f"Interactive report template does not exist: {_REPORT_TEMPLATE}")
+    template = _REPORT_TEMPLATE.read_text(encoding="utf-8")
+    marker = "__ACTION_TOKEN_EVAL_DATA__"
+    if template.count(marker) != 1:
+        raise ValueError(f"Expected exactly one {marker!r} marker in {_REPORT_TEMPLATE}.")
+    payload = json.dumps(report, ensure_ascii=False, separators=(",", ":"), default=_json_value)
+    # Prevent user-provided task text from terminating the JSON script element.
+    payload = payload.replace("</", "<\\/")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(template.replace(marker, payload), encoding="utf-8")
 
 
 def main() -> None:
@@ -396,13 +282,16 @@ def main() -> None:
         true_action_chunk = sample[ACTION_TOKENIZER_INPUT].detach().cpu().numpy().astype(np.float32)
         task = str(sample.get("task", ""))
         dataset_name = str(sample.get("dataset_name", "unknown"))
+        batch = _collate_single_sample(dataset, sample)
 
-        # Match lerobot-train's uint8-to-[0, 1] conversion before the policy processor.
+        # Match lerobot-train's collation and uint8-to-[0, 1] conversion before
+        # the policy processor. In particular, image padding masks must be [B],
+        # not scalars from a raw iterable-dataset sample.
         for camera_key in dataset.meta.camera_keys:
-            image = sample.get(camera_key)
+            image = batch.get(camera_key)
             if isinstance(image, torch.Tensor) and image.dtype == torch.uint8:
-                sample[camera_key] = image.to(torch.float32) / 255.0
-        processed_batch = preprocessor(sample)
+                batch[camera_key] = image.to(torch.float32) / 255.0
+        processed_batch = preprocessor(batch)
         logits = _predict_action_logits(policy, processed_batch)
         probabilities = torch.softmax(logits[0], dim=-1)
         top_probabilities, top_tokens = torch.topk(probabilities, k=args.top_k)
@@ -410,23 +299,11 @@ def main() -> None:
         token_probabilities = top_probabilities.detach().cpu().numpy()
         prototypes = all_prototypes[token_ids]
 
-        output_path = run_dir / f"sample_{sample_index:02d}.png"
-        _plot_sample(
-            output_path=output_path,
-            sample_number=sample_index,
-            task=task,
-            dataset_name=dataset_name,
-            token_ids=token_ids,
-            probabilities=token_probabilities,
-            prototypes=prototypes,
-            true_action_chunk=true_action_chunk,
-        )
         results.append(
             {
                 "sample": sample_index,
                 "dataset_name": dataset_name,
                 "task": task,
-                "figure": output_path.name,
                 "top_tokens": token_ids,
                 "top_probabilities": token_probabilities,
                 "decoded_effect_prototypes": prototypes,
@@ -434,10 +311,9 @@ def main() -> None:
             }
         )
         logging.info(
-            "[%d/%d] wrote %s | Top-1 token=%d p=%.4f",
+            "[%d/%d] collected sample | Top-1 token=%d p=%.4f",
             sample_index,
             args.num_samples,
-            output_path.name,
             int(token_ids[0]),
             float(token_probabilities[0]),
         )
@@ -453,9 +329,9 @@ def main() -> None:
         "top_k": args.top_k,
         "samples": results,
     }
-    with (run_dir / "summary.json").open("w", encoding="utf-8") as file:
-        json.dump(summary, file, ensure_ascii=False, indent=2, default=_json_value)
-    logging.info("Evaluation complete: %s", run_dir)
+    report_path = run_dir / "action_token_eval.html"
+    _write_interactive_html(report_path, summary)
+    logging.info("Interactive evaluation complete: %s", report_path)
 
 
 if __name__ == "__main__":
