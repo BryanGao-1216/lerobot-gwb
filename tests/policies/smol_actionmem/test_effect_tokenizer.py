@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from torch import nn
 
 from lerobot.policies.effect_tokenizer import (
@@ -8,6 +9,7 @@ from lerobot.policies.effect_tokenizer import (
     EFFECT_NORMALIZATION_CONTRACT,
     EffectVQVAEActionEncoder,
     compute_effect_descriptors,
+    load_effect_token_prototypes,
     load_effect_tokenizer_metadata,
     load_effect_vqvae_action_encoder,
 )
@@ -64,8 +66,10 @@ def test_load_effect_tokenizer_checkpoint_contract(tmp_path):
         "normalize_latents": True,
     }
     encoder = nn.Sequential(nn.Linear(7, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, latent_dim))
+    decoder = nn.Sequential(nn.Linear(latent_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 7))
     checkpoint = tmp_path / "effect_tokenizer.pt"
     state_dict = {f"encoder.{key}": value for key, value in encoder.state_dict().items()}
+    state_dict.update({f"decoder.{key}": value for key, value in decoder.state_dict().items()})
     state_dict["codebook.weight"] = torch.randn(4, latent_dim)
     torch.save(
         {
@@ -90,6 +94,10 @@ def test_load_effect_tokenizer_checkpoint_contract(tmp_path):
 
     loaded = load_effect_vqvae_action_encoder(checkpoint)
     metadata = load_effect_tokenizer_metadata(checkpoint)
+    prototypes = load_effect_token_prototypes(checkpoint)
+    expected_prototypes = decoder(F.normalize(state_dict["codebook.weight"], dim=-1))
+    expected_prototypes[:, -1] /= 1.5
+    expected_prototypes /= torch.tensor([0.1] * 6 + [1.0])
 
     assert loaded.horizon == 10
     assert loaded.action_dim == 7
@@ -97,5 +105,6 @@ def test_load_effect_tokenizer_checkpoint_contract(tmp_path):
     assert loaded.target_control_hz == 10.0
     assert metadata.horizon == 10
     assert metadata.codebook_size == 4
+    assert torch.allclose(prototypes, expected_prototypes)
     assert not any(parameter.requires_grad for parameter in loaded.parameters())
     assert loaded.compute_code_distances(torch.zeros(2, 10, 7)).shape == (2, 4)

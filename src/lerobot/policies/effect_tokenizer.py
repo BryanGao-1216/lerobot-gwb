@@ -298,3 +298,75 @@ def load_effect_vqvae_action_encoder(checkpoint_path: str | Path) -> EffectVQVAE
     model.requires_grad_(False)
     model.eval()
     return model
+
+
+def load_effect_token_prototypes(checkpoint_path: str | Path) -> Tensor:
+    """Decode every codebook entry into its unweighted endpoint-effect prototype.
+
+    Returns a CPU float32 tensor shaped ``[codebook_size, 7]`` in the same
+    per-dataset q01/q99-normalized effect coordinates used to train the
+    tokenizer. The first six values are accumulated XYZ/RPY deltas and the
+    final value is final-minus-initial gripper command.
+    """
+    resolved_path = Path(checkpoint_path).expanduser().resolve()
+    if not resolved_path.is_file():
+        raise FileNotFoundError(f"Effect-tokenizer checkpoint does not exist: {resolved_path}")
+
+    checkpoint = _load_trusted_checkpoint(resolved_path)
+    _validate_checkpoint_contract(checkpoint, resolved_path)
+    model_config = checkpoint.get("model_config")
+    state_dict = checkpoint.get("model_state_dict")
+    if not isinstance(model_config, Mapping) or not isinstance(state_dict, Mapping):
+        raise ValueError(
+            f"Effect-tokenizer checkpoint {resolved_path} must contain model_config and model_state_dict mappings."
+        )
+
+    input_dim = int(model_config.get("input_dim", len(EFFECT_DESCRIPTOR_NAMES)))
+    hidden_dim = int(model_config.get("hidden_dim", 128))
+    latent_dim = int(model_config.get("latent_dim", 16))
+    num_hidden_layers = int(model_config.get("num_hidden_layers", 2))
+    codebook_size = int(model_config.get("codebook_size", 256))
+    normalize_latents = bool(model_config.get("normalize_latents", False))
+    if input_dim != len(EFFECT_DESCRIPTOR_NAMES):
+        raise ValueError(f"Effect-tokenizer input_dim must be 7, got {input_dim} in {resolved_path}.")
+
+    decoder = _make_mlp(latent_dim, input_dim, hidden_dim, num_hidden_layers)
+    decoder_state = {
+        key.removeprefix("decoder."): value
+        for key, value in state_dict.items()
+        if key.startswith("decoder.")
+    }
+    if not decoder_state:
+        raise ValueError(f"No decoder weights found in effect-tokenizer checkpoint {resolved_path}.")
+    decoder.load_state_dict(decoder_state, strict=True)
+    decoder.eval()
+
+    codebook = state_dict.get("codebook.weight")
+    if not isinstance(codebook, Tensor) or codebook.shape != (codebook_size, latent_dim):
+        actual_shape = None if not isinstance(codebook, Tensor) else tuple(codebook.shape)
+        raise ValueError(
+            f"Unexpected effect-tokenizer codebook shape {actual_shape} in {resolved_path}; "
+            f"expected {(codebook_size, latent_dim)}."
+        )
+    centers = codebook.detach().to(torch.float32)
+    if normalize_latents:
+        centers = F.normalize(centers, dim=-1, eps=1e-6)
+    with torch.inference_mode():
+        # Scaling below stays out-of-place because this is an inference tensor.
+        decoded = decoder(centers).to(torch.float32).clone()
+
+    gripper_weight = float(checkpoint.get("gripper_weight", 0.0))
+    if gripper_weight <= 0:
+        raise ValueError(
+            f"Effect-tokenizer checkpoint {resolved_path} has invalid gripper_weight={gripper_weight}."
+        )
+    effect_scale = torch.as_tensor(
+        checkpoint.get("effect_scale", [1.0] * len(EFFECT_DESCRIPTOR_NAMES)), dtype=torch.float32
+    )
+    if effect_scale.shape != (len(EFFECT_DESCRIPTOR_NAMES),) or torch.any(effect_scale <= 0):
+        raise ValueError(
+            f"Effect-tokenizer checkpoint {resolved_path} must contain seven positive effect_scale values."
+        )
+    decoded = decoded / effect_scale
+    decoded[..., -1] /= gripper_weight
+    return decoded.cpu()
