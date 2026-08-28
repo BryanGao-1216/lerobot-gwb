@@ -356,7 +356,7 @@ def test_inference_uses_complete_logits_condition_without_argmax_token(monkeypat
     assert received_logits[0][0, 7] == 10
 
 
-def test_continuous_condition_receives_flow_gradients_but_blocks_logit_gradients():
+def test_continuous_condition_propagates_flow_gradients_into_action_logits():
     model = SmolActionMemFlowMatching.__new__(SmolActionMemFlowMatching)
     nn.Module.__init__(model)
     model.config = type("Config", (), {"action_condition_scale": 1.0})()
@@ -376,16 +376,17 @@ def test_continuous_condition_receives_flow_gradients_but_blocks_logit_gradients
     assert metrics["action_condition_gamma_rms"].item() == 0
     assert metrics["action_condition_beta_rms"].item() == 0
 
-    # Flow trains the condition projection, but the logits/VLM branch is trained
-    # separately by its KL objective.
+    # Zero initialization initially trains the condition projection. Once that
+    # projection becomes non-zero, flow gradients must also reach logits/VLM.
     conditioned.square().mean().backward()
     assert model.action_condition_proj[-1].weight.grad.abs().sum() > 0
     with torch.no_grad():
-        model.action_condition_proj[-1].weight.fill_(0.01)
+        model.action_condition_proj[-1].weight.normal_(std=0.01)
     logits = torch.randn(2, 3, requires_grad=True)
     conditioned, _ = model._condition_flow_hidden(suffix, logits)
     conditioned.square().mean().backward()
-    assert logits.grad is None
+    assert logits.grad is not None
+    assert logits.grad.abs().sum() > 0
 
 
 class _StageModel(SmolActionMemFlowMatching):

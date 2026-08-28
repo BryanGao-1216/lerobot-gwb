@@ -182,8 +182,7 @@ def condition_flow_hidden(
     *,
     scale: float,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """Apply bounded logit-conditioned FiLM while blocking flow gradients into the VLM logits."""
-    action_logits = action_logits.detach()
+    """Apply bounded FiLM and let flow gradients train the action-logit/VLM branch."""
     projection_dtype = next(projection.parameters()).dtype
     film = torch.tanh(projection(action_logits.to(dtype=projection_dtype))).float()
     gamma, beta = film.chunk(2, dim=-1)
