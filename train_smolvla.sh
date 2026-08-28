@@ -1,13 +1,26 @@
+export CUDA_VISIBLE_DEVICES=2
+
 lerobot-train \
-  --policy.path=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smolvla \
+  --policy.path=/data1/gaowenbing/WorkSpace/models/smolvla \
+  --policy.train_expert_only=false \
+  --policy.freeze_vision_encoder=true \
   --policy.input_features=null \
   --policy.output_features=null \
-  --dataset.repo_id=lqs \
-  --dataset_type=lerobot \
-  --dataset.root=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/datasets/LIBERO \
-  --output_dir=/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-Baseline-L \
-  --steps=5000 \
-  --policy.optimizer_grad_clip_norm=5 \
-  --batch_size=64 \
+  --policy.chunk_size=10 \
+  --policy.n_action_steps=10 \
+  --dataset_type=rlds \
+  --dataset.repo_id=libero_only \
+  --dataset.root=/data1/gaowenbing/WorkSpace/datasets/OpenX \
+  --dataset.rlds_storage_format=hybrid \
+  --dataset.rlds_target_control_hz=10 \
+  --output_dir=/data1/gaowenbing/WorkSpace/models/smolvla-libero-baseline \
+  --steps=60000 \
+  --save_freq=10000 \
+  --batch_size=100 \
   --eval_step=0 \
-  --policy.push_to_hub=false 
+  --policy.optimizer_lr=3e-5 \
+  --policy.optimizer_grad_clip_norm=5 \
+  --policy.scheduler_warmup_steps=5000 \
+  --policy.scheduler_decay_steps=100000 \
+  --policy.scheduler_decay_lr=5e-6 \
+  --policy.push_to_hub=false
