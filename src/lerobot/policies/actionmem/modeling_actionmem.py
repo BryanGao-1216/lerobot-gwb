@@ -85,6 +85,15 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def _get_vision_forward_dtype(vision_tower: nn.Module, fallback: torch.dtype) -> torch.dtype:
+    """Read the live patch-weight dtype without iterating FSDP-flattened parameters."""
+    try:
+        patch_weight = vision_tower.vision_model.embeddings.patch_embedding.weight
+    except AttributeError:
+        return fallback
+    return patch_weight.dtype if isinstance(patch_weight, Tensor) else fallback
+
+
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_cond, layers, rotary_emb):
     query_states = []
@@ -308,10 +317,15 @@ class PaliGemmaWithExpertModel(
 
     def embed_image(self, image: torch.Tensor):
         # Outside FSDP the vision tower is deliberately fp32. With FSDP mixed
-        # precision, its gathered parameter view is bf16, so match the live
-        # parameter dtype instead of assuming fp32.
+        # precision, its gathered patch-weight view is bf16. Do not use
+        # vision_tower.parameters() here: a whole-model FSDP wrap flattens the
+        # child registrations, so that iterator may be empty during activation
+        # checkpoint recomputation even though the live weight tensor exists.
         out_dtype = image.dtype
-        vision_dtype = next(self.paligemma.model.vision_tower.parameters()).dtype
+        vision_dtype = _get_vision_forward_dtype(
+            self.paligemma.model.vision_tower,
+            fallback=image.dtype,
+        )
         if image.dtype != vision_dtype:
             image = image.to(vision_dtype)
         image_outputs = self.paligemma.model.get_image_features(image)

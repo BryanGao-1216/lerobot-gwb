@@ -1,4 +1,5 @@
 import re
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from lerobot.policies.actionmem.modeling_actionmem import (
     ActionMemPolicy,
     ActionMemPytorch,
     PaliGemmaWithExpertModel,
+    _get_vision_forward_dtype,
 )
 from lerobot.policies.pi_gemma import PiGemmaModel
 from lerobot.utils.constants import (
@@ -31,6 +33,18 @@ class _DummyPaliGemma:
     def embed_language_tokens(self, tokens):
         values = tokens.to(torch.float32)
         return torch.stack([values, values], dim=-1)
+
+
+def test_vision_forward_dtype_does_not_require_registered_child_parameters():
+    vision_tower = nn.Module()
+    vision_tower.vision_model = SimpleNamespace(
+        embeddings=SimpleNamespace(
+            patch_embedding=SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
+        )
+    )
+
+    assert list(vision_tower.parameters()) == []
+    assert _get_vision_forward_dtype(vision_tower, torch.float32) == torch.bfloat16
 
 
 def test_actionmem_fsdp_keeps_uniform_fp32_master_parameters(monkeypatch):
