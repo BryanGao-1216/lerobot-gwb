@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optional multi-RLDS input backend for ActionMem policies.
+"""Optional multi-RLDS input backend for SmolVLA and ActionMem policies.
 
 This module deliberately does not import TensorFlow or dlimp at module import
 time. Normal LeRobot dataset users therefore keep the existing dependency and
@@ -65,6 +65,8 @@ _CAMERA_KEY_BY_VIEW = {
     "wrist": "observation.images.image3",
 }
 _ACTION_NAMES = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
+
+
 @dataclass(frozen=True)
 class RLDSBackendModules:
     dl: Any
@@ -163,9 +165,7 @@ class RLDSActionTokenCollator:
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
         batch = default_collate(samples)
-        actions = batch[ACTION_TOKENIZER_INPUT].to(
-            device=self.device, dtype=torch.float32, non_blocking=True
-        )
+        actions = batch[ACTION_TOKENIZER_INPUT].to(device=self.device, dtype=torch.float32, non_blocking=True)
         with torch.inference_mode():
             code_distances = self.encoder.compute_code_distances(actions)
             codes = code_distances.argmin(dim=-1)
@@ -513,7 +513,12 @@ def _decode_text(value: Any) -> str:
 
 
 class ActionMemRLDSDataset(IterableDataset):
-    """Weighted multi-RLDS stream adapted to the ActionMem batch contract."""
+    """Weighted multi-RLDS stream adapted to the LeRobot policy batch contract.
+
+    The historical class name is kept for checkpoint/test compatibility. Action
+    token collation is optional so the same canonical OXE samples and aggregate
+    LeRobot statistics can also train an unmodified SmolVLA policy.
+    """
 
     def __init__(
         self,
@@ -522,8 +527,8 @@ class ActionMemRLDSDataset(IterableDataset):
         action_horizon: int,
         action_dim: int,
         state_dim: int,
-        action_tokenizer_checkpoint_path: str | Path,
-        action_codebook_size: int,
+        action_tokenizer_checkpoint_path: str | Path | None,
+        action_codebook_size: int | None,
         seed: int,
     ) -> None:
         super().__init__()
@@ -640,14 +645,18 @@ class ActionMemRLDSDataset(IterableDataset):
             camera_keys=camera_keys,
             fps=self.target_control_hz or 1.0,
         )
-        self.collate_fn = RLDSActionTokenCollator(
-            checkpoint_path=action_tokenizer_checkpoint_path,
-            device=dataset_config.rlds_action_tokenizer_device,
-            expected_horizon=action_horizon,
-            expected_action_dim=action_dim,
-            expected_codebook_size=action_codebook_size,
-            expected_target_control_hz=self.target_control_hz,
-        )
+        self._include_action_tokenizer_fields = action_tokenizer_checkpoint_path is not None
+        if action_tokenizer_checkpoint_path is None:
+            self.collate_fn = default_collate
+        else:
+            self.collate_fn = RLDSActionTokenCollator(
+                checkpoint_path=action_tokenizer_checkpoint_path,
+                device=dataset_config.rlds_action_tokenizer_device,
+                expected_horizon=action_horizon,
+                expected_action_dim=action_dim,
+                expected_codebook_size=action_codebook_size,
+                expected_target_control_hz=self.target_control_hz,
+            )
 
         logging.info(
             "RLDS mixture on rank %d/%d: %s",
@@ -692,7 +701,9 @@ class ActionMemRLDSDataset(IterableDataset):
         webdataset_indices = [
             index for index, source_format in enumerate(source_formats) if source_format == "webdataset"
         ]
-        tfds_indices = [index for index, source_format in enumerate(source_formats) if source_format == "tfds"]
+        tfds_indices = [
+            index for index, source_format in enumerate(source_formats) if source_format == "tfds"
+        ]
 
         all_statistics: list[Mapping[str, Any]] = []
         valid_sizes: list[int] = []
@@ -737,9 +748,7 @@ class ActionMemRLDSDataset(IterableDataset):
         tfds_weight = float(effective_weights[tfds_indices].sum())
 
         if webdataset_indices:
-            self._webdataset_sample_weights = (
-                effective_weights[webdataset_indices] / webdataset_weight
-            )
+            self._webdataset_sample_weights = effective_weights[webdataset_indices] / webdataset_weight
             for index in webdataset_indices:
                 source_kwargs = _adapt_openx_tar_source_kwargs(
                     per_dataset_kwargs[index],
@@ -771,9 +780,7 @@ class ActionMemRLDSDataset(IterableDataset):
 
         using_hybrid_backends = bool(webdataset_indices and tfds_indices)
         if using_hybrid_backends:
-            self._hybrid_backend_weights = np.asarray(
-                [webdataset_weight, tfds_weight], dtype=np.float64
-            )
+            self._hybrid_backend_weights = np.asarray([webdataset_weight, tfds_weight], dtype=np.float64)
             webdataset_buffer_size = int(round(self._stream_shuffle_buffer_size * webdataset_weight))
             self._webdataset_shuffle_buffer_size = max(1, webdataset_buffer_size)
             tfds_shuffle_buffer_size = max(
@@ -788,9 +795,7 @@ class ActionMemRLDSDataset(IterableDataset):
 
         datasets = []
         tfds_sample_weights = effective_weights[tfds_indices] / tfds_weight
-        threads_per_dataset = max(
-            1, self.dataset_config.rlds_num_parallel_calls // len(tfds_indices)
-        )
+        threads_per_dataset = max(1, self.dataset_config.rlds_num_parallel_calls // len(tfds_indices))
         for index in tfds_indices:
             source_kwargs = copy.deepcopy(per_dataset_kwargs[index])
             statistics = all_statistics[index]
@@ -1046,20 +1051,21 @@ class ActionMemRLDSDataset(IterableDataset):
             raise ValueError(
                 f"Expected RLDS action chunk {(self.action_horizon, self.action_dim)}, got {action.shape}."
             )
-        action_tokenizer_input = np.asarray(frame[ACTION_TOKENIZER_INPUT], dtype=np.float32)
-        if action_tokenizer_input.shape != (self.action_horizon, self.action_dim):
-            raise ValueError(
-                "Expected q01/q99-normalized RLDS action-tokenizer chunk "
-                f"{(self.action_horizon, self.action_dim)}, got {action_tokenizer_input.shape}."
-            )
         sample: dict[str, Any] = {
             OBS_STATE: torch.from_numpy(state),
             ACTION: torch.from_numpy(action.copy()),
-            ACTION_TOKENIZER_INPUT: torch.from_numpy(action_tokenizer_input.copy()),
             "action_is_pad": torch.zeros(self.action_horizon, dtype=torch.bool),
             "task": _decode_text(frame["task"]["language_instruction"]),
             "dataset_name": _decode_text(frame["dataset_name"]),
         }
+        if self._include_action_tokenizer_fields:
+            action_tokenizer_input = np.asarray(frame[ACTION_TOKENIZER_INPUT], dtype=np.float32)
+            if action_tokenizer_input.shape != (self.action_horizon, self.action_dim):
+                raise ValueError(
+                    "Expected q01/q99-normalized RLDS action-tokenizer chunk "
+                    f"{(self.action_horizon, self.action_dim)}, got {action_tokenizer_input.shape}."
+                )
+            sample[ACTION_TOKENIZER_INPUT] = torch.from_numpy(action_tokenizer_input.copy())
 
         pad_masks = observation.get("pad_mask_dict", {})
         for view in self.dataset_config.rlds_camera_views:
@@ -1123,8 +1129,7 @@ class ActionMemRLDSDataset(IterableDataset):
 def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
     policy_config = cfg.trainable_config
     checkpoint_path = (
-        cfg.dataset.rlds_effect_tokenizer_checkpoint_path
-        or policy_config.effect_tokenizer_checkpoint_path
+        cfg.dataset.rlds_effect_tokenizer_checkpoint_path or policy_config.effect_tokenizer_checkpoint_path
     )
     if checkpoint_path is None:
         raise ValueError(
@@ -1136,9 +1141,7 @@ def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
     action_horizon = metadata.horizon
     action_dim = metadata.action_dim
     requested_hz = (
-        float(cfg.dataset.rlds_target_control_hz)
-        if cfg.dataset.rlds_target_control_hz > 0
-        else None
+        float(cfg.dataset.rlds_target_control_hz) if cfg.dataset.rlds_target_control_hz > 0 else None
     )
     frequency_mismatch = (metadata.target_control_hz is None) != (requested_hz is None)
     if metadata.target_control_hz is not None and requested_hz is not None:
@@ -1169,4 +1172,49 @@ def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
         action_tokenizer_checkpoint_path=checkpoint_path,
         action_codebook_size=action_codebook_size,
         seed=cfg.seed if cfg.seed is not None else 0,
+    )
+
+
+def make_smolvla_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
+    """Build the shared OXE stream without ActionMem-only code targets.
+
+    OXE standardizers emit the canonical 7-D relative EEF/gripper action used
+    by the existing ActionMem RLDS pipeline. Samples stay in that unnormalized
+    canonical space here. The ordinary SmolVLA policy preprocessor consumes the
+    aggregate ``dataset.meta.stats`` and applies its preset ACTION/STATE
+    ``MEAN_STD`` normalization exactly as it does for a LeRobot-format dataset.
+    """
+
+    policy_config = cfg.trainable_config
+    action_horizon = int(policy_config.chunk_size)
+    if action_horizon <= 0:
+        raise ValueError(f"SmolVLA chunk_size must be positive, got {action_horizon}.")
+
+    # The vendored VQ-VLA/OXE standardization contract is a 6-D relative EEF
+    # command plus one gripper dimension for every source in the supported
+    # mixtures. Policy features are populated from the metadata after dataset
+    # construction, just like the normal LeRobot dataset path.
+    action_dim = len(_ACTION_NAMES)
+    state_dim = cfg.dataset.rlds_state_dim or int(policy_config.max_state_dim)
+    return ActionMemRLDSDataset(
+        dataset_config=cfg.dataset,
+        action_horizon=action_horizon,
+        action_dim=action_dim,
+        state_dim=state_dim,
+        action_tokenizer_checkpoint_path=None,
+        action_codebook_size=None,
+        seed=cfg.seed if cfg.seed is not None else 0,
+    )
+
+
+def make_policy_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
+    """Dispatch the shared RLDS/OXE backend for the selected policy contract."""
+
+    policy_type = cfg.trainable_config.type
+    if policy_type == "smolvla":
+        return make_smolvla_rlds_dataset(cfg)
+    if policy_type in {"actionmem", "pi05_actionmem", "smol_actionmem"}:
+        return make_actionmem_rlds_dataset(cfg)
+    raise ValueError(
+        f"RLDS dataset construction supports SmolVLA and ActionMem-family policies, got {policy_type!r}."
     )

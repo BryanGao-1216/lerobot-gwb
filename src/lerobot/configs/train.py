@@ -79,7 +79,7 @@ class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
     # Selects the dataset backend used by lerobot-train. The default preserves
     # the existing LeRobotDataset path; "rlds" enables the optional multi-RLDS
-    # ActionMem backend.
+    # backend shared by SmolVLA and ActionMem policies.
     dataset_type: str = "lerobot"
     env: envs.EnvConfig | None = None
     policy: PreTrainedConfig | None = None
@@ -273,10 +273,11 @@ class TrainPipelineConfig(HubMixin):
             if self.trainable_config.type not in {
                 "actionmem",
                 "pi05_actionmem",
+                "smolvla",
                 "smol_actionmem",
             }:
                 raise ValueError(
-                    "dataset_type='rlds' currently supports only ActionMem-family policies, got "
+                    "dataset_type='rlds' currently supports SmolVLA and ActionMem-family policies, got "
                     f"{self.trainable_config.type!r}."
                 )
             if getattr(self.trainable_config, "use_relative_actions", False):

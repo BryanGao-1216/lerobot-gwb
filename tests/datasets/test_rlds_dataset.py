@@ -18,6 +18,7 @@ import io
 import json
 import pickle
 import tarfile
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -36,6 +37,7 @@ from lerobot.datasets.rlds_dataset import (
     _resolve_rlds_source_format,
     _slice_action_chunk_with_last_frame,
     _validate_statistics,
+    make_policy_rlds_dataset,
 )
 from lerobot.datasets.rlds_webdataset import (
     iter_openx_tar_episodes,
@@ -507,6 +509,7 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
     dataset.action_horizon = 16
     dataset.action_dim = 7
     dataset.state_dim = 10
+    dataset._include_action_tokenizer_fields = True
     dataset.dataset_config = DatasetConfig(
         repo_id="test", rlds_camera_views=("primary", "wrist"), rlds_resize_size=(8, 8)
     )
@@ -535,3 +538,60 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
     assert sample["observation.images.image3_padding_mask"].item() is False
     assert sample["task"] == "pick up the cup"
     assert sample["dataset_name"] == "droid"
+
+
+def test_rlds_frame_for_smolvla_uses_plain_lerobot_contract():
+    dataset = object.__new__(ActionMemRLDSDataset)
+    dataset.action_horizon = 10
+    dataset.action_dim = 7
+    dataset.state_dim = 8
+    dataset._include_action_tokenizer_fields = False
+    dataset.dataset_config = DatasetConfig(
+        repo_id="test", rlds_camera_views=("primary",), rlds_resize_size=(8, 8)
+    )
+    frame = {
+        "action": np.zeros((10, 7), dtype=np.float32),
+        "dataset_name": b"libero_spatial_no_noops",
+        "task": {"language_instruction": b"pick up the bowl"},
+        "observation": {
+            "proprio": np.ones((1, 8), dtype=np.float32),
+            "image_primary": np.zeros((1, 8, 8, 3), dtype=np.uint8),
+            "pad_mask_dict": {"image_primary": np.array([True])},
+        },
+    }
+
+    sample = dataset._to_lerobot_sample(frame)
+
+    assert sample["action"].shape == (10, 7)
+    assert sample["observation.state"].shape == (8,)
+    assert ACTION_TOKENIZER_INPUT not in sample
+    assert "action_token" not in sample
+    assert ACTION_TOKEN_DISTANCES not in sample
+
+
+def test_rlds_dispatch_builds_smolvla_without_effect_tokenizer(monkeypatch):
+    captured = {}
+
+    class _DatasetStub:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "lerobot.datasets.rlds_dataset.ActionMemRLDSDataset",
+        _DatasetStub,
+    )
+    cfg = SimpleNamespace(
+        trainable_config=SimpleNamespace(type="smolvla", chunk_size=10, max_state_dim=32),
+        dataset=DatasetConfig(repo_id="libero_only", root="/tmp/openx"),
+        seed=42,
+    )
+
+    dataset = make_policy_rlds_dataset(cfg)
+
+    assert isinstance(dataset, _DatasetStub)
+    assert captured["action_horizon"] == 10
+    assert captured["action_dim"] == 7
+    assert captured["state_dim"] == 32
+    assert captured["action_tokenizer_checkpoint_path"] is None
+    assert captured["action_codebook_size"] is None
+    assert captured["seed"] == 42

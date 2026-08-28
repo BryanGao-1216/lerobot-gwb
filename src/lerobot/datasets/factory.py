@@ -87,9 +87,9 @@ def make_dataset(
         LeRobotDataset | MultiLeRobotDataset
     """
     if cfg.dataset_type == "rlds":
-        from .rlds_dataset import make_actionmem_rlds_dataset
+        from .rlds_dataset import make_policy_rlds_dataset
 
-        return make_actionmem_rlds_dataset(cfg)
+        return make_policy_rlds_dataset(cfg)
 
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
