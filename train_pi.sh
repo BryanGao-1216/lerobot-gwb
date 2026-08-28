@@ -21,9 +21,9 @@ accelerate launch \
   --policy.path=/data1/gaowenbing/WorkSpace/models/actionmem-base\
   --policy.effect_tokenizer_checkpoint_path=/data1/gaowenbing/WorkSpace/MyStudy/effectTokenizer/outputs/effect_vqvae.pt \
   --policy.use_peft=false \
+  --policy.freeze_vision_encoder=true \
   --policy.train_expert_only=false \
   --policy.training_stage=vlm_only \
-  --policy.freeze_vision_encoder=false \
   --policy.dtype=bfloat16 \
   --policy.input_features=null \
   --policy.output_features=null \
@@ -43,7 +43,7 @@ accelerate launch \
   --policy.scheduler_warmup_steps=5000 \
   --policy.scheduler_decay_steps=100000 \
   --policy.scheduler_decay_lr=5e-6 \
-  --batch_size=1 \
+  --batch_size=4 \
   --eval_step=0 \
   --policy.gradient_checkpointing=true \
   --policy.tensorboard_enable=true \

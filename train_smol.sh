@@ -1,15 +1,16 @@
-export CUDA_VISIBLE_DEVICES=2,5
+export CUDA_VISIBLE_DEVICES=2
 
-accelerate launch \
-  --multi_gpu \
-  --num_processes=2 \
-  --num_machines=1 \
-  --main_process_port=29501 \
-  "$(which lerobot-train)" \
-  --policy.path=/data1/gaowenbing/WorkSpace/models/smol_actionmem-pretrained/checkpoints/last/pretrained_model \
+# accelerate launch \
+#   --multi_gpu \
+#   --num_processes=1 \
+#   --num_machines=1 \
+#   --main_process_port=29501 \
+  # "$(which lerobot-train)" \
+  lerobot-train \
+  --policy.path=/data1/gaowenbing/WorkSpace/models/smol_actionmem-256/checkpoints/last/pretrained_model \
   --policy.effect_tokenizer_checkpoint_path=/data1/gaowenbing/WorkSpace/MyStudy/effectTokenizer/outputs/effect_vqvae.pt \
   --policy.train_expert_only=false \
-  --policy.training_stage=vlm_only \
+  --policy.training_stage=joint \
   --policy.input_features=null \
   --policy.output_features=null \
   --policy.chunk_size=10 \
@@ -29,7 +30,7 @@ accelerate launch \
   --policy.scheduler_warmup_steps=5000 \
   --policy.scheduler_decay_steps=100000 \
   --policy.scheduler_decay_lr=5e-6 \
-  --batch_size=128 \
+  --batch_size=100 \
   --eval_step=0 \
   --policy.gradient_checkpointing=false \
   --policy.tensorboard_enable=true \
