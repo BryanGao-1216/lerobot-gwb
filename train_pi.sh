@@ -1,6 +1,6 @@
 #!/bin/sh
 
-export CUDA_VISIBLE_DEVICES=3,5
+export CUDA_VISIBLE_DEVICES=4,5
 
 # 可切换为 joint、vlm_only 或 action_expert_only；三种模式均使用下面的 FULL_SHARD FSDP。
 accelerate launch \
@@ -18,11 +18,11 @@ accelerate launch \
   --fsdp_state_dict_type=FULL_STATE_DICT \
   --main_process_port=29502 \
   -m lerobot.scripts.lerobot_train \
-  --policy.path=/data1/gaowenbing/WorkSpace/models/actionmem-pretrained/checkpoints/last/pretrained_model \
+  --policy.path=/data1/gaowenbing/WorkSpace/models/actionmem-base\
   --policy.effect_tokenizer_checkpoint_path=/data1/gaowenbing/WorkSpace/MyStudy/effectTokenizer/outputs/effect_vqvae.pt \
   --policy.use_peft=false \
   --policy.train_expert_only=false \
-  --policy.training_stage=joint \
+  --policy.training_stage=vlm_only \
   --policy.freeze_vision_encoder=false \
   --policy.dtype=bfloat16 \
   --policy.input_features=null \
@@ -35,7 +35,7 @@ accelerate launch \
   --dataset_type=rlds \
   --dataset.rlds_storage_format=hybrid \
   --dataset.root=/data1/gaowenbing/WorkSpace/datasets/OpenX \
-  --output_dir=/data1/gaowenbing/WorkSpace/models/actionmem-final \
+  --output_dir=/data1/gaowenbing/WorkSpace/models/actionmem-256 \
   --steps=100000 \
   --policy.tensorboard_log_freq=10 \
   --policy.optimizer_lr=3e-5 \
