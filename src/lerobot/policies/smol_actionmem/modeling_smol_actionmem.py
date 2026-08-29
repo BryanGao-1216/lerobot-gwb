@@ -41,6 +41,7 @@ from ..action_code import (
     ActionCodeLayout,
     compute_action_code_objective,
     condition_flow_hidden,
+    reduce_flow_losses,
     validate_action_code_sequence,
 )
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
@@ -717,17 +718,15 @@ class SmolActionMemPolicy(SmolVLAPolicy):
         if compute_flow:
             action_dim = self.config.action_feature.shape[0]
             flow_losses = output["flow_losses"][:, :, :action_dim]
-            # Dataset queries clamp future indices to the final episode frame.
-            # These positions are deliberate training targets rather than
-            # missing data, even if a LeRobot dataset still exposes the
-            # historical action_is_pad marker for the clamped indices.
-            flow_loss = flow_losses.mean()
-            per_sample_flow = flow_losses.mean(dim=(1, 2))
+            flow_loss, per_sample_flow, loss_per_dim = reduce_flow_losses(
+                flow_losses,
+                batch.get("action_is_pad"),
+            )
             scalar_terms.append(self.config.flow_loss_weight * flow_loss)
             per_sample_terms.append(self.config.flow_loss_weight * per_sample_flow)
             metrics.update(
                 {
-                    "loss_per_dim": flow_losses.mean(dim=(0, 1)).detach().cpu().tolist(),
+                    "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
                     "flow_loss": flow_loss.item(),
                     "weighted_flow_loss": (self.config.flow_loss_weight * flow_loss).item(),
                     "action_condition_gamma_rms": output["action_condition_gamma_rms"].item(),

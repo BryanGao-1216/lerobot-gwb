@@ -52,10 +52,9 @@ def test_config_rejects_non_positive_soft_target_temperature():
         SmolActionMemConfig(action_token_soft_target_temperature=0)
 
 
-def test_config_keeps_all_tail_chunk_starts_for_old_checkpoints():
-    config = SmolActionMemConfig(drop_n_last_frames=9)
-
-    assert config.drop_n_last_frames == 0
+def test_config_rejects_tail_drop():
+    with pytest.raises(ValueError, match="drop_n_last_frames=0"):
+        SmolActionMemConfig(drop_n_last_frames=9)
 
 
 def test_processor_emits_local_classes_instead_of_language_token_ids():
@@ -109,7 +108,7 @@ def test_flow_target_uses_preprocessor_action_not_tokenizer_input():
     assert torch.count_nonzero(target[..., 7:]) == 0
 
 
-def test_flow_loss_includes_last_frame_repeated_tail_targets():
+def test_flow_loss_excludes_neutral_padded_tail_targets():
     class _FlowModel(nn.Module):
         @staticmethod
         def sample_time(batch_size, device):
@@ -155,8 +154,8 @@ def test_flow_loss_includes_last_frame_repeated_tail_targets():
 
     loss, metrics = policy.forward(batch)
 
-    assert loss.item() == pytest.approx((1.0 + 4.0 + 9.0) / 3)
-    assert metrics["flow_loss"] == pytest.approx((1.0 + 4.0 + 9.0) / 3)
+    assert loss.item() == pytest.approx(1.0)
+    assert metrics["flow_loss"] == pytest.approx(1.0)
 
 
 def test_prefix_uses_independent_action_embedding_and_keeps_state_before_query():

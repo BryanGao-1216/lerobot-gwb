@@ -9,7 +9,7 @@ import copy
 import inspect
 import json
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import dlimp as dl
 import numpy as np
@@ -19,6 +19,7 @@ import tensorflow_datasets as tfds
 import logging
 from lerobot.datasets.rlds.frequency_resampling import (
     CONTROL_FREQUENCY_RESAMPLER_VERSION,
+    native_action_effects_tensor,
     resample_trajectory_tensor,
 )
 from lerobot.datasets.rlds import obs_transforms, traj_transforms
@@ -31,6 +32,7 @@ from lerobot.datasets.rlds.utils.data_utils import (
     pprint_data_mixture,
     tree_map,
 )
+from lerobot.utils.constants import ACTION_TOKENIZER_EFFECT
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = logging.getLogger(__name__)
@@ -52,6 +54,8 @@ def _standardize_and_restructure_trajectory(
     absolute_action_mask,
     source_control_hz=None,
     target_control_hz=None,
+    action_tokenizer_statistics=None,
+    action_tokenizer_window_duration_seconds=None,
 ):
     if standardize_fn is not None:
         traj = standardize_fn(traj)
@@ -109,6 +113,45 @@ def _standardize_and_restructure_trajectory(
             tf.convert_to_tensor(absolute_action_mask, dtype=tf.bool)[None],
             [traj_len, 1],
         )
+    if action_tokenizer_statistics is not None:
+        if source_control_hz is None or action_tokenizer_window_duration_seconds is None:
+            raise ValueError(
+                "Native-rate action-tokenizer effects require source_control_hz and "
+                "action_tokenizer_window_duration_seconds."
+            )
+        if absolute_action_mask is None:
+            raise ValueError("Native-rate action-tokenizer effects require absolute_action_mask.")
+        if traj["action"].shape[-1] != 7:
+            raise ValueError(
+                f"The effect tokenizer requires 7-D standardized actions, got {traj['action'].shape[-1]}."
+            )
+        action_stats = action_tokenizer_statistics["action"]
+        low = tf.convert_to_tensor(action_stats["q01"], dtype=tf.float32)
+        high = tf.convert_to_tensor(action_stats["q99"], dtype=tf.float32)
+        normalize_mask = tf.convert_to_tensor(
+            action_stats.get("mask", np.ones_like(action_stats["q01"], dtype=bool)),
+            dtype=tf.bool,
+        )
+        normalized_action = tf.clip_by_value(
+            2.0 * (traj["action"] - low) / (high - low + 1e-8) - 1.0,
+            -1.0,
+            1.0,
+        )
+        normalized_action = tf.where(normalize_mask, normalized_action, traj["action"])
+        minimum = tf.convert_to_tensor(action_stats["min"], dtype=tf.float32)
+        maximum = tf.convert_to_tensor(action_stats["max"], dtype=tf.float32)
+        normalized_action = tf.where(
+            tf.equal(minimum, maximum),
+            tf.zeros_like(traj["action"]),
+            normalized_action,
+        )
+        traj[ACTION_TOKENIZER_EFFECT] = native_action_effects_tensor(
+            normalized_action,
+            absolute_action_mask=absolute_action_mask,
+            source_hz=float(source_control_hz),
+            window_duration_seconds=float(action_tokenizer_window_duration_seconds),
+            tf=tf,
+        )
     if target_control_hz is not None:
         if source_control_hz is None:
             raise ValueError(
@@ -139,6 +182,8 @@ def _make_restructure_fn(
     absolute_action_mask,
     source_control_hz=None,
     target_control_hz=None,
+    action_tokenizer_statistics=None,
+    action_tokenizer_window_duration_seconds=None,
 ):
     return partial(
         _standardize_and_restructure_trajectory,
@@ -151,6 +196,8 @@ def _make_restructure_fn(
         absolute_action_mask=absolute_action_mask,
         source_control_hz=source_control_hz,
         target_control_hz=target_control_hz,
+        action_tokenizer_statistics=action_tokenizer_statistics,
+        action_tokenizer_window_duration_seconds=action_tokenizer_window_duration_seconds,
     )
 
 
@@ -283,6 +330,8 @@ def make_dataset_from_rlds(
     action_normalization_mask: Optional[List[bool]] = None,
     source_control_hz: Optional[float] = None,
     target_control_hz: Optional[float] = None,
+    action_tokenizer_statistics: Optional[Mapping[str, object]] = None,
+    action_tokenizer_window_duration_seconds: Optional[float] = None,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
 ) -> Tuple[dl.DLataset, dict]:
@@ -366,6 +415,8 @@ def make_dataset_from_rlds(
         absolute_action_mask=absolute_action_mask,
         source_control_hz=source_control_hz,
         target_control_hz=target_control_hz,
+        action_tokenizer_statistics=action_tokenizer_statistics,
+        action_tokenizer_window_duration_seconds=action_tokenizer_window_duration_seconds,
     )
 
     builder = tfds.builder(name, data_dir=data_dir)

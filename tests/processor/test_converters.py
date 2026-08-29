@@ -29,6 +29,7 @@ from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN,
     ACTION_TOKEN_DISTANCES,
+    ACTION_TOKENIZER_EFFECT,
     ACTION_TOKENIZER_INPUT,
     DONE,
     OBS_STATE,
@@ -260,6 +261,7 @@ def test_batch_to_transition_preserves_action_token():
         ACTION_TOKEN: torch.tensor([[0], [255]], dtype=torch.int64),
         ACTION_TOKEN_DISTANCES: torch.randn(2, 256),
         ACTION_TOKENIZER_INPUT: torch.randn(2, 16, 7),
+        ACTION_TOKENIZER_EFFECT: torch.randn(2, 7),
     }
 
     transition = batch_to_transition(batch)
@@ -271,6 +273,7 @@ def test_batch_to_transition_preserves_action_token():
         batch[ACTION_TOKEN_DISTANCES],
     )
     assert torch.equal(comp_data[ACTION_TOKENIZER_INPUT], batch[ACTION_TOKENIZER_INPUT])
+    assert torch.equal(comp_data[ACTION_TOKENIZER_EFFECT], batch[ACTION_TOKENIZER_EFFECT])
 
 
 def testtransition_to_batch_with_index_fields():

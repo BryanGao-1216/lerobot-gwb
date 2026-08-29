@@ -9,6 +9,7 @@ is never interpolated when a target stream needs additional frames.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -17,6 +18,45 @@ import numpy as np
 # Included in statistics-cache hashes. Increment whenever any resampling
 # semantics change so native-rate statistics cannot be reused accidentally.
 CONTROL_FREQUENCY_RESAMPLER_VERSION = "trajectory-nearest-v2"
+
+
+def native_action_effects_tensor(
+    normalized_action: Any,
+    *,
+    absolute_action_mask: Sequence[bool],
+    source_hz: float,
+    window_duration_seconds: float,
+    tf: Any,
+) -> Any:
+    """Compute effectTokenizer descriptors for every native-rate window start."""
+    action_dim = normalized_action.shape[-1]
+    if action_dim != 7:
+        raise ValueError(f"The effect tokenizer requires 7-D actions, got {action_dim}.")
+    mask = _validate_rates_and_mask(int(action_dim), absolute_action_mask, source_hz, source_hz)
+    if window_duration_seconds <= 0:
+        raise ValueError(
+            f"window_duration_seconds must be positive, got {window_duration_seconds}."
+        )
+    native_horizon = max(1, int(math.floor(window_duration_seconds * source_hz + 0.5)))
+    trajectory_length = tf.shape(normalized_action)[0]
+    window_indices = tf.range(trajectory_length)[:, None] + tf.range(native_horizon)[None, :]
+    is_past_episode = window_indices >= trajectory_length
+    clamped_indices = tf.minimum(window_indices, trajectory_length - 1)
+    chunks = tf.gather(normalized_action, clamped_indices)
+    neutral_chunks = tf.where(
+        tf.convert_to_tensor(mask, dtype=tf.bool)[None, None, :],
+        chunks,
+        tf.zeros_like(chunks),
+    )
+    chunks = tf.where(is_past_episode[:, :, None], neutral_chunks, chunks)
+    # Match effectTokenizer's NumPy descriptor exactly: accumulate motion in
+    # float64, then return float32 before the frozen MLP is applied.
+    motion = tf.cast(
+        tf.reduce_sum(tf.cast(chunks[..., :6], tf.float64), axis=1),
+        tf.float32,
+    )
+    gripper = chunks[:, -1, 6:7] - chunks[:, 0, 6:7]
+    return tf.concat((motion, gripper), axis=-1)
 
 
 def _validate_rates_and_mask(

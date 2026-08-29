@@ -58,8 +58,10 @@ def make_oxe_dataset_kwargs(
         dataset_kwargs["absolute_action_mask"] = [False] * 9 + [True]
         dataset_kwargs["action_normalization_mask"] = [True] * 9 + [False]
     dataset_kwargs["action_proprio_normalization_type"] = action_proprio_normalization_type
+    # Native frequency is part of the effect-tokenizer contract even when the
+    # model-side target-rate resampler is disabled.
+    dataset_kwargs["source_control_hz"] = get_oxe_control_frequency_hz(dataset_name)
     if target_control_hz is not None:
-        dataset_kwargs["source_control_hz"] = get_oxe_control_frequency_hz(dataset_name)
         dataset_kwargs["target_control_hz"] = float(target_control_hz)
 
     # Adjust Loaded Camera Views

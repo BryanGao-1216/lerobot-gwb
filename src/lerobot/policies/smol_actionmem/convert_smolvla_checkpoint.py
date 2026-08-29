@@ -21,7 +21,8 @@ Example:
 python -m lerobot.policies.smol_actionmem.convert_smolvla_checkpoint \
   --source lerobot/smolvla_base \
   --output-dir /path/to/models/smol_actionmem-base \
-  --effect-tokenizer-checkpoint /path/to/effect_vqvae.pt
+  --effect-tokenizer-checkpoint /path/to/effect_vqvae.pt \
+  --chunk-size 20
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--source", default="lerobot/smolvla_base")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--effect-tokenizer-checkpoint", type=Path, required=True)
+    parser.add_argument("--chunk-size", type=int, required=True)
     parser.add_argument("--tokenizer-source")
     parser.add_argument("--n-action-steps", type=int)
     parser.add_argument(
@@ -79,6 +81,7 @@ def _make_target_config(
     source_policy: SmolVLAPolicy,
     *,
     effect_metadata: EffectTokenizerMetadata,
+    chunk_size: int,
     n_action_steps: int | None,
 ) -> SmolActionMemConfig:
     target_field_names = {field.name for field in fields(SmolActionMemConfig)}
@@ -90,8 +93,8 @@ def _make_target_config(
     }
     values.update(
         {
-            "chunk_size": effect_metadata.horizon,
-            "n_action_steps": n_action_steps or effect_metadata.horizon,
+            "chunk_size": chunk_size,
+            "n_action_steps": n_action_steps or chunk_size,
             "drop_n_last_frames": 0,
             "num_inference_steps": int(getattr(source_config, "num_steps", 10)),
             "effect_tokenizer_checkpoint_path": effect_metadata.checkpoint_path,
@@ -157,6 +160,7 @@ def convert(args: argparse.Namespace) -> Path:
     target_config = _make_target_config(
         source_policy,
         effect_metadata=effect_metadata,
+        chunk_size=args.chunk_size,
         n_action_steps=args.n_action_steps,
     )
     target_policy = SmolActionMemPolicy(target_config)

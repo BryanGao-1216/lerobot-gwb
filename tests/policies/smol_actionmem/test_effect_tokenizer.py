@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
@@ -38,18 +39,16 @@ def test_effect_encoder_applies_checkpoint_scale_before_latent_distance():
     model = EffectVQVAEActionEncoder(
         encoder=encoder,
         codebook=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-        horizon=2,
         action_dim=7,
-        target_control_hz=10.0,
         gripper_weight=2.0,
         effect_scale=torch.tensor([0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
         normalize_latents=True,
     )
-    actions = torch.zeros(2, 2, 7)
-    actions[0, :, 0] = 1.0
-    actions[1, -1, 6] = 1.0
+    effects = torch.zeros(2, 7)
+    effects[0, 0] = 2.0
+    effects[1, 6] = 1.0
 
-    distances = model.compute_code_distances(actions)
+    distances = model.compute_code_distances_from_effects(effects)
 
     assert torch.equal(distances.argmin(dim=-1), torch.tensor([0, 1]))
 
@@ -82,9 +81,11 @@ def test_load_effect_tokenizer_checkpoint_contract(tmp_path):
             "descriptor_names": list(EFFECT_DESCRIPTOR_NAMES),
             "config": {
                 "data": {
-                    "horizon": 10,
+                    "window_contract_version": 2,
+                    "window_duration_seconds": 1.0,
+                    "sampling_stride_seconds": 0.25,
+                    "pad_incomplete_windows": True,
                     "action_dim": 7,
-                    "target_control_hz": 10.0,
                     "action_normalization": EFFECT_NORMALIZATION_CONTRACT,
                 }
             },
@@ -99,12 +100,14 @@ def test_load_effect_tokenizer_checkpoint_contract(tmp_path):
     expected_prototypes[:, -1] /= 1.5
     expected_prototypes /= torch.tensor([0.1] * 6 + [1.0])
 
-    assert loaded.horizon == 10
     assert loaded.action_dim == 7
     assert loaded.codebook_size == 4
-    assert loaded.target_control_hz == 10.0
-    assert metadata.horizon == 10
+    assert metadata.window_contract_version == 2
+    assert metadata.window_duration_seconds == 1.0
+    metadata.validate_policy_horizon(10, 10.0)
+    with pytest.raises(ValueError, match="chunk_size=20"):
+        metadata.validate_policy_horizon(20, 10.0)
     assert metadata.codebook_size == 4
     assert torch.allclose(prototypes, expected_prototypes)
     assert not any(parameter.requires_grad for parameter in loaded.parameters())
-    assert loaded.compute_code_distances(torch.zeros(2, 10, 7)).shape == (2, 4)
+    assert loaded.compute_code_distances_from_effects(torch.zeros(2, 7)).shape == (2, 4)

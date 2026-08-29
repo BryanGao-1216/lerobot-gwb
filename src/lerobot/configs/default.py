@@ -60,8 +60,9 @@ class DatasetConfig:
     rlds_skip_unlabeled: bool = True
     rlds_num_parallel_calls: int = 16
     # Align every standardized OXE trajectory to one physical control rate
-    # before statistics, normalization and action chunking. The 10 Hz default
-    # matches scripts/effectTokenizer; zero disables it.
+    # before flow statistics, global normalization and action chunking. The
+    # effect-tokenizer branch preserves its native-rate normalization contract;
+    # zero disables model-side resampling.
     rlds_target_control_hz: float = 10.0
     # ``auto`` and ``hybrid`` select local OpenX WebDataset tar shards per
     # source when they exist under ``root/<dataset_name>/*.tar`` and otherwise

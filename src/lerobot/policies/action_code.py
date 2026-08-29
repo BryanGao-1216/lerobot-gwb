@@ -175,6 +175,33 @@ def compute_action_code_objective(
     }
 
 
+def reduce_flow_losses(
+    flow_losses: Tensor,
+    action_is_pad: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Reduce per-element flow losses while excluding episode-tail padding."""
+    if action_is_pad is None:
+        return (
+            flow_losses.mean(),
+            flow_losses.mean(dim=(1, 2)),
+            flow_losses.mean(dim=(0, 1)),
+        )
+    if action_is_pad.shape != flow_losses.shape[:2]:
+        raise ValueError(
+            f"action_is_pad must have shape {tuple(flow_losses.shape[:2])}, got "
+            f"{tuple(action_is_pad.shape)}."
+        )
+    valid = (~action_is_pad.bool()).to(device=flow_losses.device, dtype=flow_losses.dtype)
+    masked = flow_losses * valid.unsqueeze(-1)
+    action_dim = flow_losses.shape[-1]
+    valid_steps = valid.sum().clamp_min(1)
+    scalar = masked.sum() / (valid_steps * action_dim)
+    per_sample_valid = valid.sum(dim=1).clamp_min(1)
+    per_sample = masked.sum(dim=(1, 2)) / (per_sample_valid * action_dim)
+    per_dim = masked.sum(dim=(0, 1)) / valid_steps
+    return scalar, per_sample, per_dim
+
+
 def condition_flow_hidden(
     suffix_out: Tensor,
     action_logits: Tensor,

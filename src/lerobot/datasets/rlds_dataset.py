@@ -55,6 +55,7 @@ from lerobot.utils.constants import (
     ACTION,
     ACTION_TOKEN,
     ACTION_TOKEN_DISTANCES,
+    ACTION_TOKENIZER_EFFECT,
     ACTION_TOKENIZER_INPUT,
     OBS_STATE,
 )
@@ -118,16 +119,14 @@ class RLDSDatasetMetadata:
 
 
 class RLDSActionTokenCollator:
-    """Collate RLDS samples and encode normalized chunks into action codes."""
+    """Collate RLDS samples and encode native-rate endpoint effects into action codes."""
 
     def __init__(
         self,
         checkpoint_path: str | Path,
         device: str = "cpu",
-        expected_horizon: int | None = None,
         expected_action_dim: int | None = None,
         expected_codebook_size: int | None = None,
-        expected_target_control_hz: float | None = None,
     ) -> None:
         self.checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
         self.device = torch.device(device)
@@ -138,7 +137,6 @@ class RLDSActionTokenCollator:
         self.encoder = load_effect_vqvae_action_encoder(self.checkpoint_path)
 
         expected_values = {
-            "horizon": expected_horizon,
             "action_dim": expected_action_dim,
             "codebook_size": expected_codebook_size,
         }
@@ -147,14 +145,6 @@ class RLDSActionTokenCollator:
             for name, expected in expected_values.items()
             if expected is not None and int(getattr(self.encoder, name)) != int(expected)
         ]
-        checkpoint_hz = getattr(self.encoder, "target_control_hz", None)
-        target_hz_mismatch = (checkpoint_hz is None) != (expected_target_control_hz is None)
-        if checkpoint_hz is not None and expected_target_control_hz is not None:
-            target_hz_mismatch = not np.isclose(checkpoint_hz, expected_target_control_hz)
-        if target_hz_mismatch:
-            mismatches.append(
-                f"target_control_hz: checkpoint={checkpoint_hz}, expected={expected_target_control_hz}"
-            )
         if mismatches:
             raise ValueError(
                 "Action-tokenizer checkpoint is incompatible with the RLDS/policy contract: "
@@ -165,9 +155,13 @@ class RLDSActionTokenCollator:
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
         batch = default_collate(samples)
-        actions = batch[ACTION_TOKENIZER_INPUT].to(device=self.device, dtype=torch.float32, non_blocking=True)
+        effects = batch[ACTION_TOKENIZER_EFFECT].to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
         with torch.inference_mode():
-            code_distances = self.encoder.compute_code_distances(actions)
+            code_distances = self.encoder.compute_code_distances_from_effects(effects)
             codes = code_distances.argmin(dim=-1)
         batch[ACTION_TOKEN] = codes.to(device="cpu", dtype=torch.long)
         batch[ACTION_TOKEN_DISTANCES] = code_distances.to(device="cpu", dtype=torch.float32)
@@ -326,11 +320,12 @@ def _denormalize_trajectory(trajectory: dict[str, Any], statistics: Mapping[str,
 def _attach_normalized_action_tokenizer_input(
     trajectory: dict[str, Any], statistics: Mapping[str, Any], tf: Any
 ):
-    """Keep the per-source q01/q99-normalized action for action-code encoding.
+    """Keep a target-rate q01/q99 chunk for OXE filters and diagnostics.
 
     ``trajectory["action"]`` remains in the canonical, unnormalized ActionMem
     action space for metadata and environment post-processing. The flow target
-    is normalized separately by the policy preprocessor.
+    is normalized separately by the policy preprocessor. Exact action-code
+    labels come from the native-rate ``ACTION_TOKENIZER_EFFECT`` branch.
     """
     action = tf.cast(trajectory["action"], tf.float32)
     action_stats = statistics["action"]
@@ -357,33 +352,36 @@ def _filter_vqvla_action_chunk(frame: Mapping[str, Any], chunk_filter_fn: Callab
     return chunk_filter_fn(filter_frame)
 
 
-def _repeat_last_action_for_padded_targets(trajectory: dict[str, Any], horizon: int, tf: Any):
-    """Replace every future action past the episode boundary with its final action.
-
-    The vendored OXE chunk transform normally makes out-of-range relative
-    actions neutral (zero) and absolute actions repeat. ActionMem instead uses
-    one endpoint-effect code for the complete chunk, so all action dimensions
-    follow one unambiguous rule: clamp future indices to the episode's final
-    action. No frame at the end of the episode is discarded.
-    """
-    action = trajectory["action"]
-    trajectory_length = tf.shape(action)[0]
+def _attach_action_padding_mask(trajectory: dict[str, Any], horizon: int, tf: Any):
+    """Expose which neutral-padded flow targets lie beyond the episode."""
+    trajectory_length = tf.shape(trajectory["action"])[0]
     future_indices = tf.range(trajectory_length)[:, None] + tf.range(horizon)[None, :]
-    is_past_episode = future_indices >= trajectory_length
-    final_action = action[-1, 0]
-    trajectory["action"] = tf.where(is_past_episode[:, :, None], final_action[None, None], action)
+    trajectory["action_is_pad"] = future_indices >= trajectory_length
     return trajectory
 
 
-def _slice_action_chunk_with_last_frame(action: np.ndarray, start: int, horizon: int) -> np.ndarray:
-    """Slice a future action chunk and repeat its final available frame to ``horizon``."""
+def _slice_action_chunk_with_neutral_padding(
+    action: np.ndarray,
+    *,
+    start: int,
+    horizon: int,
+    absolute_action_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Slice a future chunk using the effectTokenizer neutral tail contract."""
     chunk = action[start : start + horizon]
     if chunk.shape[0] == 0:
         raise ValueError("Cannot construct an action chunk from an empty episode.")
     missing = horizon - chunk.shape[0]
+    padding_mask = np.arange(horizon) >= chunk.shape[0]
     if missing > 0:
-        chunk = np.concatenate([chunk, np.repeat(chunk[-1:], missing, axis=0)], axis=0)
-    return chunk
+        mask = np.asarray(absolute_action_mask, dtype=bool)
+        if mask.shape != (action.shape[-1],):
+            raise ValueError(
+                f"absolute_action_mask must have shape {(action.shape[-1],)}, got {mask.shape}."
+            )
+        neutral = np.where(mask, action[-1], np.zeros(action.shape[-1], dtype=np.float32))
+        chunk = np.concatenate([chunk, np.repeat(neutral[None], missing, axis=0)], axis=0)
+    return chunk.astype(np.float32, copy=False), padding_mask
 
 
 def _pad_trajectory_proprio(trajectory: dict[str, Any], state_dim: int, tf: Any):
@@ -529,6 +527,7 @@ class ActionMemRLDSDataset(IterableDataset):
         state_dim: int,
         action_tokenizer_checkpoint_path: str | Path | None,
         action_codebook_size: int | None,
+        action_tokenizer_window_duration_seconds: float | None,
         seed: int,
     ) -> None:
         super().__init__()
@@ -536,6 +535,7 @@ class ActionMemRLDSDataset(IterableDataset):
         self.action_horizon = action_horizon
         self.action_dim = action_dim
         self.state_dim = state_dim
+        self.action_tokenizer_window_duration_seconds = action_tokenizer_window_duration_seconds
         self.seed = seed
         self.backend = _load_rlds_backend()
         self.rank, self.world_size = _resolve_rank_and_world_size()
@@ -566,6 +566,11 @@ class ActionMemRLDSDataset(IterableDataset):
             if dataset_config.rlds_target_control_hz > 0
             else None
         )
+        self._include_action_tokenizer_fields = action_tokenizer_checkpoint_path is not None
+        if self._include_action_tokenizer_fields and self.action_tokenizer_window_duration_seconds is None:
+            raise ValueError(
+                "ActionMem RLDS training requires the effect-tokenizer window_duration_seconds contract."
+            )
 
         mixture_spec = _load_mixture_spec(dataset_config, self.backend.named_mixtures)
         per_dataset_kwargs, base_weights = self.backend.get_oxe_dataset_kwargs_and_weights(
@@ -645,17 +650,14 @@ class ActionMemRLDSDataset(IterableDataset):
             camera_keys=camera_keys,
             fps=self.target_control_hz or 1.0,
         )
-        self._include_action_tokenizer_fields = action_tokenizer_checkpoint_path is not None
         if action_tokenizer_checkpoint_path is None:
             self.collate_fn = default_collate
         else:
             self.collate_fn = RLDSActionTokenCollator(
                 checkpoint_path=action_tokenizer_checkpoint_path,
                 device=dataset_config.rlds_action_tokenizer_device,
-                expected_horizon=action_horizon,
                 expected_action_dim=action_dim,
                 expected_codebook_size=action_codebook_size,
-                expected_target_control_hz=self.target_control_hz,
             )
 
         logging.info(
@@ -671,6 +673,16 @@ class ActionMemRLDSDataset(IterableDataset):
             "RLDS storage backends: %s",
             ", ".join(f"{name}={self.source_formats[name]}" for name in self.dataset_names),
         )
+        logging.info(
+            "RLDS policy normalization uses one mixture-weighted global mean/std for action and state."
+        )
+        if self._include_action_tokenizer_fields:
+            logging.info(
+                "RLDS action-code targets use per-source native-rate q01/q99 normalization over %.6gs "
+                "physical windows; policy chunk_size=%d controls the target-rate flow horizon.",
+                self.action_tokenizer_window_duration_seconds,
+                self.action_horizon,
+            )
         if self.target_control_hz is not None:
             logging.info(
                 "OXE control-frequency alignment: %s",
@@ -706,6 +718,7 @@ class ActionMemRLDSDataset(IterableDataset):
         ]
 
         all_statistics: list[Mapping[str, Any]] = []
+        all_tokenizer_statistics: list[Mapping[str, Any] | None] = []
         valid_sizes: list[int] = []
         for kwargs, source_format in zip(per_dataset_kwargs, source_formats, strict=True):
             statistics_kwargs = copy.deepcopy(kwargs)
@@ -735,8 +748,45 @@ class ActionMemRLDSDataset(IterableDataset):
                 kwargs["name"], statistics, action_dim=self.action_dim, state_dim=self.state_dim
             )
             all_statistics.append(statistics)
-            # Every transition is now a valid chunk start because future
-            # indices beyond an episode repeat that episode's final action.
+
+            tokenizer_statistics: Mapping[str, Any] | None = None
+            if self._include_action_tokenizer_fields:
+                source_hz = kwargs.get("source_control_hz")
+                target_hz = kwargs.get("target_control_hz")
+                uses_native_rate = (
+                    target_hz is None
+                    or source_hz is None
+                    or np.isclose(float(source_hz), float(target_hz))
+                )
+                if uses_native_rate:
+                    tokenizer_statistics = statistics
+                else:
+                    native_statistics_kwargs = copy.deepcopy(kwargs)
+                    native_statistics_kwargs["target_control_hz"] = None
+                    native_statistics_kwargs.pop("dataset_frame_transform_kwargs", None)
+                    if source_format == "webdataset":
+                        native_statistics_kwargs = _adapt_openx_tar_source_kwargs(
+                            native_statistics_kwargs,
+                            self.dataset_config.root or "",
+                            standardization_transforms=self.backend.standardization_transforms,
+                        )
+                    _, tokenizer_statistics = make_source(
+                        **native_statistics_kwargs,
+                        train=True,
+                        num_parallel_calls=self.dataset_config.rlds_num_parallel_calls,
+                        num_parallel_reads=self.dataset_config.rlds_num_parallel_calls,
+                        **source_options,
+                    )
+                    _validate_statistics(
+                        kwargs["name"],
+                        tokenizer_statistics,
+                        action_dim=self.action_dim,
+                        state_dim=self.state_dim,
+                    )
+            all_tokenizer_statistics.append(tokenizer_statistics)
+
+            # Every transition remains a valid chunk start; tail entries use
+            # neutral action padding and carry an explicit loss mask.
             valid_sizes.append(max(int(statistics["num_transitions"]), 1))
 
         effective_weights = base_weights.copy()
@@ -766,6 +816,12 @@ class ActionMemRLDSDataset(IterableDataset):
                     absolute_action_mask=source_kwargs.get("absolute_action_mask"),
                     source_control_hz=source_kwargs.get("source_control_hz"),
                     target_control_hz=source_kwargs.get("target_control_hz"),
+                    action_tokenizer_statistics=all_tokenizer_statistics[index],
+                    action_tokenizer_window_duration_seconds=(
+                        self.action_tokenizer_window_duration_seconds
+                        if all_tokenizer_statistics[index] is not None
+                        else None
+                    ),
                 )
                 paths = resolve_openx_tar_paths(self.dataset_config.root or "", source_kwargs["name"])
                 self._webdataset_sources.append(
@@ -773,6 +829,10 @@ class ActionMemRLDSDataset(IterableDataset):
                         "name": source_kwargs["name"],
                         "paths": paths,
                         "statistics": all_statistics[index],
+                        "absolute_action_mask": np.asarray(
+                            source_kwargs.get("absolute_action_mask", [False] * self.action_dim),
+                            dtype=bool,
+                        ),
                         "restructure": restructure,
                         "chunk_filter_fn": frame_transform_kwargs.get("chunk_filter_fn"),
                     }
@@ -807,6 +867,12 @@ class ActionMemRLDSDataset(IterableDataset):
                 num_parallel_calls=threads_per_dataset,
                 num_parallel_reads=threads_per_dataset,
                 dataset_statistics=statistics,
+                action_tokenizer_statistics=all_tokenizer_statistics[index],
+                action_tokenizer_window_duration_seconds=(
+                    self.action_tokenizer_window_duration_seconds
+                    if all_tokenizer_statistics[index] is not None
+                    else None
+                ),
             )
             if self.world_size > 1:
                 source = source.shard(self.world_size, self.rank)
@@ -829,20 +895,21 @@ class ActionMemRLDSDataset(IterableDataset):
             )
             source = source.traj_map(
                 partial(
-                    _repeat_last_action_for_padded_targets,
+                    _attach_action_padding_mask,
                     horizon=self.action_horizon,
                     tf=self.backend.tf,
                 ),
                 threads_per_dataset,
-            )
-            source = source.traj_map(
-                partial(
-                    _attach_normalized_action_tokenizer_input,
-                    statistics=statistics,
-                    tf=self.backend.tf,
-                ),
-                threads_per_dataset,
             ).flatten(num_parallel_calls=threads_per_dataset)
+            if self._include_action_tokenizer_fields or chunk_filter_fn is not None:
+                source = source.frame_map(
+                    partial(
+                        _attach_normalized_action_tokenizer_input,
+                        statistics=statistics,
+                        tf=self.backend.tf,
+                    ),
+                    num_parallel_calls=threads_per_dataset,
+                )
             if chunk_filter_fn is not None:
                 source = source.filter(partial(_filter_vqvla_action_chunk, chunk_filter_fn=chunk_filter_fn))
             source = self.backend.apply_per_dataset_frame_transforms(source, **frame_transform_kwargs)
@@ -876,16 +943,8 @@ class ActionMemRLDSDataset(IterableDataset):
             return np.asarray(image, dtype=np.uint8)
 
     def _iter_webdataset_source(self, source: Mapping[str, Any], source_index: int):
-        statistics = source["statistics"]
-        action_stats = statistics["action"]
-        q01 = np.asarray(action_stats["q01"], dtype=np.float32)
-        q99 = np.asarray(action_stats["q99"], dtype=np.float32)
-        minimum = np.asarray(action_stats["min"], dtype=np.float32)
-        maximum = np.asarray(action_stats["max"], dtype=np.float32)
-        normalization_mask = np.asarray(
-            action_stats.get("mask", np.ones(self.action_dim, dtype=bool)),
-            dtype=bool,
-        )
+        absolute_action_mask = np.asarray(source["absolute_action_mask"], dtype=bool)
+        action_stats = source["statistics"]["action"]
         chunk_filter_fn = source.get("chunk_filter_fn")
         epoch = 0
         while True:
@@ -905,6 +964,11 @@ class ActionMemRLDSDataset(IterableDataset):
                     transform=source["restructure"],
                 )
                 action = np.asarray(trajectory["action"], dtype=np.float32)
+                tokenizer_effects = (
+                    np.asarray(trajectory[ACTION_TOKENIZER_EFFECT], dtype=np.float32)
+                    if self._include_action_tokenizer_fields
+                    else None
+                )
                 observation = trajectory["observation"]
                 proprio = np.asarray(observation["proprio"], dtype=np.float32)
                 language = np.asarray(trajectory["task"]["language_instruction"])
@@ -917,24 +981,43 @@ class ActionMemRLDSDataset(IterableDataset):
                 frame_indices = np.arange(action.shape[0])
                 frame_rng.shuffle(frame_indices)
                 for frame_index in frame_indices:
-                    action_chunk = _slice_action_chunk_with_last_frame(
+                    action_chunk, action_is_pad = _slice_action_chunk_with_neutral_padding(
                         action,
-                        int(frame_index),
-                        self.action_horizon,
+                        start=int(frame_index),
+                        horizon=self.action_horizon,
+                        absolute_action_mask=absolute_action_mask,
                     )
-                    normalized_chunk = np.clip(
-                        2.0 * (action_chunk - q01) / (q99 - q01 + 1e-8) - 1.0,
-                        -1.0,
-                        1.0,
-                    )
-                    normalized_chunk = np.where(normalization_mask, normalized_chunk, action_chunk)
-                    normalized_chunk = np.where(minimum == maximum, 0.0, normalized_chunk).astype(np.float32)
-                    if chunk_filter_fn is not None:
-                        keep = chunk_filter_fn(
-                            {"action": self.backend.tf.convert_to_tensor(normalized_chunk)}
+                    normalized_chunk = None
+                    if self._include_action_tokenizer_fields or chunk_filter_fn is not None:
+                        q01 = np.asarray(action_stats["q01"], dtype=np.float32)
+                        q99 = np.asarray(action_stats["q99"], dtype=np.float32)
+                        minimum = np.asarray(action_stats["min"], dtype=np.float32)
+                        maximum = np.asarray(action_stats["max"], dtype=np.float32)
+                        normalization_mask = np.asarray(
+                            action_stats.get("mask", np.ones(self.action_dim, dtype=bool)),
+                            dtype=bool,
                         )
-                        if not bool(np.asarray(keep)):
-                            continue
+                        normalized_chunk = np.clip(
+                            2.0 * (action_chunk - q01) / (q99 - q01 + 1e-8) - 1.0,
+                            -1.0,
+                            1.0,
+                        )
+                        normalized_chunk = np.where(
+                            normalization_mask,
+                            normalized_chunk,
+                            action_chunk,
+                        )
+                        normalized_chunk = np.where(
+                            minimum == maximum,
+                            0.0,
+                            normalized_chunk,
+                        ).astype(np.float32)
+                        if chunk_filter_fn is not None:
+                            keep = chunk_filter_fn(
+                                {"action": self.backend.tf.convert_to_tensor(normalized_chunk)}
+                            )
+                            if not bool(np.asarray(keep)):
+                                continue
 
                     pad_mask_dict: dict[str, np.ndarray] = {}
                     frame_observation: dict[str, Any] = {
@@ -957,13 +1040,17 @@ class ActionMemRLDSDataset(IterableDataset):
                         pad_mask_dict[key] = np.asarray([image_is_present], dtype=bool)
 
                     yielded_in_epoch = True
-                    yield {
+                    frame = {
                         "observation": frame_observation,
                         "task": {"language_instruction": language[frame_index]},
                         "action": action_chunk,
-                        ACTION_TOKENIZER_INPUT: normalized_chunk,
+                        "action_is_pad": action_is_pad,
                         "dataset_name": source["name"],
                     }
+                    if tokenizer_effects is not None:
+                        frame[ACTION_TOKENIZER_EFFECT] = tokenizer_effects[frame_index]
+                        frame[ACTION_TOKENIZER_INPUT] = normalized_chunk
+                    yield frame
             if not yielded_in_epoch:
                 raise ValueError(
                     f"OpenX tar source {source['name']!r} produced no valid samples on rank "
@@ -1051,10 +1138,18 @@ class ActionMemRLDSDataset(IterableDataset):
             raise ValueError(
                 f"Expected RLDS action chunk {(self.action_horizon, self.action_dim)}, got {action.shape}."
             )
+        action_is_pad = np.asarray(
+            frame.get("action_is_pad", np.zeros(self.action_horizon, dtype=bool)),
+            dtype=bool,
+        )
+        if action_is_pad.shape != (self.action_horizon,):
+            raise ValueError(
+                f"Expected RLDS action padding mask {(self.action_horizon,)}, got {action_is_pad.shape}."
+            )
         sample: dict[str, Any] = {
             OBS_STATE: torch.from_numpy(state),
             ACTION: torch.from_numpy(action.copy()),
-            "action_is_pad": torch.zeros(self.action_horizon, dtype=torch.bool),
+            "action_is_pad": torch.from_numpy(action_is_pad.copy()),
             "task": _decode_text(frame["task"]["language_instruction"]),
             "dataset_name": _decode_text(frame["dataset_name"]),
         }
@@ -1062,10 +1157,17 @@ class ActionMemRLDSDataset(IterableDataset):
             action_tokenizer_input = np.asarray(frame[ACTION_TOKENIZER_INPUT], dtype=np.float32)
             if action_tokenizer_input.shape != (self.action_horizon, self.action_dim):
                 raise ValueError(
-                    "Expected q01/q99-normalized RLDS action-tokenizer chunk "
+                    "Expected target-rate q01/q99-normalized diagnostic action chunk "
                     f"{(self.action_horizon, self.action_dim)}, got {action_tokenizer_input.shape}."
                 )
+            action_tokenizer_effect = np.asarray(frame[ACTION_TOKENIZER_EFFECT], dtype=np.float32)
+            if action_tokenizer_effect.shape != (self.action_dim,):
+                raise ValueError(
+                    "Expected native-rate q01/q99-normalized endpoint effect "
+                    f"{(self.action_dim,)}, got {action_tokenizer_effect.shape}."
+                )
             sample[ACTION_TOKENIZER_INPUT] = torch.from_numpy(action_tokenizer_input.copy())
+            sample[ACTION_TOKENIZER_EFFECT] = torch.from_numpy(action_tokenizer_effect.copy())
 
         pad_masks = observation.get("pad_mask_dict", {})
         for view in self.dataset_config.rlds_camera_views:
@@ -1138,18 +1240,17 @@ def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
             "--policy.effect_tokenizer_checkpoint_path."
         )
     metadata = load_effect_tokenizer_metadata(checkpoint_path)
-    action_horizon = metadata.horizon
-    action_dim = metadata.action_dim
     requested_hz = (
         float(cfg.dataset.rlds_target_control_hz) if cfg.dataset.rlds_target_control_hz > 0 else None
     )
-    frequency_mismatch = (metadata.target_control_hz is None) != (requested_hz is None)
-    if metadata.target_control_hz is not None and requested_hz is not None:
-        frequency_mismatch = not np.isclose(metadata.target_control_hz, requested_hz)
-    if frequency_mismatch:
+    action_horizon = int(cfg.trainable_config.chunk_size)
+    metadata.validate_policy_horizon(action_horizon, requested_hz)
+    action_dim = metadata.action_dim
+    if metadata.window_contract_version >= 2 and not metadata.pad_incomplete_windows:
         raise ValueError(
-            f"dataset.rlds_target_control_hz={requested_hz} does not match effect-tokenizer "
-            f"target_control_hz={metadata.target_control_hz}."
+            "The effect-tokenizer checkpoint was trained with pad_incomplete_windows=False, but the "
+            "RLDS policy stream keeps every episode frame using neutral tail padding. Train the tokenizer "
+            "with --pad-incomplete-windows or use a matching drop-tail policy stream."
         )
     action_codebook_size = int(policy_config.action_codebook_size)
     if action_codebook_size != metadata.codebook_size:
@@ -1158,11 +1259,6 @@ def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
             f"codebook_size={metadata.codebook_size}."
         )
 
-    configured_chunk_size = int(getattr(cfg.trainable_config, "chunk_size", action_horizon))
-    if configured_chunk_size != action_horizon:
-        raise ValueError(
-            f"Policy chunk_size={configured_chunk_size} must match action-tokenizer horizon={action_horizon}."
-        )
     state_dim = cfg.dataset.rlds_state_dim or int(getattr(cfg.trainable_config, "max_state_dim", 32))
     return ActionMemRLDSDataset(
         dataset_config=cfg.dataset,
@@ -1171,6 +1267,7 @@ def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
         state_dim=state_dim,
         action_tokenizer_checkpoint_path=checkpoint_path,
         action_codebook_size=action_codebook_size,
+        action_tokenizer_window_duration_seconds=metadata.window_duration_seconds,
         seed=cfg.seed if cfg.seed is not None else 0,
     )
 
@@ -1203,6 +1300,7 @@ def make_smolvla_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
         state_dim=state_dim,
         action_tokenizer_checkpoint_path=None,
         action_codebook_size=None,
+        action_tokenizer_window_duration_seconds=None,
         seed=cfg.seed if cfg.seed is not None else 0,
     )
 

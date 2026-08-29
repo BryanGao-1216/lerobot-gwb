@@ -63,6 +63,7 @@ from ..action_code import (
     compute_action_code_objective,
     condition_flow_hidden,
     fill_missing_initialized_state,
+    reduce_flow_losses,
     validate_action_code_sequence,
 )
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
@@ -1563,12 +1564,15 @@ class ActionMemPolicy(PreTrainedPolicy):
             # Truncate losses to actual action dimensions.
             original_action_dim = self.config.output_features[ACTION].shape[0]
             flow_losses = model_output["flow_losses"][:, :, :original_action_dim]
-            flow_loss = flow_losses.mean()
+            flow_loss, per_sample_flow_loss, loss_per_dim = reduce_flow_losses(
+                flow_losses,
+                batch.get("action_is_pad"),
+            )
             scalar_terms.append(self.config.flow_loss_weight * flow_loss)
-            per_sample_terms.append(self.config.flow_loss_weight * flow_losses.mean(dim=(1, 2)))
+            per_sample_terms.append(self.config.flow_loss_weight * per_sample_flow_loss)
             loss_dict.update(
                 {
-                    "loss_per_dim": flow_losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+                    "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),
                     "flow_loss": flow_loss.item(),
                     "weighted_flow_loss": (self.config.flow_loss_weight * flow_loss).item(),
                     "action_condition_gamma_rms": model_output["action_condition_gamma_rms"].item(),

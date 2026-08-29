@@ -25,6 +25,7 @@ gripper component is final-minus-initial.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,10 +52,27 @@ EFFECT_NORMALIZATION_CONTRACT = "per_dataset_q01_q99_to_minus1_plus1_except_grip
 @dataclass(frozen=True)
 class EffectTokenizerMetadata:
     checkpoint_path: str
-    horizon: int
     action_dim: int
-    target_control_hz: float | None
     codebook_size: int
+    window_contract_version: int
+    window_duration_seconds: float
+    sampling_stride_seconds: float | None
+    pad_incomplete_windows: bool
+
+    def validate_policy_horizon(self, horizon: int, target_control_hz: float | None) -> None:
+        """Check that the policy-controlled chunk spans the tokenizer duration."""
+        if horizon <= 0:
+            raise ValueError(f"Policy chunk_size must be positive, got {horizon}.")
+        if target_control_hz is None:
+            return
+        expected = max(1, int(math.floor(self.window_duration_seconds * target_control_hz + 0.5)))
+        if horizon != expected:
+            raise ValueError(
+                f"Policy chunk_size={horizon} spans {horizon / target_control_hz:g}s at "
+                f"dataset.rlds_target_control_hz={target_control_hz:g}, but the effect tokenizer "
+                f"was trained with window_duration_seconds={self.window_duration_seconds:g} "
+                f"({expected} target-rate frames)."
+            )
 
 
 def _make_mlp(
@@ -120,6 +138,32 @@ def _validate_checkpoint_contract(checkpoint: Mapping[str, Any], path: Path) -> 
         )
 
 
+def _validate_data_contract(data_config: Mapping[str, Any], path: Path) -> None:
+    normalization = data_config.get("action_normalization")
+    if normalization != EFFECT_NORMALIZATION_CONTRACT:
+        raise ValueError(
+            f"Effect-tokenizer checkpoint {path} uses action_normalization={normalization!r}; "
+            f"expected {EFFECT_NORMALIZATION_CONTRACT!r}."
+        )
+    if int(data_config.get("window_contract_version", 0)) != 2:
+        raise ValueError(
+            f"Effect-tokenizer checkpoint {path} must use window_contract_version=2."
+        )
+    if "window_duration_seconds" not in data_config:
+        raise ValueError(
+            f"Effect-tokenizer checkpoint {path} is missing window_duration_seconds."
+        )
+    if float(data_config["window_duration_seconds"]) <= 0:
+        raise ValueError(
+            f"Effect-tokenizer checkpoint {path} has non-positive window_duration_seconds="
+            f"{data_config['window_duration_seconds']}."
+        )
+    if "pad_incomplete_windows" not in data_config:
+        raise ValueError(
+            f"Effect-tokenizer checkpoint {path} is missing pad_incomplete_windows."
+        )
+
+
 def load_effect_tokenizer_metadata(checkpoint_path: str | Path) -> EffectTokenizerMetadata:
     """Read the data/codebook contract without constructing the MLP."""
     resolved_path = Path(checkpoint_path).expanduser().resolve()
@@ -134,40 +178,38 @@ def load_effect_tokenizer_metadata(checkpoint_path: str | Path) -> EffectTokeniz
     if not isinstance(saved_config, Mapping) or not isinstance(saved_config.get("data"), Mapping):
         raise ValueError(f"Effect-tokenizer checkpoint {resolved_path} is missing config.data.")
     data_config = saved_config["data"]
-    normalization = data_config.get("action_normalization")
-    if normalization != EFFECT_NORMALIZATION_CONTRACT:
-        raise ValueError(
-            f"Effect-tokenizer checkpoint {resolved_path} uses action_normalization={normalization!r}; "
-            f"expected {EFFECT_NORMALIZATION_CONTRACT!r}."
-        )
-    target_control_hz_raw = data_config.get("target_control_hz")
+    _validate_data_contract(data_config, resolved_path)
+    window_contract_version = int(data_config["window_contract_version"])
+    window_duration_raw = data_config["window_duration_seconds"]
     return EffectTokenizerMetadata(
         checkpoint_path=str(resolved_path),
-        horizon=int(data_config["horizon"]),
         action_dim=int(data_config["action_dim"]),
-        target_control_hz=None if target_control_hz_raw is None else float(target_control_hz_raw),
         codebook_size=int(model_config.get("codebook_size", 256)),
+        window_contract_version=window_contract_version,
+        window_duration_seconds=float(window_duration_raw),
+        sampling_stride_seconds=(
+            None
+            if data_config.get("sampling_stride_seconds") is None
+            else float(data_config["sampling_stride_seconds"])
+        ),
+        pad_incomplete_windows=bool(data_config["pad_incomplete_windows"]),
     )
 
 
 class EffectVQVAEActionEncoder(nn.Module):
-    """Encode normalized action chunks and return all spherical-code distances."""
+    """Encode normalized endpoint effects and return all spherical-code distances."""
 
     def __init__(
         self,
         *,
         encoder: nn.Module,
         codebook: Tensor,
-        horizon: int,
         action_dim: int,
-        target_control_hz: float | None,
         gripper_weight: float,
         effect_scale: Tensor,
         normalize_latents: bool,
     ) -> None:
         super().__init__()
-        if horizon <= 0:
-            raise ValueError(f"Effect-tokenizer horizon must be positive, got {horizon}.")
         if action_dim != len(EFFECT_DESCRIPTOR_NAMES):
             raise ValueError(
                 f"Effect tokenizer requires action_dim={len(EFFECT_DESCRIPTOR_NAMES)}, got {action_dim}."
@@ -184,20 +226,17 @@ class EffectVQVAEActionEncoder(nn.Module):
         self.encoder = encoder
         self.register_buffer("codebook", codebook.detach().to(torch.float32))
         self.register_buffer("effect_scale", effect_scale.detach().to(torch.float32))
-        self.horizon = int(horizon)
         self.action_dim = int(action_dim)
-        self.target_control_hz = target_control_hz
         self.gripper_weight = float(gripper_weight)
         self.normalize_latents = bool(normalize_latents)
         self.codebook_size = int(codebook.shape[0])
 
-    def _encode_latents(self, actions: Tensor) -> Tensor:
-        actions = actions.to(device=self.codebook.device, dtype=torch.float32)
-        if actions.ndim != 3 or actions.shape[1:] != (self.horizon, self.action_dim):
+    def _encode_effect_latents(self, effects: Tensor) -> Tensor:
+        effects = effects.to(device=self.codebook.device, dtype=torch.float32)
+        if effects.ndim != 2 or effects.shape[-1] != self.action_dim:
             raise ValueError(
-                f"Expected action chunks [B, {self.horizon}, {self.action_dim}], got {tuple(actions.shape)}."
+                f"Expected endpoint effects [B, {self.action_dim}], got {tuple(effects.shape)}."
             )
-        effects = compute_effect_descriptors(actions)
         effects = effects * self.effect_scale
         effects[..., -1] *= self.gripper_weight
         latents = self.encoder(effects)
@@ -210,8 +249,8 @@ class EffectVQVAEActionEncoder(nn.Module):
             return F.normalize(self.codebook.float(), dim=-1, eps=1e-6)
         return self.codebook.float()
 
-    def compute_code_distances(self, actions: Tensor) -> Tensor:
-        latents = self._encode_latents(actions)
+    def compute_code_distances_from_effects(self, effects: Tensor) -> Tensor:
+        latents = self._encode_effect_latents(effects)
         centers = self.normalized_codebook()
         return (
             latents.square().sum(dim=-1, keepdim=True)
@@ -219,8 +258,8 @@ class EffectVQVAEActionEncoder(nn.Module):
             - 2.0 * latents @ centers.t()
         ).clamp_min_(0.0)
 
-    def forward(self, actions: Tensor) -> Tensor:
-        return self.compute_code_distances(actions).argmin(dim=-1)
+    def forward(self, effects: Tensor) -> Tensor:
+        return self.compute_code_distances_from_effects(effects).argmin(dim=-1)
 
 
 def load_effect_vqvae_action_encoder(checkpoint_path: str | Path) -> EffectVQVAEActionEncoder:
@@ -244,13 +283,7 @@ def load_effect_vqvae_action_encoder(checkpoint_path: str | Path) -> EffectVQVAE
             f"Effect-tokenizer checkpoint {resolved_path} is missing the config.data contract."
         )
     data_config = saved_config["data"]
-
-    normalization = data_config.get("action_normalization")
-    if normalization != EFFECT_NORMALIZATION_CONTRACT:
-        raise ValueError(
-            f"Effect-tokenizer checkpoint {resolved_path} uses action_normalization={normalization!r}; "
-            f"expected {EFFECT_NORMALIZATION_CONTRACT!r}."
-        )
+    _validate_data_contract(data_config, resolved_path)
 
     input_dim = int(model_config.get("input_dim", len(EFFECT_DESCRIPTOR_NAMES)))
     hidden_dim = int(model_config.get("hidden_dim", 128))
@@ -280,17 +313,13 @@ def load_effect_vqvae_action_encoder(checkpoint_path: str | Path) -> EffectVQVAE
             f"expected {(codebook_size, latent_dim)}."
         )
 
-    target_control_hz_raw = data_config.get("target_control_hz")
-    target_control_hz = None if target_control_hz_raw is None else float(target_control_hz_raw)
     effect_scale = torch.as_tensor(
         checkpoint.get("effect_scale", [1.0] * len(EFFECT_DESCRIPTOR_NAMES)), dtype=torch.float32
     )
     model = EffectVQVAEActionEncoder(
         encoder=encoder,
         codebook=codebook,
-        horizon=int(data_config["horizon"]),
         action_dim=int(data_config["action_dim"]),
-        target_control_hz=target_control_hz,
         gripper_weight=float(checkpoint["gripper_weight"]),
         effect_scale=effect_scale,
         normalize_latents=normalize_latents,

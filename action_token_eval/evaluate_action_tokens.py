@@ -125,25 +125,13 @@ def _make_dataset(
     seed: int,
 ) -> ActionMemRLDSDataset:
     metadata = load_effect_tokenizer_metadata(args.effect_tokenizer_checkpoint)
-    if policy_config.chunk_size != metadata.horizon:
-        raise ValueError(
-            f"Policy chunk_size={policy_config.chunk_size} does not match effect-tokenizer "
-            f"horizon={metadata.horizon}."
-        )
     if policy_config.action_codebook_size != metadata.codebook_size:
         raise ValueError(
             f"Policy codebook_size={policy_config.action_codebook_size} does not match "
             f"effect-tokenizer codebook_size={metadata.codebook_size}."
         )
     target_hz = args.target_control_hz if args.target_control_hz > 0 else None
-    hz_mismatch = (metadata.target_control_hz is None) != (target_hz is None)
-    if metadata.target_control_hz is not None and target_hz is not None:
-        hz_mismatch = not np.isclose(metadata.target_control_hz, target_hz)
-    if hz_mismatch:
-        raise ValueError(
-            f"Requested target_control_hz={target_hz} does not match effect-tokenizer "
-            f"target_control_hz={metadata.target_control_hz}."
-        )
+    metadata.validate_policy_horizon(policy_config.chunk_size, target_hz)
 
     camera_views = tuple(view.strip() for view in args.camera_views.split(",") if view.strip())
     dataset_config = DatasetConfig(
@@ -162,11 +150,12 @@ def _make_dataset(
     state_dim = args.state_dim or policy_config.max_state_dim
     return ActionMemRLDSDataset(
         dataset_config=dataset_config,
-        action_horizon=metadata.horizon,
+        action_horizon=policy_config.chunk_size,
         action_dim=metadata.action_dim,
         state_dim=state_dim,
         action_tokenizer_checkpoint_path=args.effect_tokenizer_checkpoint,
         action_codebook_size=metadata.codebook_size,
+        action_tokenizer_window_duration_seconds=metadata.window_duration_seconds,
         seed=seed,
     )
 

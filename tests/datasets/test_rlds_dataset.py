@@ -25,17 +25,18 @@ import pytest
 import torch
 
 from lerobot.configs.default import DatasetConfig
+from lerobot.datasets.rlds.frequency_resampling import native_action_effects_tensor
 from lerobot.datasets.rlds_dataset import (
     ActionMemRLDSDataset,
     RLDSActionTokenCollator,
     _adapt_openx_tar_source_kwargs,
     _aggregate_weighted_stats,
+    _attach_action_padding_mask,
     _attach_normalized_action_tokenizer_input,
     _filter_vqvla_action_chunk,
     _load_mixture_spec,
-    _repeat_last_action_for_padded_targets,
     _resolve_rlds_source_format,
-    _slice_action_chunk_with_last_frame,
+    _slice_action_chunk_with_neutral_padding,
     _validate_statistics,
     make_policy_rlds_dataset,
 )
@@ -47,12 +48,14 @@ from lerobot.datasets.rlds_webdataset import (
 )
 from lerobot.utils.constants import (
     ACTION_TOKEN_DISTANCES,
+    ACTION_TOKENIZER_EFFECT,
     ACTION_TOKENIZER_INPUT,
 )
 
 
 class _NumpyTensorFlow:
     float32 = np.float32
+    float64 = np.float64
     bool = np.bool_
 
     @staticmethod
@@ -76,8 +79,8 @@ class _NumpyTensorFlow:
         return np.clip(value, minimum, maximum)
 
     @staticmethod
-    def zeros_like(value):
-        return np.zeros_like(value)
+    def zeros_like(value, dtype=None):
+        return np.zeros_like(value, dtype=dtype)
 
     @staticmethod
     def shape(value):
@@ -90,6 +93,22 @@ class _NumpyTensorFlow:
     @staticmethod
     def range(limit):
         return np.arange(limit)
+
+    @staticmethod
+    def minimum(left, right):
+        return np.minimum(left, right)
+
+    @staticmethod
+    def gather(value, indices):
+        return np.asarray(value)[indices]
+
+    @staticmethod
+    def reduce_sum(value, axis):
+        return np.sum(value, axis=axis)
+
+    @staticmethod
+    def concat(values, axis):
+        return np.concatenate(values, axis=axis)
 
 
 def test_load_explicit_rlds_mixture(tmp_path):
@@ -420,14 +439,31 @@ def test_action_tokenizer_input_matches_oxe_q01_q99_and_preserves_gripper():
     )
 
 
-def test_rlds_collator_encodes_only_normalized_action_tokenizer_input():
+def test_native_action_effects_use_source_rate_and_neutral_tail_padding():
+    normalized_action = np.zeros((3, 7), dtype=np.float32)
+    normalized_action[:, 0] = [1.0, 2.0, 3.0]
+    normalized_action[:, 6] = [0.0, 1.0, 0.5]
+
+    effects = native_action_effects_tensor(
+        normalized_action,
+        absolute_action_mask=[False] * 6 + [True],
+        source_hz=2.0,
+        window_duration_seconds=1.0,
+        tf=_NumpyTensorFlow,
+    )
+
+    assert np.allclose(effects[:, 0], [3.0, 5.0, 3.0])
+    assert np.allclose(effects[:, 6], [1.0, -0.5, 0.0])
+
+
+def test_rlds_collator_encodes_native_action_effect_instead_of_diagnostic_chunk():
     class _RecordingEncoder:
         def __init__(self):
-            self.actions = None
+            self.effects = None
 
-        def compute_code_distances(self, actions):
-            self.actions = actions.clone()
-            distances = torch.ones(actions.shape[0], 256, device=actions.device)
+        def compute_code_distances_from_effects(self, effects):
+            self.effects = effects.clone()
+            distances = torch.ones(effects.shape[0], 256, device=effects.device)
             distances[:, 17] = 0
             return distances
 
@@ -436,17 +472,19 @@ def test_rlds_collator_encodes_only_normalized_action_tokenizer_input():
     collator.encoder = _RecordingEncoder()
     raw_action = torch.full((2, 3), 10.0)
     normalized_action = torch.full((2, 3), 0.25)
+    native_effect = torch.arange(3, dtype=torch.float32)
 
     batch = collator(
         [
             {
                 "action": raw_action,
                 ACTION_TOKENIZER_INPUT: normalized_action,
+                ACTION_TOKENIZER_EFFECT: native_effect,
             }
         ]
     )
 
-    assert torch.equal(collator.encoder.actions, normalized_action.unsqueeze(0))
+    assert torch.equal(collator.encoder.effects, native_effect.unsqueeze(0))
     assert torch.equal(batch["action"], raw_action.unsqueeze(0))
     assert torch.equal(batch["action_token"], torch.tensor([17]))
     assert batch[ACTION_TOKEN_DISTANCES].shape == (1, 256)
@@ -470,7 +508,7 @@ def test_vqvla_chunk_filter_reads_shared_normalized_action_without_overwriting_r
     assert np.all(frame["action"] == 10.0)
 
 
-def test_tfds_tail_chunks_repeat_final_action_in_every_dimension():
+def test_tfds_tail_padding_mask_marks_only_out_of_episode_targets():
     trajectory = {
         "action": np.array(
             [
@@ -482,26 +520,38 @@ def test_tfds_tail_chunks_repeat_final_action_in_every_dimension():
         )
     }
 
-    result = _repeat_last_action_for_padded_targets(trajectory, horizon=4, tf=_NumpyTensorFlow)
+    result = _attach_action_padding_mask(trajectory, horizon=4, tf=_NumpyTensorFlow)
 
     assert np.array_equal(
-        result["action"],
+        result["action_is_pad"],
         [
-            [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [3.0, 30.0]],
-            [[2.0, 20.0], [3.0, 30.0], [3.0, 30.0], [3.0, 30.0]],
-            [[3.0, 30.0], [3.0, 30.0], [3.0, 30.0], [3.0, 30.0]],
+            [False, False, False, True],
+            [False, False, True, True],
+            [False, True, True, True],
         ],
     )
 
 
-def test_webdataset_tail_chunks_repeat_final_action_and_keep_last_start():
-    action = np.array([[1.0], [2.0], [3.0]], dtype=np.float32)
+def test_webdataset_tail_chunks_zero_relative_and_hold_absolute_action():
+    action = np.array([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]], dtype=np.float32)
 
-    penultimate = _slice_action_chunk_with_last_frame(action, start=1, horizon=4)
-    final = _slice_action_chunk_with_last_frame(action, start=2, horizon=4)
+    penultimate, penultimate_pad = _slice_action_chunk_with_neutral_padding(
+        action,
+        start=1,
+        horizon=4,
+        absolute_action_mask=np.array([False, True]),
+    )
+    final, final_pad = _slice_action_chunk_with_neutral_padding(
+        action,
+        start=2,
+        horizon=4,
+        absolute_action_mask=np.array([False, True]),
+    )
 
-    assert np.array_equal(penultimate[:, 0], [2.0, 3.0, 3.0, 3.0])
-    assert np.array_equal(final[:, 0], [3.0, 3.0, 3.0, 3.0])
+    assert np.array_equal(penultimate, [[2.0, 20.0], [3.0, 30.0], [0.0, 30.0], [0.0, 30.0]])
+    assert np.array_equal(final, [[3.0, 30.0], [0.0, 30.0], [0.0, 30.0], [0.0, 30.0]])
+    assert np.array_equal(penultimate_pad, [False, False, True, True])
+    assert np.array_equal(final_pad, [False, True, True, True])
 
 
 def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
@@ -516,6 +566,8 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
     frame = {
         "action": np.zeros((16, 7), dtype=np.float32),
         ACTION_TOKENIZER_INPUT: np.full((16, 7), 0.25, dtype=np.float32),
+        ACTION_TOKENIZER_EFFECT: np.arange(7, dtype=np.float32),
+        "action_is_pad": np.array([False] * 15 + [True]),
         "dataset_name": b"droid",
         "task": {"language_instruction": b"pick up the cup"},
         "observation": {
@@ -533,6 +585,8 @@ def test_rlds_frame_is_converted_to_lerobot_actionmem_sample():
 
     assert sample["action"].shape == (16, 7)
     assert torch.all(sample[ACTION_TOKENIZER_INPUT] == 0.25)
+    assert torch.equal(sample[ACTION_TOKENIZER_EFFECT], torch.arange(7, dtype=torch.float32))
+    assert sample["action_is_pad"][-1]
     assert sample["observation.state"].shape == (10,)
     assert sample["observation.images.image"].shape == (3, 8, 8)
     assert sample["observation.images.image3_padding_mask"].item() is False
@@ -551,6 +605,7 @@ def test_rlds_frame_for_smolvla_uses_plain_lerobot_contract():
     )
     frame = {
         "action": np.zeros((10, 7), dtype=np.float32),
+        "action_is_pad": np.zeros(10, dtype=bool),
         "dataset_name": b"libero_spatial_no_noops",
         "task": {"language_instruction": b"pick up the bowl"},
         "observation": {
@@ -594,4 +649,5 @@ def test_rlds_dispatch_builds_smolvla_without_effect_tokenizer(monkeypatch):
     assert captured["state_dim"] == 32
     assert captured["action_tokenizer_checkpoint_path"] is None
     assert captured["action_codebook_size"] is None
+    assert captured["action_tokenizer_window_duration_seconds"] is None
     assert captured["seed"] == 42

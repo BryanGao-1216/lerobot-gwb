@@ -33,7 +33,7 @@ class PI05ActionMemConfig(PreTrainedConfig):
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
     n_obs_steps: int = 1
-    chunk_size: int = 10  # Must match the endpoint-effect tokenizer horizon
+    chunk_size: int = 10  # Policy-controlled action horizon
     n_action_steps: int = 10  # Number of action steps to execute
 
     # Shorter state and action vectors will be padded to these dimensions

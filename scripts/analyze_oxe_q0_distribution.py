@@ -72,6 +72,8 @@ def _parse_args() -> argparse.Namespace:
         help="Optional explicit subset names. Each receives mixture weight 1.0.",
     )
     parser.add_argument("--effect-tokenizer-checkpoint", type=Path, required=True)
+    parser.add_argument("--chunk-size", type=int, default=20)
+    parser.add_argument("--target-control-hz", type=float, default=20.0)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--rlds-storage-format",
@@ -115,11 +117,19 @@ def _parse_args() -> argparse.Namespace:
         help="Stop on the first incompatible/missing subset. By default errors are recorded and other subsets continue.",
     )
     args = parser.parse_args()
-    for name in ("samples_per_dataset", "batch_size", "state_dim", "rlds_num_parallel_calls"):
+    for name in (
+        "samples_per_dataset",
+        "batch_size",
+        "state_dim",
+        "rlds_num_parallel_calls",
+        "chunk_size",
+    ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.rlds_shuffle_buffer_size <= 0:
         parser.error("--rlds-shuffle-buffer-size must be positive")
+    if args.target_control_hz <= 0:
+        parser.error("--target-control-hz must be positive")
     if args.soft_target_temperature <= 0:
         parser.error("--soft-target-temperature must be positive")
     if args.progress_every < 0:
@@ -204,7 +214,7 @@ def _analyze_dataset(
     with torch.inference_mode():
         for action_batch in _batch_actions(limited_frames(), batch_size, action_key):
             actions = torch.from_numpy(action_batch).to(device=device, dtype=torch.float32)
-            distances = encoder.compute_code_distances(actions).float()
+            distances = encoder.compute_code_distances_from_effects(actions).float()
             if distances.ndim != 2 or distances.shape[1] != codebook_size:
                 raise ValueError(
                     f"Expected code distances [B, {codebook_size}], got {tuple(distances.shape)} for {dataset_name}."
@@ -366,7 +376,7 @@ def main() -> None:
         _load_rlds_backend,
     )
     from lerobot.policies.effect_tokenizer import load_effect_tokenizer_metadata
-    from lerobot.utils.constants import ACTION_TOKENIZER_INPUT
+    from lerobot.utils.constants import ACTION_TOKENIZER_EFFECT
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"--device={args.device!r} requested CUDA, but PyTorch cannot access CUDA.")
@@ -390,7 +400,8 @@ def main() -> None:
     )
 
     metadata = load_effect_tokenizer_metadata(checkpoint)
-    action_horizon = metadata.horizon
+    action_horizon = args.chunk_size
+    metadata.validate_policy_horizon(action_horizon, args.target_control_hz)
     action_dim = metadata.action_dim
     codebook_size = metadata.codebook_size
 
@@ -420,7 +431,7 @@ def main() -> None:
                 rlds_skip_unlabeled=True,
                 rlds_num_parallel_calls=args.rlds_num_parallel_calls,
                 rlds_storage_format=args.rlds_storage_format,
-                rlds_target_control_hz=metadata.target_control_hz or 0.0,
+                rlds_target_control_hz=args.target_control_hz,
                 rlds_action_tokenizer_device=args.device,
                 rlds_state_dim=args.state_dim,
             )
@@ -431,6 +442,7 @@ def main() -> None:
                 state_dim=args.state_dim,
                 action_tokenizer_checkpoint_path=checkpoint,
                 action_codebook_size=codebook_size,
+                action_tokenizer_window_duration_seconds=metadata.window_duration_seconds,
                 seed=args.seed,
             )
             if len(dataset.dataset_names) != 1:
@@ -446,7 +458,7 @@ def main() -> None:
                 temperature=args.soft_target_temperature,
                 device=device,
                 progress_every=args.progress_every,
-                action_key=ACTION_TOKENIZER_INPUT,
+                action_key=ACTION_TOKENIZER_EFFECT,
             )
             if len(result.counts) != codebook_size:
                 raise ValueError(

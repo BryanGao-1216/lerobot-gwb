@@ -16,7 +16,6 @@
 
 """Configuration for Smol ActionMem with an independent action vocabulary."""
 
-import logging
 from dataclasses import dataclass, field
 
 from lerobot.configs import PreTrainedConfig
@@ -31,8 +30,8 @@ class SmolActionMemConfig(SmolVLAConfig):
 
     chunk_size: int = 10
     n_action_steps: int = 10
-    # Future action indices past an episode boundary repeat its final frame, so
-    # every episode frame remains a valid chunk start.
+    # Every episode frame remains a valid chunk start. Relative action tail
+    # dimensions are zero-padded and absolute dimensions hold their final value.
     drop_n_last_frames: int = 0
     num_inference_steps: int = 10
     time_sampling_beta_alpha: float = 1.5
@@ -94,16 +93,12 @@ class SmolActionMemConfig(SmolVLAConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # Older converted checkpoints stored horizon - 1 here and would keep
-        # dropping tail chunks even after the dataset gained last-frame
-        # padding. Normalize those configs when they are loaded.
         if self.drop_n_last_frames != 0:
-            logging.warning(
-                "Smol ActionMem ignores drop_n_last_frames=%d because tail action chunks are "
-                "completed by repeating the episode's final frame.",
-                self.drop_n_last_frames,
+            raise ValueError(
+                "Smol ActionMem requires drop_n_last_frames=0 because episode-tail chunks use "
+                "neutral action padding plus action_is_pad masking; got "
+                f"{self.drop_n_last_frames}."
             )
-            self.drop_n_last_frames = 0
 
         valid_training_stages = {"vlm_only", "action_expert_only", "joint"}
         if self.train_expert_only:
