@@ -1,12 +1,15 @@
+
+export CUDA_VISIBLE_DEVICES=3
+
 lerobot-eval \
-  --output_dir="./outputs/eval/libero_smol_actionmem" \
-  --policy.path="/media/fzx/f2f907fa-be7e-46fd-a2f6-720114ae5359/media/gwb/models/smol_actionmem-finall/checkpoints/last/pretrained_model" \
+  --output_dir="./outputs/eval/libero_smol_actionmem_lr" \
+  --policy.path="/data1/gaowenbing/WorkSpace/models/smolvla-libero-baseline/checkpoints/last/pretrained_model" \
   --policy.use_peft=false \
-  --env.camera_name_mapping='{"agentview_image":"image","robot0_eye_in_hand_image":"image3"}' \
+  --env.camera_name_mapping='{"agentview_image":"image","robot0_eye_in_hand_image":"image2"}' \
   --env.type=libero \
   --env.task=libero_object,libero_spatial,libero_goal \
   --env.control_mode=relative \
   --env.max_parallel_tasks=1 \
   --eval.batch_size=1 \
   --eval.n_episodes=2 \
-  --policy.n_action_steps=16
+  --policy.n_action_steps=10

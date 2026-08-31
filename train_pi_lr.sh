@@ -1,6 +1,6 @@
 #!/bin/sh
 
-export CUDA_VISIBLE_DEVICES=4,5
+export CUDA_VISIBLE_DEVICES=3,4
 
 # 用两张 GPU 全参数微调原始 PI0（视觉编码器冻结）。
 accelerate launch \
@@ -27,8 +27,8 @@ accelerate launch \
   --policy.chunk_size=20 \
   --policy.n_action_steps=20 \
   --dataset_type=lerobot \
-  --dataset.repo_id=libero_only \
-  --dataset.root=/data1/gaowenbing/WorkSpace/datasets/LIBERO \
+  --dataset.repo_id=local \
+  --dataset.root=/data1/gaowenbing/WorkSpace/datasets/LIBERO-Lerobot \
   --output_dir=/data1/gaowenbing/WorkSpace/models/pi0-libero-baseline \
   --steps=100000 \
   --policy.optimizer_lr=3e-5 \
