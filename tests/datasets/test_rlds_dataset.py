@@ -26,6 +26,7 @@ import torch
 
 from lerobot.configs.default import DatasetConfig
 from lerobot.datasets.rlds.frequency_resampling import native_action_effects_tensor
+from lerobot.datasets.rlds.oxe.configs import OXE_DATASET_CONFIGS
 from lerobot.datasets.rlds_dataset import (
     ActionMemRLDSDataset,
     RLDSActionTokenCollator,
@@ -109,6 +110,23 @@ class _NumpyTensorFlow:
     @staticmethod
     def concat(values, axis):
         return np.concatenate(values, axis=axis)
+
+
+@pytest.mark.parametrize(
+    "dataset_name",
+    [
+        "libero_spatial_no_noops",
+        "libero_object_no_noops",
+        "libero_goal_no_noops",
+        "libero_10_no_noops",
+        "libero_90_no_noops",
+    ],
+)
+def test_libero_rlds_state_schema_matches_native_libero_eval(dataset_name):
+    assert OXE_DATASET_CONFIGS[dataset_name]["state_obs_keys"] == [
+        "EEF_state",
+        "gripper_state",
+    ]
 
 
 def test_load_explicit_rlds_mixture(tmp_path):

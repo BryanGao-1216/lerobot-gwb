@@ -55,12 +55,11 @@ def make_env_pre_post_processors(
 
     preprocessor, postprocessor = env_cfg.get_env_processors()
 
-    # RLDS checkpoints may contain normalization statistics for proprioception
-    # padded to max_state_dim (for example 32), whereas LIBERO emits an 8-D raw
-    # state. Infer the required width from the *loaded checkpoint preprocessor*
-    # instead of the policy name: this also covers vanilla SmolVLA checkpoints
-    # trained through the RLDS pipeline, while preserving the raw 8-D interface
-    # for ordinary LeRobot checkpoints whose normalizer was fitted on 8-D state.
+    # LIBERO itself always emits the canonical 8-D state. A mixed RLDS policy may
+    # nevertheless normalize a wider shared proprio schema because other sources
+    # in the mixture require more dimensions. Infer that exact width from the
+    # loaded preprocessor; never pad merely because the model internally supports
+    # max_state_dim=32.
     normalizer_state_dim = None
     if policy_preprocessor is not None:
         for policy_step in policy_preprocessor.steps:
@@ -72,12 +71,6 @@ def make_env_pre_post_processors(
                     break
             if normalizer_state_dim is not None:
                 break
-
-    # Backward-compatible fallback for call sites that create environment
-    # processors without loading the policy preprocessor (for example training
-    # with online evaluation).
-    if normalizer_state_dim is None and getattr(policy_cfg, "type", None) == "smol_actionmem":
-        normalizer_state_dim = int(policy_cfg.max_state_dim)
 
     if normalizer_state_dim is not None:
         from lerobot.processor import LiberoProcessorStep

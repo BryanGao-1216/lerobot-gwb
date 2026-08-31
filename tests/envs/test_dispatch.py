@@ -90,14 +90,14 @@ def test_libero_processor_flattens_state_to_raw_8_dim():
     assert torch.allclose(state, torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 4.0, 5.0]]))
 
 
-def test_smol_actionmem_libero_processor_pads_state_before_policy_normalization():
+def test_smol_actionmem_libero_processor_does_not_pad_without_preprocessor_stats():
     cfg = LiberoEnv()
     policy_cfg = SimpleNamespace(type="smol_actionmem", max_state_dim=32)
     pre, _ = make_env_pre_post_processors(cfg, policy_cfg=policy_cfg)
 
     step = pre.steps[0]
     assert isinstance(step, LiberoProcessorStep)
-    assert step.state_dim == 32
+    assert step.state_dim is None
 
     observation = {
         OBS_PREFIX + "robot_state": {
@@ -110,9 +110,8 @@ def test_smol_actionmem_libero_processor_pads_state_before_policy_normalization(
     }
     state = step.observation(observation)[OBS_STATE]
 
-    assert state.shape == (1, 32)
-    assert torch.allclose(state[:, :8], torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 4.0, 5.0]]))
-    assert torch.count_nonzero(state[:, 8:]) == 0
+    assert state.shape == (1, 8)
+    assert torch.allclose(state, torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 4.0, 5.0]]))
 
 
 def test_libero_processor_uses_loaded_policy_normalizer_state_dim():

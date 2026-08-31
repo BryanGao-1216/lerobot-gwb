@@ -47,10 +47,9 @@ class LiberoProcessorStep(ObservationProcessorStep):
 
     Args:
         state_dim: Optional output width for ``observation.state``. The raw LIBERO
-            state has 8 values; larger widths are zero-padded before the policy
-            normalizer runs. This is required by policies trained with padded
-            RLDS state statistics, while ``None`` preserves the standard 8-D
-            LIBERO interface.
+            state has 8 values. A larger width is used only when a mixed-dataset
+            policy preprocessor explicitly contains wider shared state statistics;
+            ``None`` preserves the canonical 8-D LIBERO interface.
     """
 
     state_dim: int | None = None
