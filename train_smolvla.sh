@@ -6,13 +6,13 @@ lerobot-train \
   --policy.freeze_vision_encoder=true \
   --policy.input_features=null \
   --policy.output_features=null \
-  --policy.chunk_size=10 \
-  --policy.n_action_steps=10 \
+  --policy.chunk_size=20 \
+  --policy.n_action_steps=20 \
   --dataset_type=rlds \
   --dataset.repo_id=libero_only \
   --dataset.root=/data1/gaowenbing/WorkSpace/datasets/OpenX \
   --dataset.rlds_storage_format=hybrid \
-  --dataset.rlds_target_control_hz=10 \
+  --dataset.rlds_target_control_hz=20 \
   --output_dir=/data1/gaowenbing/WorkSpace/models/smolvla-libero-baseline-rlds \
   --steps=60000 \
   --save_freq=10000 \

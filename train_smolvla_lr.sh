@@ -6,8 +6,8 @@ lerobot-train \
   --policy.freeze_vision_encoder=true \
   --policy.input_features=null \
   --policy.output_features=null \
-  --policy.chunk_size=10 \
-  --policy.n_action_steps=10 \
+  --policy.chunk_size=20 \
+  --policy.n_action_steps=20 \
   --dataset_type=lerobot \
   --dataset.repo_id=libero_only \
   --dataset.root=/data1/gaowenbing/WorkSpace/datasets/LIBERO-Lerobot \
