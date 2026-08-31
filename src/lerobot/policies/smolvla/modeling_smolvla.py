@@ -415,41 +415,59 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
-        """
-        images = []
-        img_masks = []
-        present_img_keys = [key for key in self.config.image_features if key in batch]
-        missing_img_keys = [key for key in self.config.image_features if key not in batch]
 
-        if len(present_img_keys) == 0:
+        Camera slots are emitted in ``config.image_features`` order. This is important for
+        policies trained with a fixed multi-camera prefix: when an intermediate camera is
+        unavailable at inference time, moving later cameras forward changes their prefix
+        positions. Missing configured cameras are therefore represented by an all-black
+        image and a false padding mask in their original slot.
+        """
+        image_keys = list(self.config.image_features)
+        present_img_keys = [key for key in image_keys if key in batch]
+        if not present_img_keys:
             raise ValueError(
                 f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
-        # Preprocess image features present in the batch
-        for key in present_img_keys:
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+
+        def preprocess_image(key):
+            raw_img = batch[key]
+            is_temporal = raw_img.ndim == 5
+            img = raw_img[:, -1, :, :, :] if is_temporal else raw_img
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
-            # Normalize from range [0,1] to [-1,1] as expacted by siglip
+            # Normalize from range [0,1] to [-1,1] as expected by SigLIP.
             img = img * 2.0 - 1.0
 
             bsize = img.shape[0]
-            device = img.device
-            if f"{key}_padding_mask" in batch:
-                mask = batch[f"{key}_padding_mask"].bool()
+            mask_key = f"{key}_padding_mask"
+            if mask_key in batch:
+                mask = batch[mask_key]
+                if mask.ndim == 0:
+                    mask = mask.expand(bsize)
+                elif is_temporal and mask.ndim >= 2:
+                    mask = mask[:, -1]
+                if mask.ndim != 1 or mask.shape[0] != bsize:
+                    raise ValueError(
+                        f"Expected {mask_key} to resolve to shape ({bsize},), got {tuple(mask.shape)}."
+                    )
+                mask = mask.to(device=img.device, dtype=torch.bool)
             else:
-                mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            images.append(img)
-            img_masks.append(mask)
+                mask = torch.ones(bsize, dtype=torch.bool, device=img.device)
+            return img, mask
 
-        # Create image features not present in the batch
-        # as fully 0 padded images.
-        for num_empty_cameras in range(len(missing_img_keys)):
-            if num_empty_cameras >= self.config.empty_cameras:
-                break
-            img = torch.ones_like(img) * -1
-            mask = torch.zeros_like(mask)
+        processed_images = {key: preprocess_image(key) for key in present_img_keys}
+        reference_img, reference_mask = processed_images[present_img_keys[0]]
+
+        images = []
+        img_masks = []
+        for key in image_keys:
+            if key in processed_images:
+                img, mask = processed_images[key]
+            else:
+                # Pixel value 0 before SigLIP normalization is -1 afterwards.
+                img = torch.full_like(reference_img, -1.0)
+                mask = torch.zeros_like(reference_mask)
             images.append(img)
             img_masks.append(mask)
         return images, img_masks
