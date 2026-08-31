@@ -1,6 +1,11 @@
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=3,4
 
-lerobot-train \
+accelerate launch \
+  --multi_gpu \
+  --num_processes=2 \
+  --num_machines=1 \
+  --main_process_port=29503 \
+  "$(which lerobot-train)" \
   --policy.path=/data1/gaowenbing/WorkSpace/models/smolvla \
   --policy.train_expert_only=false \
   --policy.freeze_vision_encoder=true \

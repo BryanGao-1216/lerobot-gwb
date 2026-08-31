@@ -8,9 +8,9 @@ lerobot-eval \
   --policy.use_peft=false \
   --env.camera_name_mapping='{"agentview_image":"image","robot0_eye_in_hand_image":"image3"}' \
   --env.type=libero \
-  --env.task=libero_object,libero_spatial,libero_goal \
+  --env.task=libero_object,libero_spatial \
   --env.control_mode=relative \
   --env.max_parallel_tasks=1 \
   --eval.batch_size=1 \
-  --eval.n_episodes=2 \
+  --eval.n_episodes=1 \
   --policy.n_action_steps=20
