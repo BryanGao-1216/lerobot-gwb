@@ -3,6 +3,8 @@
 export CUDA_VISIBLE_DEVICES=3,4
 
 # 用两张 GPU 全参数微调原始 PI0（视觉编码器冻结）。
+# FSDP1 can only flatten parameters with one storage dtype. Keep PI0 parameters
+# uniformly in FP32; Accelerate still runs forward/backward in BF16.
 accelerate launch \
   --use_fsdp \
   --num_processes=2 \
@@ -21,7 +23,7 @@ accelerate launch \
   --policy.path=/data1/gaowenbing/WorkSpace/models/pi0-base \
   --policy.freeze_vision_encoder=true \
   --policy.train_expert_only=false \
-  --policy.dtype=bfloat16 \
+  --policy.dtype=float32 \
   --policy.input_features=null \
   --policy.output_features=null \
   --policy.chunk_size=20 \
