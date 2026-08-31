@@ -115,6 +115,60 @@ def test_smol_actionmem_libero_processor_pads_state_before_policy_normalization(
     assert torch.count_nonzero(state[:, 8:]) == 0
 
 
+def test_libero_processor_uses_loaded_policy_normalizer_state_dim():
+    cfg = LiberoEnv()
+    policy_cfg = SimpleNamespace(type="smolvla", max_state_dim=32)
+    policy_preprocessor = SimpleNamespace(
+        steps=[
+            SimpleNamespace(
+                _tensor_stats={
+                    OBS_STATE: {
+                        "mean": torch.zeros(32),
+                        "std": torch.ones(32),
+                    }
+                }
+            )
+        ]
+    )
+
+    pre, _ = make_env_pre_post_processors(
+        cfg,
+        policy_cfg=policy_cfg,
+        policy_preprocessor=policy_preprocessor,
+    )
+
+    step = pre.steps[0]
+    assert isinstance(step, LiberoProcessorStep)
+    assert step.state_dim == 32
+
+
+def test_libero_processor_keeps_raw_state_for_8d_checkpoint_normalizer():
+    cfg = LiberoEnv()
+    policy_cfg = SimpleNamespace(type="smolvla", max_state_dim=32)
+    policy_preprocessor = SimpleNamespace(
+        steps=[
+            SimpleNamespace(
+                _tensor_stats={
+                    OBS_STATE: {
+                        "mean": torch.zeros(8),
+                        "std": torch.ones(8),
+                    }
+                }
+            )
+        ]
+    )
+
+    pre, _ = make_env_pre_post_processors(
+        cfg,
+        policy_cfg=policy_cfg,
+        policy_preprocessor=policy_preprocessor,
+    )
+
+    step = pre.steps[0]
+    assert isinstance(step, LiberoProcessorStep)
+    assert step.state_dim is None
+
+
 def test_base_create_envs():
     """Base class create_envs() should build a single-task VectorEnv via gym.make()."""
     gym_id = "_dispatch_test/CartPole-v99"

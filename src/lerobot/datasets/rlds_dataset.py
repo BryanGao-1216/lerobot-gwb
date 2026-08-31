@@ -401,7 +401,7 @@ def _validate_statistics(
     statistics: Mapping[str, Any],
     *,
     action_dim: int,
-    state_dim: int,
+    state_dim: int | None,
 ) -> None:
     if "action" not in statistics or "proprio" not in statistics:
         raise ValueError(f"RLDS dataset {dataset_name!r} must provide both action and proprio statistics.")
@@ -412,7 +412,7 @@ def _validate_statistics(
             f"ActionMem action tokenizer expects {action_dim}."
         )
     actual_state_dim = np.asarray(statistics["proprio"]["mean"]).size
-    if actual_state_dim > state_dim:
+    if state_dim is not None and actual_state_dim > state_dim:
         raise ValueError(
             f"RLDS dataset {dataset_name!r} has proprio dimension {actual_state_dim}, which exceeds "
             f"dataset.rlds_state_dim={state_dim}."
@@ -524,17 +524,25 @@ class ActionMemRLDSDataset(IterableDataset):
         dataset_config: DatasetConfig,
         action_horizon: int,
         action_dim: int,
-        state_dim: int,
+        state_dim: int | None,
         action_tokenizer_checkpoint_path: str | Path | None,
         action_codebook_size: int | None,
         action_tokenizer_window_duration_seconds: float | None,
         seed: int,
+        max_state_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.dataset_config = dataset_config
         self.action_horizon = action_horizon
         self.action_dim = action_dim
         self.state_dim = state_dim
+        self.max_state_dim = max_state_dim if max_state_dim is not None else state_dim
+        if self.max_state_dim is None:
+            raise ValueError("max_state_dim is required when RLDS state_dim is inferred automatically.")
+        if self.state_dim is not None and self.state_dim > self.max_state_dim:
+            raise ValueError(
+                f"dataset.rlds_state_dim={self.state_dim} exceeds policy max_state_dim={self.max_state_dim}."
+            )
         self.action_tokenizer_window_duration_seconds = action_tokenizer_window_duration_seconds
         self.seed = seed
         self.backend = _load_rlds_backend()
@@ -596,6 +604,8 @@ class ActionMemRLDSDataset(IterableDataset):
             per_dataset_kwargs,
             np.asarray(base_weights, dtype=np.float64),
         )
+        if self.state_dim is None:
+            raise RuntimeError("RLDS state dimension was not resolved from dataset statistics.")
         self.dataset_names = [kwargs["name"] for kwargs in per_dataset_kwargs]
         self.source_formats = {
             name: _resolve_rlds_source_format(dataset_config, name) for name in self.dataset_names
@@ -617,8 +627,8 @@ class ActionMemRLDSDataset(IterableDataset):
         features: dict[str, dict[str, Any]] = {
             OBS_STATE: {
                 "dtype": "float32",
-                "shape": (state_dim,),
-                "names": [f"state_{index}" for index in range(state_dim)],
+                "shape": (self.state_dim,),
+                "names": [f"state_{index}" for index in range(self.state_dim)],
             },
             ACTION: {
                 "dtype": "float32",
@@ -635,7 +645,9 @@ class ActionMemRLDSDataset(IterableDataset):
 
         stats = {
             ACTION: _aggregate_weighted_stats(all_statistics, effective_weights, "action", action_dim),
-            OBS_STATE: _aggregate_weighted_stats(all_statistics, effective_weights, "proprio", state_dim),
+            OBS_STATE: _aggregate_weighted_stats(
+                all_statistics, effective_weights, "proprio", self.state_dim
+            ),
         }
         for key in camera_keys:
             stats[key] = _image_stats()
@@ -675,6 +687,12 @@ class ActionMemRLDSDataset(IterableDataset):
         )
         logging.info(
             "RLDS policy normalization uses one mixture-weighted global mean/std for action and state."
+        )
+        logging.info(
+            "RLDS proprio uses %d dimensions before normalization; the policy pads to max_state_dim=%d "
+            "inside the model.",
+            self.state_dim,
+            self.max_state_dim,
         )
         if self._include_action_tokenizer_fields:
             logging.info(
@@ -788,6 +806,32 @@ class ActionMemRLDSDataset(IterableDataset):
             # Every transition remains a valid chunk start; tail entries use
             # neutral action padding and carry an explicit loss mask.
             valid_sizes.append(max(int(statistics["num_transitions"]), 1))
+
+        native_state_dim = max(
+            np.asarray(statistics["proprio"]["mean"]).size for statistics in all_statistics
+        )
+        if self.state_dim is None:
+            self.state_dim = native_state_dim
+        if self.state_dim > self.max_state_dim:
+            raise ValueError(
+                f"The selected RLDS mixture requires {self.state_dim} proprio dimensions, but the policy "
+                f"supports max_state_dim={self.max_state_dim}."
+            )
+        for kwargs, statistics in zip(per_dataset_kwargs, all_statistics, strict=True):
+            _validate_statistics(
+                kwargs["name"],
+                statistics,
+                action_dim=self.action_dim,
+                state_dim=self.state_dim,
+            )
+        for kwargs, statistics in zip(per_dataset_kwargs, all_tokenizer_statistics, strict=True):
+            if statistics is not None:
+                _validate_statistics(
+                    kwargs["name"],
+                    statistics,
+                    action_dim=self.action_dim,
+                    state_dim=self.state_dim,
+                )
 
         effective_weights = base_weights.copy()
         if self.dataset_config.rlds_balance_weights:
@@ -1259,16 +1303,17 @@ def make_actionmem_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
             f"codebook_size={metadata.codebook_size}."
         )
 
-    state_dim = cfg.dataset.rlds_state_dim or int(getattr(cfg.trainable_config, "max_state_dim", 32))
+    max_state_dim = int(getattr(cfg.trainable_config, "max_state_dim", 32))
     return ActionMemRLDSDataset(
         dataset_config=cfg.dataset,
         action_horizon=action_horizon,
         action_dim=action_dim,
-        state_dim=state_dim,
+        state_dim=cfg.dataset.rlds_state_dim,
         action_tokenizer_checkpoint_path=checkpoint_path,
         action_codebook_size=action_codebook_size,
         action_tokenizer_window_duration_seconds=metadata.window_duration_seconds,
         seed=cfg.seed if cfg.seed is not None else 0,
+        max_state_dim=max_state_dim,
     )
 
 
@@ -1292,16 +1337,16 @@ def make_smolvla_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
     # mixtures. Policy features are populated from the metadata after dataset
     # construction, just like the normal LeRobot dataset path.
     action_dim = len(_ACTION_NAMES)
-    state_dim = cfg.dataset.rlds_state_dim or int(policy_config.max_state_dim)
     return ActionMemRLDSDataset(
         dataset_config=cfg.dataset,
         action_horizon=action_horizon,
         action_dim=action_dim,
-        state_dim=state_dim,
+        state_dim=cfg.dataset.rlds_state_dim,
         action_tokenizer_checkpoint_path=None,
         action_codebook_size=None,
         action_tokenizer_window_duration_seconds=None,
         seed=cfg.seed if cfg.seed is not None else 0,
+        max_state_dim=int(policy_config.max_state_dim),
     )
 
 

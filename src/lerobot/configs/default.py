@@ -80,8 +80,10 @@ class DatasetConfig:
     # Action-code encoding runs inside the main-process collate function. CPU
     # saves GPU memory; CUDA is faster when memory permits.
     rlds_action_tokenizer_device: str = "cpu"
-    # If unset, the active policy's max_state_dim is used. RLDS proprio vectors
-    # are padded to this fixed size so heterogeneous datasets can be collated.
+    # If unset, the smallest width that accommodates every selected source is
+    # inferred from their statistics. RLDS proprio vectors are padded only to
+    # that common width for collation; the policy pads to max_state_dim after
+    # normalization, matching the native LeRobot data path.
     rlds_state_dim: int | None = None
 
     def __post_init__(self) -> None:

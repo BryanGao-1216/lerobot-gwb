@@ -646,7 +646,8 @@ def test_rlds_dispatch_builds_smolvla_without_effect_tokenizer(monkeypatch):
     assert isinstance(dataset, _DatasetStub)
     assert captured["action_horizon"] == 10
     assert captured["action_dim"] == 7
-    assert captured["state_dim"] == 32
+    assert captured["state_dim"] is None
+    assert captured["max_state_dim"] == 32
     assert captured["action_tokenizer_checkpoint_path"] is None
     assert captured["action_codebook_size"] is None
     assert captured["action_tokenizer_window_duration_seconds"] is None

@@ -37,6 +37,7 @@ def make_env_config(env_type: str, **kwargs) -> EnvConfig:
 def make_env_pre_post_processors(
     env_cfg: EnvConfig,
     policy_cfg: Any,
+    policy_preprocessor: Any | None = None,
 ) -> tuple[Any, Any]:
     """
     Create preprocessor and postprocessor pipelines for environment observations.
@@ -54,16 +55,41 @@ def make_env_pre_post_processors(
 
     preprocessor, postprocessor = env_cfg.get_env_processors()
 
-    # SmolActionMem RLDS checkpoints normalize states that were padded to
-    # max_state_dim during dataset loading. Match that contract before the
-    # checkpoint's policy normalizer sees the raw 8-D LIBERO state. Keep the
-    # default LIBERO processor unchanged for every other policy.
-    if getattr(policy_cfg, "type", None) == "smol_actionmem":
+    # RLDS checkpoints may contain normalization statistics for proprioception
+    # padded to max_state_dim (for example 32), whereas LIBERO emits an 8-D raw
+    # state. Infer the required width from the *loaded checkpoint preprocessor*
+    # instead of the policy name: this also covers vanilla SmolVLA checkpoints
+    # trained through the RLDS pipeline, while preserving the raw 8-D interface
+    # for ordinary LeRobot checkpoints whose normalizer was fitted on 8-D state.
+    normalizer_state_dim = None
+    if policy_preprocessor is not None:
+        for policy_step in policy_preprocessor.steps:
+            state_stats = getattr(policy_step, "_tensor_stats", {}).get("observation.state", {})
+            for stat_name in ("mean", "std", "min", "max", "q01", "q99"):
+                stat = state_stats.get(stat_name)
+                if stat is not None and getattr(stat, "ndim", 0) > 0:
+                    normalizer_state_dim = int(stat.numel())
+                    break
+            if normalizer_state_dim is not None:
+                break
+
+    # Backward-compatible fallback for call sites that create environment
+    # processors without loading the policy preprocessor (for example training
+    # with online evaluation).
+    if normalizer_state_dim is None and getattr(policy_cfg, "type", None) == "smol_actionmem":
+        normalizer_state_dim = int(policy_cfg.max_state_dim)
+
+    if normalizer_state_dim is not None:
         from lerobot.processor import LiberoProcessorStep
 
         for step in preprocessor.steps:
             if isinstance(step, LiberoProcessorStep):
-                step.state_dim = policy_cfg.max_state_dim
+                if normalizer_state_dim < 8:
+                    raise ValueError(
+                        "A LIBERO policy normalizer cannot expect fewer than the raw 8 state dimensions, "
+                        f"got {normalizer_state_dim}."
+                    )
+                step.state_dim = normalizer_state_dim if normalizer_state_dim > 8 else None
 
     return preprocessor, postprocessor
 
