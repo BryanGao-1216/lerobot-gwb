@@ -16,7 +16,7 @@ def _policy_with_image_slots(*keys: str) -> SmolVLAPolicy:
     return policy
 
 
-def test_prepare_images_preserves_missing_intermediate_camera_slot():
+def test_prepare_images_omits_missing_intermediate_camera_slot():
     policy = _policy_with_image_slots(
         "observation.images.image",
         "observation.images.image2",
@@ -31,13 +31,34 @@ def test_prepare_images_preserves_missing_intermediate_camera_slot():
 
     images, masks = policy.prepare_images(batch)
 
-    assert len(images) == 3
+    assert len(images) == 2
     assert torch.allclose(images[0], torch.full_like(images[0], 0.5))
-    assert torch.equal(images[1], torch.full_like(images[1], -1.0))
-    assert torch.allclose(images[2], torch.full_like(images[2], -0.5))
+    assert torch.allclose(images[1], torch.full_like(images[1], -0.5))
     assert torch.equal(masks[0], torch.tensor([True, True]))
-    assert torch.equal(masks[1], torch.tensor([False, False]))
-    assert torch.equal(masks[2], torch.tensor([True, False]))
+    assert torch.equal(masks[1], torch.tensor([True, False]))
+
+
+def test_prepare_images_omits_rlds_camera_that_is_padding_for_whole_batch():
+    policy = _policy_with_image_slots(
+        "observation.images.image",
+        "observation.images.image2",
+        "observation.images.image3",
+    )
+    batch = {
+        "observation.images.image": torch.full((2, 3, 4, 4), 0.75),
+        "observation.images.image_padding_mask": torch.tensor([True, True]),
+        "observation.images.image2": torch.zeros(2, 3, 4, 4),
+        "observation.images.image2_padding_mask": torch.tensor([False, False]),
+        "observation.images.image3": torch.full((2, 3, 4, 4), 0.25),
+        "observation.images.image3_padding_mask": torch.tensor([True, True]),
+    }
+
+    images, masks = policy.prepare_images(batch)
+
+    assert len(images) == 2
+    assert torch.allclose(images[0], torch.full_like(images[0], 0.5))
+    assert torch.allclose(images[1], torch.full_like(images[1], -0.5))
+    assert all(mask.all() for mask in masks)
 
 
 def test_prepare_images_resolves_temporal_image_and_mask_to_latest_step():

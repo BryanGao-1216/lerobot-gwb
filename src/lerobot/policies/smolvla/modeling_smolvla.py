@@ -416,11 +416,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
 
-        Camera slots are emitted in ``config.image_features`` order. This is important for
-        policies trained with a fixed multi-camera prefix: when an intermediate camera is
-        unavailable at inference time, moving later cameras forward changes their prefix
-        positions. Missing configured cameras are therefore represented by an all-black
-        image and a false padding mask in their original slot.
+        Only cameras that are present and valid for at least one batch item are emitted.
+        Their relative order follows ``config.image_features``. Missing cameras and RLDS
+        placeholder cameras whose padding mask is false for the whole batch do not create
+        image-token groups in the VLM prefix.
         """
         image_keys = list(self.config.image_features)
         present_img_keys = [key for key in image_keys if key in batch]
@@ -456,20 +455,18 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 mask = torch.ones(bsize, dtype=torch.bool, device=img.device)
             return img, mask
 
-        processed_images = {key: preprocess_image(key) for key in present_img_keys}
-        reference_img, reference_mask = processed_images[present_img_keys[0]]
-
         images = []
         img_masks = []
-        for key in image_keys:
-            if key in processed_images:
-                img, mask = processed_images[key]
-            else:
-                # Pixel value 0 before SigLIP normalization is -1 afterwards.
-                img = torch.full_like(reference_img, -1.0)
-                mask = torch.zeros_like(reference_mask)
+        for key in present_img_keys:
+            img, mask = preprocess_image(key)
+            if not torch.any(mask).item():
+                continue
             images.append(img)
             img_masks.append(mask)
+        if not images:
+            raise ValueError(
+                "All image features in the batch are padding. At least one valid camera is required."
+            )
         return images, img_masks
 
     def _pi_aloha_decode_state(self, state):
