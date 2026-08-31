@@ -14,7 +14,7 @@ lerobot-train \
   --output_dir=/data1/gaowenbing/WorkSpace/models/smolvla-libero-baseline \
   --steps=60000 \
   --save_freq=10000 \
-  --batch_size=100 \
+  --batch_size=128 \
   --eval_step=0 \
   --policy.optimizer_lr=3e-5 \
   --policy.optimizer_grad_clip_norm=5 \
