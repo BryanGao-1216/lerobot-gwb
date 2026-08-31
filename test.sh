@@ -9,6 +9,7 @@ lerobot-eval \
   --env.type=libero \
   --env.task=libero_object,libero_spatial,libero_goal \
   --env.control_mode=relative \
+  --env.gripper_action_convention=oxe \
   --env.max_parallel_tasks=1 \
   --eval.batch_size=1 \
   --eval.n_episodes=2 \

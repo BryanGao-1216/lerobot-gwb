@@ -32,6 +32,10 @@ from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.types import RobotObservation
 
+from .libero_utils import (
+    convert_action_to_libero_gripper_convention,
+    validate_libero_gripper_action_convention,
+)
 from .utils import _LazyAsyncVectorEnv, parse_camera_names
 
 
@@ -126,6 +130,7 @@ class LiberoEnv(gym.Env):
         camera_name_mapping: dict[str, str] | None = None,
         num_steps_wait: int = 10,
         control_mode: str = "relative",
+        gripper_action_convention: str = "libero",
         is_libero_plus: bool = False,
     ):
         super().__init__()
@@ -184,6 +189,8 @@ class LiberoEnv(gym.Env):
             else self.episode_length
         )
         self.control_mode = control_mode
+        validate_libero_gripper_action_convention(gripper_action_convention)
+        self.gripper_action_convention = gripper_action_convention
         images = {}
         for cam in self.camera_name:
             images[self.camera_name_mapping[cam]] = spaces.Box(
@@ -359,7 +366,11 @@ class LiberoEnv(gym.Env):
                 f"Expected action to be 1-D (shape (action_dim,)), "
                 f"but got shape {action.shape} with ndim={action.ndim}"
             )
-        raw_obs, reward, done, info = self._env.step(action)
+        environment_action = convert_action_to_libero_gripper_convention(
+            action,
+            source_convention=self.gripper_action_convention,
+        )
+        raw_obs, reward, done, info = self._env.step(environment_action)
 
         is_success = self._env.check_success()
         terminated = done or is_success
@@ -393,6 +404,7 @@ def _make_env_fns(
     init_states: bool,
     gym_kwargs: Mapping[str, Any],
     control_mode: str,
+    gripper_action_convention: str,
     camera_name_mapping: dict[str, str] | None = None,
     is_libero_plus: bool = False,
 ) -> list[Callable[[], LiberoEnv]]:
@@ -410,6 +422,7 @@ def _make_env_fns(
             episode_index=episode_index,
             n_envs=n_envs,
             control_mode=control_mode,
+            gripper_action_convention=gripper_action_convention,
             camera_name_mapping=camera_name_mapping,
             is_libero_plus=is_libero_plus,
             **local_kwargs,
@@ -432,6 +445,7 @@ def create_libero_envs(
     init_states: bool = True,
     env_cls: Callable[[Sequence[Callable[[], Any]]], Any] | None = None,
     control_mode: str = "relative",
+    gripper_action_convention: str = "libero",
     episode_length: int | None = None,
     camera_name_mapping: dict[str, str] | None = None,
     is_libero_plus: bool = False,
@@ -492,6 +506,7 @@ def create_libero_envs(
                 init_states=init_states,
                 gym_kwargs=gym_kwargs,
                 control_mode=control_mode,
+                gripper_action_convention=gripper_action_convention,
                 camera_name_mapping=camera_name_mapping,
                 is_libero_plus=is_libero_plus,
             )

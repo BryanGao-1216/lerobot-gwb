@@ -44,6 +44,8 @@ from lerobot.utils.constants import (
     OBS_STATE,
 )
 
+from .libero_utils import validate_libero_gripper_action_convention
+
 
 def _make_vec_env_cls(use_async: bool, n_envs: int):
     """Return the right VectorEnv constructor."""
@@ -352,8 +354,12 @@ class LiberoEnv(EnvConfig):
         }
     )
     control_mode: str = "relative"  # or "absolute"
+    # Convention produced by the evaluated policy. RLDS/OXE policies use
+    # 0=closed, 1=open; native LIBERO policies already use +1=closed, -1=open.
+    gripper_action_convention: str = "libero"
 
     def __post_init__(self):
+        validate_libero_gripper_action_convention(self.gripper_action_convention)
         if self.obs_type == "pixels":
             self.features[LIBERO_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
                 type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
@@ -431,6 +437,7 @@ class LiberoEnv(EnvConfig):
             gym_kwargs=self.gym_kwargs,
             env_cls=env_cls,
             control_mode=self.control_mode,
+            gripper_action_convention=self.gripper_action_convention,
             episode_length=self.episode_length,
             camera_name_mapping=self.camera_name_mapping,
             is_libero_plus=self.is_libero_plus,
