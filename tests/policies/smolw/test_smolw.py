@@ -54,6 +54,28 @@ def test_config_builds_past_and_future_lerobot_timestamps():
     assert config.drop_n_last_frames == 3
     assert not hasattr(config, "vidtwin_repo_path")
     assert not hasattr(config, "vidtwin_config_path")
+    assert not config.tensorboard_enable
+    assert config.tensorboard_log_freq == 100
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "tensorboard_log_freq",
+        "tensorboard_flush_secs",
+        "tensorboard_max_queue",
+        "tensorboard_histogram_freq",
+    ],
+)
+def test_tensorboard_intervals_must_be_positive(field):
+    with pytest.raises(ValueError, match=field):
+        SmolWConfig(
+            chunk_size=4,
+            n_action_steps=4,
+            motion_horizon=4,
+            device="cpu",
+            **{field: 0},
+        )
 
 
 def test_vidtwin_architecture_config_is_bundled_and_uses_internal_targets():

@@ -63,6 +63,18 @@ class SmolWConfig(SmolVLAConfig):
     # exactly the final H-1 episode frames in the LeRobot sampler.
     drop_n_last_frames: int | None = None
 
+    # TensorBoard logging is performed by lerobot-train on the main process.
+    # Relative log directories are resolved below the training output dir.
+    tensorboard_enable: bool = False
+    tensorboard_log_dir: str | None = None
+    tensorboard_log_freq: int = 100
+    tensorboard_flush_secs: int = 30
+    tensorboard_max_queue: int = 10
+    tensorboard_filename_suffix: str = ""
+    tensorboard_log_parameters: bool = False
+    tensorboard_log_gradients: bool = False
+    tensorboard_histogram_freq: int = 1_000
+
     def __post_init__(self) -> None:
         super().__post_init__()
 
@@ -100,6 +112,16 @@ class SmolWConfig(SmolVLAConfig):
             raise ValueError(
                 "vidtwin_dtype must be one of 'float32', 'float16', or 'bfloat16', got "
                 f"{self.vidtwin_dtype!r}."
+            )
+        if self.tensorboard_log_freq <= 0:
+            raise ValueError(f"tensorboard_log_freq must be positive, got {self.tensorboard_log_freq}.")
+        if self.tensorboard_flush_secs <= 0:
+            raise ValueError(f"tensorboard_flush_secs must be positive, got {self.tensorboard_flush_secs}.")
+        if self.tensorboard_max_queue <= 0:
+            raise ValueError(f"tensorboard_max_queue must be positive, got {self.tensorboard_max_queue}.")
+        if self.tensorboard_histogram_freq <= 0:
+            raise ValueError(
+                f"tensorboard_histogram_freq must be positive, got {self.tensorboard_histogram_freq}."
             )
 
         required_tail_drop = self.motion_horizon - 1

@@ -47,8 +47,18 @@ bash train_smolw_lr.sh
 首次使用时安装 SmolW 的附加依赖：
 
 ```bash
-uv sync --extra smolw
+uv sync --extra smolw --extra training
 ```
+
+训练脚本默认每 10 step 写一次 TensorBoard scalar，日志目录为
+`${OUTPUT_DIR}/tensorboard`。启动查看：
+
+```bash
+tensorboard --logdir /path/to/output/tensorboard
+```
+
+可通过 `TENSORBOARD_ENABLE`、`TENSORBOARD_LOG_FREQ` 和
+`TENSORBOARD_LOG_DIR` 环境变量覆盖默认设置。
 
 不要在 LeRobot 环境中安装 CoWVLA 的完整 requirements；其中固定的 Torch 和
 Transformers 版本与当前 LeRobot 不一致。

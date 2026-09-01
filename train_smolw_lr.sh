@@ -7,6 +7,10 @@ export CUDA_VISIBLE_DEVICES=0
 HORIZON="${HORIZON:-20}"
 MEMORY_STRIDE="${MEMORY_STRIDE:-1}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-libero}"
+TENSORBOARD_ENABLE="${TENSORBOARD_ENABLE:-true}"
+TENSORBOARD_LOG_FREQ="${TENSORBOARD_LOG_FREQ:-10}"
+TENSORBOARD_LOG_DIR="${TENSORBOARD_LOG_DIR:-${OUTPUT_DIR}/tensorboard}"
 
 lerobot-train \
   --policy.path="/data1/gaowenbing/WorkSpace/models/smolw-base" \
@@ -25,7 +29,7 @@ lerobot-train \
   --dataset.repo_id=local \
   --dataset.root="/data1/gaowenbing/WorkSpace/datasets/LIBERO-Lerobot" \
   --dataset.eval_split=0.0 \
-  --output_dir="/data1/gaowenbing/WorkSpace/models/smolw-libero" \
+  --output_dir="${OUTPUT_DIR}" \
   --steps=60000 \
   --save_freq=10000 \
   --batch_size="${BATCH_SIZE}" \
@@ -35,4 +39,7 @@ lerobot-train \
   --policy.scheduler_warmup_steps=5000 \
   --policy.scheduler_decay_steps=100000 \
   --policy.scheduler_decay_lr=5e-6 \
-  --policy.push_to_hub=false \
+  --policy.tensorboard_enable="${TENSORBOARD_ENABLE}" \
+  --policy.tensorboard_log_freq="${TENSORBOARD_LOG_FREQ}" \
+  --policy.tensorboard_log_dir="${TENSORBOARD_LOG_DIR}" \
+  --policy.push_to_hub=false
