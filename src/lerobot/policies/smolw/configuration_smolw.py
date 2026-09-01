@@ -38,10 +38,8 @@ class SmolWConfig(SmolVLAConfig):
     motion_horizon: int | None = None
     memory_stride: int = 1
 
-    # The frozen VidTwin extractor is external to the policy state dict.  All
-    # paths are supplied by the launch script or a saved SmolW config.
-    vidtwin_repo_path: str | None = None
-    vidtwin_config_path: str | None = None
+    # The frozen VidTwin extractor is external to the policy state dict. Its
+    # architecture is bundled with SmolW; only checkpoint weights are external.
     vidtwin_checkpoint_path: str | None = None
     vidtwin_num_frames: int = 16
     vidtwin_input_height: int = 224

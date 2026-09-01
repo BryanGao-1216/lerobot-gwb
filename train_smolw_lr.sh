@@ -6,10 +6,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 # The launch script owns every external location; policy code contains no
 # machine-specific model or dataset directory.
-SMOLW_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SMOLW_MODEL_DIR="${SMOLW_MODEL_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-base}"
-VIDTWIN_REPO_DIR="${VIDTWIN_REPO_DIR:-${SMOLW_SCRIPT_DIR}/../CoWVLA}"
-VIDTWIN_CONFIG_PATH="${VIDTWIN_CONFIG_PATH:-${VIDTWIN_REPO_DIR}/vidtwin/configs/vidtwin_structure_7_7_8_dynamics_7_8.yaml}"
 VIDTWIN_CHECKPOINT_PATH="${VIDTWIN_CHECKPOINT_PATH:-/mnt/models/microsoft__vidtwin/main/checkpoints/vidtwin_structure_7_7_8_dynamics_7_8.ckpt}"
 DATASET_ROOT="${DATASET_ROOT:-/data1/gaowenbing/WorkSpace/datasets/LIBERO-Lerobot}"
 DATASET_REPO_ID="${DATASET_REPO_ID:-libero_only}"
@@ -26,8 +23,6 @@ fi
 
 lerobot-train \
   --policy.path="${SMOLW_MODEL_DIR}" \
-  --policy.vidtwin_repo_path="${VIDTWIN_REPO_DIR}" \
-  --policy.vidtwin_config_path="${VIDTWIN_CONFIG_PATH}" \
   --policy.vidtwin_checkpoint_path="${VIDTWIN_CHECKPOINT_PATH}" \
   --policy.motion_horizon="${HORIZON}" \
   --policy.memory_stride="${MEMORY_STRIDE}" \

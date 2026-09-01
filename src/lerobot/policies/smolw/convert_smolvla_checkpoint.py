@@ -25,8 +25,6 @@ Example:
 python -m lerobot.policies.smolw.convert_smolvla_checkpoint \
   --source /path/to/models/smolvla \
   --output-dir /path/to/models/smolw-base \
-  --vidtwin-repo-path /path/to/CoWVLA \
-  --vidtwin-config-path /path/to/CoWVLA/vidtwin/configs/vidtwin_structure_7_7_8_dynamics_7_8.yaml \
   --vidtwin-checkpoint-path /path/to/vidtwin_structure_7_7_8_dynamics_7_8.ckpt \
   --motion-horizon 20
 """
@@ -53,8 +51,6 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default="lerobot/smolvla_base")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--vidtwin-repo-path", type=Path, required=True)
-    parser.add_argument("--vidtwin-config-path", type=Path, required=True)
     parser.add_argument("--vidtwin-checkpoint-path", type=Path, required=True)
     parser.add_argument("--motion-horizon", type=int, required=True)
     parser.add_argument("--memory-stride", type=int, default=1)
@@ -95,8 +91,6 @@ def _make_target_config(source_policy: SmolVLAPolicy, args: argparse.Namespace) 
             "motion_horizon": args.motion_horizon,
             "memory_stride": args.memory_stride,
             "drop_n_last_frames": args.motion_horizon - 1,
-            "vidtwin_repo_path": str(args.vidtwin_repo_path.expanduser().resolve()),
-            "vidtwin_config_path": str(args.vidtwin_config_path.expanduser().resolve()),
             "vidtwin_checkpoint_path": str(args.vidtwin_checkpoint_path.expanduser().resolve()),
             "motion_camera_key": args.motion_camera_key,
             "motion_loss_weight": args.motion_loss_weight,

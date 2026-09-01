@@ -8,7 +8,11 @@ from torch import nn
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.smolw.configuration_smolw import SmolWConfig
 from lerobot.policies.smolw.modeling_smolw import SmolWFlowMatching, SmolWPolicy
-from lerobot.policies.smolw.vidtwin_motion_encoder import VidTwinMotionExtractor
+from lerobot.policies.smolw.vidtwin_motion_encoder import (
+    _BUNDLED_VIDTWIN_CONFIG,
+    VidTwinMotionExtractor,
+    _get_obj_from_str,
+)
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -48,6 +52,31 @@ def test_config_builds_past_and_future_lerobot_timestamps():
     assert config.future_motion_positions == [3, 4, 5, 6]
     assert config.current_observation_position == 3
     assert config.drop_n_last_frames == 3
+    assert not hasattr(config, "vidtwin_repo_path")
+    assert not hasattr(config, "vidtwin_config_path")
+
+
+def test_vidtwin_architecture_config_is_bundled_and_uses_internal_targets():
+    config_text = _BUNDLED_VIDTWIN_CONFIG.read_text(encoding="utf-8")
+
+    assert "lerobot.policies.smolw.vidtwin.models.vidtwin_ae" in config_text
+    assert "target: vidtwin." not in config_text
+
+
+def test_bundled_qformer_runs_with_lerobot_transformers_version():
+    omegaconf = pytest.importorskip("omegaconf")
+    config = omegaconf.OmegaConf.load(_BUNDLED_VIDTWIN_CONFIG)
+    qformer_config = config.model.params.temporal_qformer_config
+    qformer = _get_obj_from_str(qformer_config.target)(**qformer_config.params)
+
+    with torch.inference_mode():
+        output = qformer(torch.randn(1, 8, qformer_config.params.encoder_hidden_size))
+
+    assert output.shape == (
+        1,
+        qformer_config.params.num_query_tokens,
+        qformer_config.params.query_hidden_size,
+    )
 
 
 def test_config_keeps_motion_and_action_horizons_aligned():
@@ -71,8 +100,6 @@ def test_flatten_motion_latents_matches_cowvla_order():
 
 def test_vidtwin_preprocess_samples_fixed_frame_count_and_normalizes(tmp_path):
     extractor = VidTwinMotionExtractor(
-        repo_path=tmp_path,
-        config_path=tmp_path / "config.yaml",
         checkpoint_path=tmp_path / "model.ckpt",
         num_frames=4,
         input_height=2,

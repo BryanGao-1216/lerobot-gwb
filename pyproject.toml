@@ -221,6 +221,7 @@ wallx = [
 pi = ["lerobot[transformers-dep]", "lerobot[scipy-dep]"]
 molmoact2 = ["lerobot[transformers-dep]", "lerobot[peft-dep]", "lerobot[scipy-dep]"]
 smolvla = ["lerobot[transformers-dep]", "num2words>=0.5.14,<0.6.0", "lerobot[accelerate-dep]"]
+smolw = ["lerobot[smolvla]", "lerobot[timm-dep]", "omegaconf>=2.3.0,<3.0.0"]
 multi_task_dit = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]"]
 groot = [
     "lerobot[transformers-dep]",
@@ -321,6 +322,7 @@ all = [
     "lerobot[pi]",
     "lerobot[molmoact2]",
     "lerobot[smolvla]",
+    "lerobot[smolw]",
     "lerobot[fastwam]",
     "lerobot[groot]",
     "lerobot[xvla]",
@@ -384,6 +386,7 @@ lerobot = [
     "envs/*.json",
     "annotations/steerable_pipeline/prompts/*.txt",
     "datasets/rlds/VQ_VLA_LICENSE",
+    "policies/smolw/vidtwin/configs/*.yaml",
 ]
 
 [tool.setuptools.packages.find]
@@ -392,7 +395,12 @@ where = ["src"]
 [tool.ruff]
 target-version = "py312"
 line-length = 110
-exclude = ["tests/artifacts/**/*.safetensors", "*_pb2.py", "*_pb2_grpc.py"]
+exclude = [
+    "tests/artifacts/**/*.safetensors",
+    "*_pb2.py",
+    "*_pb2_grpc.py",
+    "src/lerobot/policies/smolw/vidtwin/**/*.py",
+]
 
 [tool.ruff.lint]
 # E, W: pycodestyle errors and warnings

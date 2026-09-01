@@ -414,8 +414,6 @@ class SmolWPolicy(SmolVLAPolicy):
             motion_extractor
             if motion_extractor is not None
             else VidTwinMotionExtractor(
-                repo_path=config.vidtwin_repo_path,
-                config_path=config.vidtwin_config_path,
                 checkpoint_path=config.vidtwin_checkpoint_path,
                 num_frames=config.vidtwin_num_frames,
                 input_height=config.vidtwin_input_height,

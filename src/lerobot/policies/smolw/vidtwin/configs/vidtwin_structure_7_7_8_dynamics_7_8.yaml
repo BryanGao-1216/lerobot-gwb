@@ -1,0 +1,49 @@
+model:
+  base_learning_rate: 1.6e-4
+  target: lerobot.policies.smolw.vidtwin.models.vidtwin_ae.VidAutoEncoderQformerCompactSymVidVAE
+  params:
+    input_key: jpg
+    monitor: val/rec_loss
+    ckpt_path: PATH_TO_CHECKPOINT
+    ignore_keys: []
+    expect_ch: 8
+    cont_num_blocks: 1
+    downsample_motion: True
+    motion_num_blocks: 1
+    d_dim: 8
+
+    temporal_qformer_config:
+      target: lerobot.policies.smolw.vidtwin.modules.qformer.MyQformerInterface
+      params:
+        num_query_tokens: 16
+        query_hidden_size: 64
+        encoder_hidden_size: 768
+
+    encoder_config:
+      target: lerobot.policies.smolw.vidtwin.modules.st_transformer.STTEncoder
+      params:
+        in_channels: 3
+        input_size: [16, 224, 224]
+        patch_size: [1, 16, 16]
+        hidden_size: 768
+        depth: 16
+        num_heads: 12
+        temporal_casual: true
+
+    decoder_config:
+      target: lerobot.policies.smolw.vidtwin.modules.st_transformer.STTDecoder
+      params:
+        in_channels: 3
+        input_size: [16, 224, 224]
+        patch_size: [1, 16, 16]
+        hidden_size: 768
+        depth: 16
+        num_heads: 12
+        temporal_casual: true
+
+    regularizer_config:
+      target: lerobot.policies.smolw.vidtwin.modules.regularizers.DiagonalGaussianRegularizer
+      params:
+        sample: True
+
+        

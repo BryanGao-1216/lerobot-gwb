@@ -25,7 +25,6 @@ checkpoints.
 from __future__ import annotations
 
 import importlib
-import sys
 from pathlib import Path
 
 import torch
@@ -37,6 +36,10 @@ _TORCH_DTYPES = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
+
+_BUNDLED_VIDTWIN_CONFIG = (
+    Path(__file__).parent / "vidtwin" / "configs" / "vidtwin_structure_7_7_8_dynamics_7_8.yaml"
+)
 
 
 def _get_obj_from_str(path: str):
@@ -53,8 +56,8 @@ def _instantiate_from_config(config):
     return _get_obj_from_str(config["target"])(**config.get("params", {}))
 
 
-def load_vidtwin_model_from_config(config_path: str | Path, checkpoint_path: str | Path):
-    """Load a VidTwin checkpoint using CoWVLA's loading rules."""
+def load_vidtwin_model_from_config(checkpoint_path: str | Path):
+    """Load a checkpoint into SmolW's bundled VidTwin architecture."""
     try:
         from omegaconf import OmegaConf
     except ImportError as exc:
@@ -65,7 +68,7 @@ def load_vidtwin_model_from_config(config_path: str | Path, checkpoint_path: str
     except ImportError as exc:
         raise ImportError("SmolW VidTwin loading requires safetensors.") from exc
 
-    config_path = Path(config_path).expanduser().resolve()
+    config_path = _BUNDLED_VIDTWIN_CONFIG.resolve()
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
     if not config_path.is_file():
         raise FileNotFoundError(f"VidTwin config not found: {config_path}")
@@ -103,8 +106,6 @@ class VidTwinMotionExtractor:
     def __init__(
         self,
         *,
-        repo_path: str | Path | None,
-        config_path: str | Path | None,
         checkpoint_path: str | Path | None,
         num_frames: int = 16,
         input_height: int = 224,
@@ -113,25 +114,13 @@ class VidTwinMotionExtractor:
         sample_posterior: bool = True,
         expected_latent_dim: int = 1792,
     ) -> None:
-        missing_paths = [
-            name
-            for name, value in (
-                ("vidtwin_repo_path", repo_path),
-                ("vidtwin_config_path", config_path),
-                ("vidtwin_checkpoint_path", checkpoint_path),
-            )
-            if value is None
-        ]
-        if missing_paths:
+        if checkpoint_path is None:
             raise ValueError(
-                "SmolW requires VidTwin paths supplied by the training/inference launch config: "
-                + ", ".join(missing_paths)
+                "SmolW requires vidtwin_checkpoint_path in the training/inference launch config."
             )
         if dtype not in _TORCH_DTYPES:
             raise ValueError(f"Unsupported VidTwin dtype: {dtype!r}.")
 
-        self.repo_path = Path(repo_path).expanduser().resolve()
-        self.config_path = Path(config_path).expanduser().resolve()
         self.checkpoint_path = Path(checkpoint_path).expanduser().resolve()
         self.num_frames = num_frames
         self.input_height = input_height
@@ -149,13 +138,7 @@ class VidTwinMotionExtractor:
         return self._model
 
     def _load(self, device: torch.device) -> None:
-        if not self.repo_path.is_dir():
-            raise FileNotFoundError(f"VidTwin repository directory not found: {self.repo_path}")
-        repo_path_str = str(self.repo_path)
-        if repo_path_str not in sys.path:
-            sys.path.insert(0, repo_path_str)
-
-        model = load_vidtwin_model_from_config(self.config_path, self.checkpoint_path)
+        model = load_vidtwin_model_from_config(self.checkpoint_path)
         model.eval()
         model.requires_grad_(False)
         # CoWVLA's YAML sets DiagonalGaussianRegularizer(sample=True).  Keep

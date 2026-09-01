@@ -16,14 +16,15 @@ SmolVLA flow-matching action token 上。action expert 的 attention 会屏蔽 `
 
 VidTwin 提取逻辑保持 CoWVLA 的关键约定：使用 `linspace` 采样固定 16 帧、Resize +
 CenterCrop 到 224、归一化到 `[-1, 1]`、调用 `encode`、拼接 `z_motion_x/y`，最后按
-`b d f n -> b (f n d)` 展平。VidTwin 是冻结的惰性外部模块，不写入 SmolW checkpoint。
+`b d f n -> b (f n d)` 展平。VidTwin 网络定义和对应 YAML 已复制到 SmolW 的
+`vidtwin/` 子目录；运行时不再导入 CoWVLA。VidTwin 是冻结的惰性模块，权重不写入
+SmolW checkpoint。
 
 先从原始 SmolVLA 生成一次 SmolW base artifact：
 
 ```bash
 SOURCE_SMOLVLA_DIR=/path/to/smolvla \
 SMOLW_MODEL_DIR=/path/to/smolw-base \
-VIDTWIN_REPO_DIR=/path/to/CoWVLA \
 VIDTWIN_CHECKPOINT_PATH=/path/to/vidtwin.ckpt \
 HORIZON=20 MEMORY_STRIDE=1 \
 bash convert_smolw_base.sh
@@ -33,13 +34,24 @@ bash convert_smolw_base.sh
 
 ```bash
 SMOLW_MODEL_DIR=/path/to/smolw-base \
-VIDTWIN_REPO_DIR=/path/to/CoWVLA \
 VIDTWIN_CHECKPOINT_PATH=/path/to/vidtwin.ckpt \
 DATASET_ROOT=/path/to/lerobot_dataset \
 OUTPUT_DIR=/path/to/output \
 HORIZON=20 MEMORY_STRIDE=1 \
 bash train_smolw_lr.sh
 ```
+
+外部只需要 VidTwin `.ckpt`；网络源码和
+`vidtwin_structure_7_7_8_dynamics_7_8.yaml` 均随 SmolW 提供。
+
+首次使用时安装 SmolW 的附加依赖：
+
+```bash
+uv sync --extra smolw
+```
+
+不要在 LeRobot 环境中安装 CoWVLA 的完整 requirements；其中固定的 Torch 和
+Transformers 版本与当前 LeRobot 不一致。
 
 若不设置 `MOTION_CAMERA_KEY`，默认使用策略配置中的第一个视觉输入。训练会自动丢弃
 每个 episode 最后的 `H-1` 个采样起点，避免 future motion target 含补帧；episode
