@@ -35,6 +35,56 @@ class _DummyPaliGemma:
         return torch.stack([values, values], dim=-1)
 
 
+def _policy_with_image_slots(*keys: str) -> ActionMemPolicy:
+    policy = ActionMemPolicy.__new__(ActionMemPolicy)
+    nn.Module.__init__(policy)
+    policy.register_parameter("device_anchor", nn.Parameter(torch.zeros(())))
+    policy.config = SimpleNamespace(
+        image_features={key: object() for key in keys},
+        image_resolution=(4, 4),
+    )
+    return policy
+
+
+def test_actionmem_rlds_libero_images_match_two_camera_lerobot_input():
+    policy = _policy_with_image_slots(
+        "observation.images.image",
+        "observation.images.image2",
+        "observation.images.image3",
+    )
+    batch = {
+        "observation.images.image": torch.full((2, 3, 4, 4), 0.75),
+        "observation.images.image_padding_mask": torch.tensor([True, True]),
+        "observation.images.image2": torch.zeros(2, 3, 4, 4),
+        "observation.images.image2_padding_mask": torch.tensor([False, False]),
+        "observation.images.image3": torch.full((2, 3, 4, 4), 0.25),
+        "observation.images.image3_padding_mask": torch.tensor([True, True]),
+    }
+
+    images, masks = policy._preprocess_images(batch)
+
+    assert len(images) == 2
+    assert torch.allclose(images[0], torch.full_like(images[0], 0.5))
+    assert torch.allclose(images[1], torch.full_like(images[1], -0.5))
+    assert all(mask.all() for mask in masks)
+
+
+def test_actionmem_lerobot_images_default_to_valid_without_padding_masks():
+    policy = _policy_with_image_slots(
+        "observation.images.image",
+        "observation.images.image3",
+    )
+    batch = {
+        "observation.images.image": torch.full((1, 3, 4, 4), 0.75),
+        "observation.images.image3": torch.full((1, 3, 4, 4), 0.25),
+    }
+
+    images, masks = policy._preprocess_images(batch)
+
+    assert len(images) == 2
+    assert all(torch.equal(mask, torch.tensor([True])) for mask in masks)
+
+
 def test_vision_forward_dtype_does_not_require_registered_child_parameters():
     vision_tower = nn.Module()
     vision_tower.vision_model = SimpleNamespace(

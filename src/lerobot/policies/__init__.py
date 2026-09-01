@@ -33,6 +33,7 @@ from .pi05_actionmem.configuration_pi05_actionmem import PI05ActionMemConfig as 
 from .pretrained import PreTrainedPolicy as PreTrainedPolicy
 from .smol_actionmem.configuration_smol_actionmem import SmolActionMemConfig as SmolActionMemConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
+from .smolw.configuration_smolw import SmolWConfig as SmolWConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .utils import make_robot_action, prepare_observation_for_inference
 from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig as VLAJEPAConfig
@@ -61,6 +62,7 @@ __all__ = [
     "PI05Config",
     "SmolActionMemConfig",
     "SmolVLAConfig",
+    "SmolWConfig",
     "TDMPCConfig",
     "VLAJEPAConfig",
     "VQBeTConfig",

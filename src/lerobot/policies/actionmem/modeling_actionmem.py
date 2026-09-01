@@ -1384,6 +1384,11 @@ class ActionMemPolicy(PreTrainedPolicy):
 
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
         PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
+
+        Only camera slots that are present and valid for at least one batch item
+        are returned. This makes an RLDS LIBERO sample with a fully padded
+        secondary view equivalent to a LeRobot LIBERO sample that contains only
+        the head and wrist cameras.
         """
         images = []
         img_masks = []
@@ -1392,7 +1397,6 @@ class ActionMemPolicy(PreTrainedPolicy):
         device = next(self.parameters()).device
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
-        missing_img_keys = [key for key in self.config.image_features if key not in batch]
 
         if len(present_img_keys) == 0:
             raise ValueError(
@@ -1401,7 +1405,9 @@ class ActionMemPolicy(PreTrainedPolicy):
             )
 
         for key in present_img_keys:
-            img = batch[key]
+            raw_img = batch[key]
+            is_temporal = raw_img.ndim == 5
+            img = raw_img[:, -1] if is_temporal else raw_img
 
             # Ensure tensor is on the same device as the model
             if img.device != device:
@@ -1429,18 +1435,32 @@ class ActionMemPolicy(PreTrainedPolicy):
             if is_channels_first:
                 img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
-            images.append(img)
-            # Create mask (all ones for real images)
             bsize = img.shape[0]
-            mask = torch.ones(bsize, dtype=torch.bool, device=device)
+            mask_key = f"{key}_padding_mask"
+            if mask_key in batch:
+                mask = batch[mask_key]
+                if mask.ndim == 0:
+                    mask = mask.expand(bsize)
+                elif is_temporal and mask.ndim >= 2:
+                    mask = mask[:, -1]
+                if mask.ndim != 1 or mask.shape[0] != bsize:
+                    raise ValueError(
+                        f"Expected {mask_key} to resolve to shape ({bsize},), got {tuple(mask.shape)}."
+                    )
+                mask = mask.to(device=device, dtype=torch.bool)
+            else:
+                # Native LeRobot image observations have no explicit padding
+                # mask, so every provided image is valid.
+                mask = torch.ones(bsize, dtype=torch.bool, device=device)
+
+            if not torch.any(mask).item():
+                continue
+
+            images.append(img)
             img_masks.append(mask)
 
-        # Create image features not present in the batch as fully 0 padded images
-        for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1  # padded with -1 for SigLIP
-            mask = torch.zeros_like(mask)  # mask is zero for empty cameras
-            images.append(img)
-            img_masks.append(mask)
+        if not images:
+            raise ValueError("All ActionMem image features in the batch are padding.")
 
         return images, img_masks
 
