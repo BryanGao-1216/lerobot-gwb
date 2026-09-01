@@ -2,28 +2,16 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
-
-# The launch script owns every external location; policy code contains no
-# machine-specific model or dataset directory.
-SMOLW_MODEL_DIR="${SMOLW_MODEL_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-base}"
-VIDTWIN_CHECKPOINT_PATH="${VIDTWIN_CHECKPOINT_PATH:-/mnt/models/microsoft__vidtwin/main/checkpoints/vidtwin_structure_7_7_8_dynamics_7_8.ckpt}"
-DATASET_ROOT="${DATASET_ROOT:-/data1/gaowenbing/WorkSpace/datasets/LIBERO-Lerobot}"
-DATASET_REPO_ID="${DATASET_REPO_ID:-libero_only}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-libero}"
+export CUDA_VISIBLE_DEVICES=0
 
 HORIZON="${HORIZON:-20}"
 MEMORY_STRIDE="${MEMORY_STRIDE:-1}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 
-MOTION_CAMERA_ARGS=()
-if [[ -n "${MOTION_CAMERA_KEY:-}" ]]; then
-  MOTION_CAMERA_ARGS+=(--policy.motion_camera_key="${MOTION_CAMERA_KEY}")
-fi
-
 lerobot-train \
-  --policy.path="${SMOLW_MODEL_DIR}" \
-  --policy.vidtwin_checkpoint_path="${VIDTWIN_CHECKPOINT_PATH}" \
+  --policy.path="/data1/gaowenbing/WorkSpace/models/smolw-base" \
+  --policy.vidtwin_checkpoint_path="/data1/gaowenbing/WorkSpace/models/VidTwin/checkpoints/vidtwin_structure_7_7_8_dynamics_7_8.ckpt" \
+  --policy.motion_camera_key="observation.images.image" \
   --policy.motion_horizon="${HORIZON}" \
   --policy.memory_stride="${MEMORY_STRIDE}" \
   --policy.chunk_size="${HORIZON}" \
@@ -34,10 +22,10 @@ lerobot-train \
   --policy.input_features=null \
   --policy.output_features=null \
   --dataset_type=lerobot \
-  --dataset.repo_id="${DATASET_REPO_ID}" \
-  --dataset.root="${DATASET_ROOT}" \
+  --dataset.repo_id=local \
+  --dataset.root="/data1/gaowenbing/WorkSpace/datasets/LIBERO-Lerobot" \
   --dataset.eval_split=0.0 \
-  --output_dir="${OUTPUT_DIR}" \
+  --output_dir="/data1/gaowenbing/WorkSpace/models/smolw-libero" \
   --steps=60000 \
   --save_freq=10000 \
   --batch_size="${BATCH_SIZE}" \
@@ -48,4 +36,3 @@ lerobot-train \
   --policy.scheduler_decay_steps=100000 \
   --policy.scheduler_decay_lr=5e-6 \
   --policy.push_to_hub=false \
-  "${MOTION_CAMERA_ARGS[@]}"
