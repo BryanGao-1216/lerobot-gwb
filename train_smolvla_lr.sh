@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=3
 
 lerobot-train \
   --policy.path=/data1/gaowenbing/WorkSpace/models/smolvla \
@@ -11,7 +11,7 @@ lerobot-train \
   --dataset_type=lerobot \
   --dataset.repo_id=libero_only \
   --dataset.root=/data1/gaowenbing/WorkSpace/datasets/LIBERO-Lerobot \
-  --output_dir=/data1/gaowenbing/WorkSpace/models/smolvla-libero-baseline \
+  --output_dir=/data1/gaowenbing/WorkSpace/models/smolvla-libero-baseline1 \
   --steps=60000 \
   --save_freq=10000 \
   --batch_size=128 \
