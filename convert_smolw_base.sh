@@ -7,13 +7,9 @@ set -euo pipefail
 SOURCE_SMOLVLA_DIR="${SOURCE_SMOLVLA_DIR:-/data1/gaowenbing/WorkSpace/models/smolvla}"
 SMOLW_MODEL_DIR="${SMOLW_MODEL_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-base}"
 VIDTWIN_CHECKPOINT_PATH="${VIDTWIN_CHECKPOINT_PATH:-/mnt/models/microsoft__vidtwin/main/checkpoints/vidtwin_structure_7_7_8_dynamics_7_8.ckpt}"
-HORIZON="${HORIZON:-20}"
+HORIZON="${HORIZON:-16}"
 MEMORY_STRIDE="${MEMORY_STRIDE:-1}"
-
-MOTION_CAMERA_ARGS=()
-if [[ -n "${MOTION_CAMERA_KEY:-}" ]]; then
-  MOTION_CAMERA_ARGS+=(--motion-camera-key "${MOTION_CAMERA_KEY}")
-fi
+MOTION_CAMERA_KEY="${MOTION_CAMERA_KEY:-observation.images.image}"
 
 python -m lerobot.policies.smolw.convert_smolvla_checkpoint \
   --source "${SOURCE_SMOLVLA_DIR}" \
@@ -21,4 +17,4 @@ python -m lerobot.policies.smolw.convert_smolvla_checkpoint \
   --vidtwin-checkpoint-path "${VIDTWIN_CHECKPOINT_PATH}" \
   --motion-horizon "${HORIZON}" \
   --memory-stride "${MEMORY_STRIDE}" \
-  "${MOTION_CAMERA_ARGS[@]}"
+  --motion-camera-key "${MOTION_CAMERA_KEY}"

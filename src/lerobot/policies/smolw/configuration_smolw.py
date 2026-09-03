@@ -28,15 +28,21 @@ from ..smolvla.configuration_smolvla import SmolVLAConfig
 class SmolWConfig(SmolVLAConfig):
     """SmolVLA with a past-motion query and a predicted future-motion condition.
 
-    The VLM still receives only the current observation.  Temporal frames are
-    requested from a LeRobot dataset through ``observation_delta_indices`` and
-    are consumed exclusively by the frozen VidTwin motion extractor.
+    The VLM still receives only the current observation. Temporal frames are
+    requested from a LeRobot dataset through ``observation_delta_indices``.
+    VidTwin consumes the history/future clips, while the frozen SmolVLM visual
+    encoder supplies the current/future endpoint token targets for stage one.
     """
 
     # Motion/action temporal contract. ``None`` keeps the motion horizon tied to
     # the SmolVLA action chunk size.
     motion_horizon: int | None = None
     memory_stride: int = 1
+
+    # Two-stage training. ``joint`` is kept for ablations/backward-compatible
+    # experiments, but the intended recipe is world_model -> action_expert_only.
+    training_stage: str = "world_model"
+    train_expert_only: bool = False
 
     # The frozen VidTwin extractor is external to the policy state dict. Its
     # architecture is bundled with SmolW; only checkpoint weights are external.
@@ -45,7 +51,9 @@ class SmolWConfig(SmolVLAConfig):
     vidtwin_input_height: int = 224
     vidtwin_input_width: int = 224
     vidtwin_dtype: str = "bfloat16"
-    vidtwin_sample_posterior: bool = True
+    # Deterministic posterior modes are substantially better regression targets
+    # than resampling the Gaussian posterior on every training step.
+    vidtwin_sample_posterior: bool = False
 
     # The released CoWVLA VidTwin configuration produces two [8, 16, 7]
     # motion tensors, which are concatenated and flattened to 1792 values.
@@ -56,11 +64,17 @@ class SmolWConfig(SmolVLAConfig):
     motion_projector_hidden_dim: int = 1024
     motion_condition_hidden_dim: int = 1024
     motion_condition_scale: float = 1.0
-    motion_loss_weight: float = 0.1
+    motion_loss_weight: float = 1.0
     detach_motion_condition: bool = False
 
-    # A full future video is required for VidTwin supervision.  ``None`` drops
-    # exactly the final H-1 episode frames in the LeRobot sampler.
+    # Stage-one future visual-token residual prediction.
+    future_visual_loss_weight: float = 1.0
+    future_visual_cosine_weight: float = 0.1
+    future_visual_decoder_layers: int = 2
+
+    # A full future video ending at t+H is required in stage one. ``None`` drops
+    # exactly the final H episode frames in the LeRobot sampler. Stage two has
+    # no future-observation dependency and defaults to zero.
     drop_n_last_frames: int | None = None
 
     # TensorBoard logging is performed by lerobot-train on the main process.
@@ -80,6 +94,13 @@ class SmolWConfig(SmolVLAConfig):
 
         if self.motion_horizon is None:
             self.motion_horizon = self.chunk_size
+        if self.train_expert_only:
+            self.training_stage = "action_expert_only"
+        valid_training_stages = {"world_model", "action_expert_only", "joint"}
+        if self.training_stage not in valid_training_stages:
+            raise ValueError(
+                f"training_stage must be one of {sorted(valid_training_stages)}, got {self.training_stage!r}."
+            )
         if self.motion_horizon <= 0:
             raise ValueError(f"motion_horizon must be positive, got {self.motion_horizon}.")
         if self.motion_horizon != self.chunk_size:
@@ -89,8 +110,11 @@ class SmolWConfig(SmolVLAConfig):
             )
         if self.memory_stride <= 0:
             raise ValueError(f"memory_stride must be positive, got {self.memory_stride}.")
-        if self.vidtwin_num_frames <= 0:
-            raise ValueError(f"vidtwin_num_frames must be positive, got {self.vidtwin_num_frames}.")
+        if self.vidtwin_num_frames != 16:
+            raise ValueError(
+                "The bundled VidTwin checkpoint architecture requires vidtwin_num_frames=16, "
+                f"got {self.vidtwin_num_frames}."
+            )
         if self.vidtwin_input_height <= 0 or self.vidtwin_input_width <= 0:
             raise ValueError(
                 "vidtwin_input_height and vidtwin_input_width must be positive, got "
@@ -106,6 +130,25 @@ class SmolWConfig(SmolVLAConfig):
             )
         if self.motion_loss_weight < 0:
             raise ValueError(f"motion_loss_weight must be non-negative, got {self.motion_loss_weight}.")
+        if self.future_visual_loss_weight < 0:
+            raise ValueError(
+                f"future_visual_loss_weight must be non-negative, got {self.future_visual_loss_weight}."
+            )
+        if self.future_visual_cosine_weight < 0:
+            raise ValueError(
+                f"future_visual_cosine_weight must be non-negative, got {self.future_visual_cosine_weight}."
+            )
+        if self.future_visual_decoder_layers <= 0:
+            raise ValueError(
+                f"future_visual_decoder_layers must be positive, got {self.future_visual_decoder_layers}."
+            )
+        if self.training_stage == "world_model" and (
+            self.motion_loss_weight == 0 and self.future_visual_loss_weight == 0
+        ):
+            raise ValueError(
+                "world_model training requires motion_loss_weight or "
+                "future_visual_loss_weight to be positive."
+            )
         if not self.use_cache:
             raise ValueError("SmolW requires use_cache=True for motion-first prefix execution.")
         if self.vidtwin_dtype not in {"float32", "float16", "bfloat16"}:
@@ -124,12 +167,16 @@ class SmolWConfig(SmolVLAConfig):
                 f"tensorboard_histogram_freq must be positive, got {self.tensorboard_histogram_freq}."
             )
 
-        required_tail_drop = self.motion_horizon - 1
+        # H actions a_t...a_{t+H-1} end at observation o_{t+H}. Stage one
+        # therefore needs H future observations after the current frame.
+        if self.drop_n_last_frames is not None and self.drop_n_last_frames < 0:
+            raise ValueError(f"drop_n_last_frames must be non-negative, got {self.drop_n_last_frames}.")
+        required_tail_drop = self.motion_horizon if self.training_stage != "action_expert_only" else 0
         if self.drop_n_last_frames is None:
             self.drop_n_last_frames = required_tail_drop
-        elif self.drop_n_last_frames < required_tail_drop:
+        elif self.training_stage != "action_expert_only" and self.drop_n_last_frames < required_tail_drop:
             raise ValueError(
-                "SmolW future-motion supervision requires dropping at least motion_horizon - 1 "
+                "SmolW future-motion supervision requires dropping at least motion_horizon "
                 f"episode-tail frames; got drop_n_last_frames={self.drop_n_last_frames}, "
                 f"required>={required_tail_drop}."
             )
@@ -144,13 +191,15 @@ class SmolWConfig(SmolVLAConfig):
 
     @property
     def future_motion_delta_indices(self) -> list[int]:
-        """H contiguous observations starting at t."""
+        """H future observations following t, aligned with H actions."""
         assert self.motion_horizon is not None
-        return list(range(self.motion_horizon))
+        return list(range(1, self.motion_horizon + 1))
 
     @property
     def observation_delta_indices(self) -> list[int]:
-        """Union of history and future frames requested from LeRobot datasets."""
+        """Request future supervision only for stages that consume it."""
+        if self.training_stage == "action_expert_only":
+            return self.past_motion_delta_indices
         return sorted(set(self.past_motion_delta_indices + self.future_motion_delta_indices))
 
     @property
@@ -164,5 +213,7 @@ class SmolWConfig(SmolVLAConfig):
 
     @property
     def future_motion_positions(self) -> list[int]:
+        if self.training_stage == "action_expert_only":
+            return []
         deltas = self.observation_delta_indices
         return [deltas.index(delta) for delta in self.future_motion_delta_indices]

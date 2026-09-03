@@ -26,7 +26,7 @@ python -m lerobot.policies.smolw.convert_smolvla_checkpoint \
   --source /path/to/models/smolvla \
   --output-dir /path/to/models/smolw-base \
   --vidtwin-checkpoint-path /path/to/vidtwin_structure_7_7_8_dynamics_7_8.ckpt \
-  --motion-horizon 20
+  --motion-horizon 16
 """
 
 from __future__ import annotations
@@ -56,7 +56,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-stride", type=int, default=1)
     parser.add_argument("--n-action-steps", type=int)
     parser.add_argument("--motion-camera-key")
-    parser.add_argument("--motion-loss-weight", type=float, default=0.1)
+    parser.add_argument("--motion-loss-weight", type=float, default=1.0)
+    parser.add_argument("--future-visual-loss-weight", type=float, default=1.0)
+    parser.add_argument("--future-visual-cosine-weight", type=float, default=0.1)
     parser.add_argument("--motion-latent-dim", type=int, default=1792)
     parser.add_argument(
         "--overwrite",
@@ -90,11 +92,16 @@ def _make_target_config(source_policy: SmolVLAPolicy, args: argparse.Namespace) 
             "n_action_steps": args.n_action_steps or args.motion_horizon,
             "motion_horizon": args.motion_horizon,
             "memory_stride": args.memory_stride,
-            "drop_n_last_frames": args.motion_horizon - 1,
+            "drop_n_last_frames": args.motion_horizon,
             "vidtwin_checkpoint_path": str(args.vidtwin_checkpoint_path.expanduser().resolve()),
+            "vidtwin_sample_posterior": False,
             "motion_camera_key": args.motion_camera_key,
             "motion_loss_weight": args.motion_loss_weight,
+            "future_visual_loss_weight": args.future_visual_loss_weight,
+            "future_visual_cosine_weight": args.future_visual_cosine_weight,
             "motion_latent_dim": args.motion_latent_dim,
+            "training_stage": "world_model",
+            "train_expert_only": False,
             # The converter transfers the complete original SmolVLA state, so
             # the target does not need to download VLM weights a second time.
             "load_vlm_weights": False,
@@ -124,6 +131,10 @@ def _copy_compatible_weights(source_policy: SmolVLAPolicy, target_policy: SmolWP
         "model.past_motion_projector.",
         "model.future_motion_head.",
         "model.future_motion_condition_proj.",
+        "model.future_visual_queries.",
+        "model.future_motion_visual_proj.",
+        "model.future_visual_decoder.",
+        "model.future_visual_out_proj.",
     )
     unmatched_missing = [key for key in missing_keys if not key.startswith(expected_new_prefixes)]
     logging.info(

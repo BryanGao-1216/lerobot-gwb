@@ -111,7 +111,7 @@ class VidTwinMotionExtractor:
         input_height: int = 224,
         input_width: int = 224,
         dtype: str = "bfloat16",
-        sample_posterior: bool = True,
+        sample_posterior: bool = False,
         expected_latent_dim: int = 1792,
     ) -> None:
         if checkpoint_path is None:
