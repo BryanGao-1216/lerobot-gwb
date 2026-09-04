@@ -1,12 +1,17 @@
+#!/bin/sh
+
+set -eu
+
 export CUDA_VISIBLE_DEVICES=3,5
 
 HORIZON="${HORIZON:-16}"
 N_ACTION_STEPS="${N_ACTION_STEPS:-${HORIZON}}"
 MEMORY_STRIDE="${MEMORY_STRIDE:-1}"
+TRAIN_MODE="${TRAIN_MODE:-action_only}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 
-
-OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-stage1}"
+POLICY_PATH="${POLICY_PATH:-/data1/gaowenbing/WorkSpace/models/smolw-base}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-${TRAIN_MODE}}"
 TENSORBOARD_LOG_DIR="${TENSORBOARD_LOG_DIR:-${OUTPUT_DIR}/tensorboard}"
 
 
@@ -14,20 +19,23 @@ accelerate launch \
   --multi_gpu \
   --num_processes=2 \
   --num_machines=1 \
+  --mixed_precision=bf16 \
   --main_process_port=25901 \
   "$(which lerobot-train)" \
-  --policy.path="/data1/gaowenbing/WorkSpace/models/smolw-base" \
+  --policy.path="${POLICY_PATH}" \
   --policy.vidtwin_checkpoint_path="/data1/gaowenbing/WorkSpace/models/vidtwin-libero/checkpoint-best.ckpt" \
   --policy.motion_camera_key="observation.images.image" \
   --policy.motion_horizon="${HORIZON}" \
   --policy.memory_stride="${MEMORY_STRIDE}" \
   --policy.chunk_size="${HORIZON}" \
-  --policy.training_stage=world_model \
-  --policy.train_expert_only=false \
+  --policy.n_action_steps="${N_ACTION_STEPS}" \
+  --policy.drop_n_last_frames="${HORIZON}" \
+  --policy.train_mode="${TRAIN_MODE}" \
   --policy.use_peft=false \
   --policy.freeze_vision_encoder=true \
   --policy.vidtwin_sample_posterior=false \
   --policy.motion_loss_weight=1.0 \
+  --policy.z_loss_weight=1.0 \
   --policy.input_features=null \
   --policy.output_features=null \
   --dataset_type=lerobot \
