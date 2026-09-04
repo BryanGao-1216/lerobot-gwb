@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0,2
+export CUDA_VISIBLE_DEVICES=5
 
 HORIZON="${HORIZON:-16}"
 N_ACTION_STEPS="${N_ACTION_STEPS:-${HORIZON}}"
@@ -10,14 +10,15 @@ OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-pret}"
 TENSORBOARD_LOG_DIR="${TENSORBOARD_LOG_DIR:-${OUTPUT_DIR}/tensorboard}"
 
 
-accelerate launch \
-  --multi_gpu \
-  --num_processes=2 \
-  --num_machines=1 \
-  --main_process_port=25901 \
-  "$(which lerobot-train)" \
+# accelerate launch \
+#   --multi_gpu \
+#   --num_processes=2 \
+#   --num_machines=1 \
+#   --main_process_port=25901 \
+  # "$(which lerobot-train)" \
+lerobot-train \
   --policy.path="/data1/gaowenbing/WorkSpace/models/smolw-base" \
-  --policy.vidtwin_checkpoint_path="/data1/gaowenbing/WorkSpace/models/VidTwin/checkpoints/vidtwin_structure_7_7_8_dynamics_7_8.ckpt" \
+  --policy.vidtwin_checkpoint_path="/data1/gaowenbing/WorkSpace/models/vidtwin-libero/checkpoint-best.ckpt" \
   --policy.motion_camera_key="observation.images.image" \
   --policy.motion_horizon="${HORIZON}" \
   --policy.memory_stride="${MEMORY_STRIDE}" \
@@ -28,8 +29,6 @@ accelerate launch \
   --policy.freeze_vision_encoder=true \
   --policy.vidtwin_sample_posterior=false \
   --policy.motion_loss_weight=1.0 \
-  --policy.future_visual_loss_weight=1.0 \
-  --policy.future_visual_cosine_weight=0.1 \
   --policy.input_features=null \
   --policy.output_features=null \
   --dataset_type=lerobot \
