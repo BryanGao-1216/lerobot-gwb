@@ -371,7 +371,11 @@ class _StageVLMWithExpert(nn.Module):
 def _mode_model(train_mode: str) -> SmolWFlowMatching:
     model = SmolWFlowMatching.__new__(SmolWFlowMatching)
     nn.Module.__init__(model)
-    model.config = SimpleNamespace(train_mode=train_mode, freeze_vision_encoder=True)
+    model.config = SimpleNamespace(
+        train_mode=train_mode,
+        freeze_vision_encoder=True,
+        train_state_proj=True,
+    )
     model.vlm_with_expert = _StageVLMWithExpert()
     model.state_proj = nn.Linear(2, 2)
     model.mt_query_embedding = nn.Embedding(1, 2)
@@ -410,6 +414,7 @@ def test_train_mode_freezes_unselected_branch_and_vision_encoder():
     assert not action_model.vlm_with_expert.vlm.model.text_model.weight.requires_grad
     assert not action_model.future_motion_head.weight.requires_grad
     assert action_model.vlm_with_expert.lm_expert.weight.requires_grad
+    assert action_model.state_proj.weight.requires_grad
     assert action_model.action_in_proj.weight.requires_grad
     assert action_model.z_token_in_proj.weight.requires_grad
     assert action_model.z_token_out_proj.weight.requires_grad
@@ -426,6 +431,11 @@ def test_train_mode_freezes_unselected_branch_and_vision_encoder():
     assert joint_model.vlm_with_expert.lm_expert.weight.requires_grad
     assert joint_model.z_token_in_proj.weight.requires_grad
     assert joint_model.z_token_out_proj.weight.requires_grad
+
+    no_state_model = _mode_model("action_only")
+    no_state_model.config.train_state_proj = False
+    no_state_model.configure_train_mode()
+    assert not no_state_model.state_proj.weight.requires_grad
 
 
 def test_mt_query_is_appended_after_original_smolvla_prefix():
@@ -671,6 +681,7 @@ def test_policy_combines_masked_flow_and_motion_losses():
     assert metrics["flow_loss"] == pytest.approx(1.5)
     assert metrics["action_flow_loss"] == pytest.approx(1.0)
     assert metrics["z_flow_loss"] == pytest.approx(2.0)
+    assert metrics["effective_z_loss_weight"] == pytest.approx(0.25)
     assert metrics["motion_loss"] == pytest.approx(4.0)
     assert metrics["z_condition_active"] == 1.0
     assert metrics["z_condition_step"] == 12.0
@@ -724,6 +735,11 @@ def test_motion_only_does_not_prepare_or_run_action_expert():
 
 def test_action_only_uses_oracle_future_motion_without_motion_loss():
     class _ActionModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.action_scale = nn.Parameter(torch.tensor(1.0))
+            self.z_scale = nn.Parameter(torch.tensor(1.0))
+
         def forward(self, *args, **kwargs):
             del args
             assert kwargs["actions"] is not None
@@ -732,8 +748,8 @@ def test_action_only_uses_oracle_future_motion_without_motion_loss():
             assert not kwargs["compute_motion_loss"]
             assert kwargs["compute_flow"]
             return {
-                "flow_losses": torch.tensor([[[1.0], [4.0]]]),
-                "z_flow_losses": torch.tensor([0.5]),
+                "flow_losses": self.action_scale * torch.tensor([[[1.0], [4.0]]]),
+                "z_flow_losses": self.z_scale * torch.tensor([0.5]),
                 "predicted_future_motion": torch.tensor([[2.0]]),
                 "z_motion_source": kwargs["z_motion_source"],
                 "z_target": torch.tensor([[3.0]]),
@@ -771,12 +787,18 @@ def test_action_only_uses_oracle_future_motion_without_motion_loss():
 
     loss, metrics = policy.forward(batch)
 
-    assert loss.item() == pytest.approx(3.0)
-    assert metrics["flow_loss"] == pytest.approx(3.0)
+    assert loss.item() == pytest.approx(2.5)
+    assert metrics["flow_loss"] == pytest.approx(2.5)
     assert metrics["action_flow_loss"] == pytest.approx(2.5)
     assert metrics["z_flow_loss"] == pytest.approx(0.5)
+    assert metrics["weighted_z_flow_loss"] == pytest.approx(0.0)
+    assert metrics["effective_z_loss_weight"] == pytest.approx(0.0)
     assert metrics["oracle_motion_rms"] == pytest.approx(1.0)
     assert metrics["predicted_motion_rms"] == pytest.approx(2.0)
     assert metrics["z_condition_active"] == 0.0
     assert metrics["z_condition_step"] == 3.0
     assert "motion_loss" not in metrics
+
+    loss.backward()
+    assert policy.model.action_scale.grad.item() == pytest.approx(2.5)
+    assert policy.model.z_scale.grad.item() == pytest.approx(0.0)

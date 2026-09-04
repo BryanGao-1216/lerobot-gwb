@@ -75,10 +75,13 @@ flow matching 内部 suffix 按 `[z_1,...,z_16,a_1,...,a_H]` 分块排列：
 - 推理时联合去噪 16 个 z 和 H 个 action，策略最终只返回 action chunk。
 
 `z_condition_warmup_steps=m` 控制 action 条件课程学习：前 `m` 次 action 训练 forward
-中仅屏蔽 `action→z` 注意力，action 按原始 SmolVLA 路径学习，而 z flow loss 仍正常
-训练；从第 `m+1` 次开始恢复所有 `action→z` 边。计数器保存在 policy checkpoint 中，
-恢复训练不会重新开始 warmup；eval/推理始终启用 z condition。若设为 `0`，从第一步
-起就使用 z。
+中屏蔽 `action→z` 注意力，同时把 z flow loss 的有效权重强制设为 0；这段时间只有
+action flow loss 训练 action expert。从第 `m+1` 次开始恢复所有 `action→z` 边，并启用
+配置的 `z_loss_weight`。计数器保存在 policy checkpoint 中，恢复训练不会重新开始
+warmup；eval/推理始终启用 z condition。若设为 `0`，从第一步起就使用并训练 z。
+
+`action_only` 中的 `state_proj` 遵循原始 SmolVLA 的 `train_state_proj` 开关；训练脚本
+显式设置为 `true`。
 
 当前 RTC 不支持这种联合状态去噪，启用时会明确报错。
 
@@ -159,4 +162,5 @@ tensorboard --logdir /path/to/output/tensorboard
 ```
 
 可通过 `TENSORBOARD_LOG_DIR` 覆盖日志目录。
-TensorBoard 还会记录 `z_condition_step` 和二值的 `z_condition_active`，便于确认课程切换。
+TensorBoard 还会记录 `z_condition_step`、二值的 `z_condition_active` 和
+`effective_z_loss_weight`，便于确认课程切换。

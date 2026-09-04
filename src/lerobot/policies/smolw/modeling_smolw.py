@@ -113,6 +113,7 @@ class SmolWFlowMatching(VLAFlowMatching):
     def _is_action_expert_parameter(name: str) -> bool:
         return name.startswith("vlm_with_expert.lm_expert.") or name.startswith(
             (
+                "state_proj.",
                 "action_in_proj.",
                 "action_out_proj.",
                 "action_time_mlp_in.",
@@ -137,6 +138,8 @@ class SmolWFlowMatching(VLAFlowMatching):
             included = (mode in {"motion_only", "jointly"} and is_motion) or (
                 mode in {"action_only", "jointly"} and is_expert
             )
+            if name.startswith("state_proj.") and not self.config.train_state_proj:
+                included = False
             if first_configuration:
                 # Preserve tensors that the original SmolVLA implementation
                 # freezes because they are unused by its truncated VLM/expert
@@ -371,7 +374,8 @@ class SmolWFlowMatching(VLAFlowMatching):
         z_rows = torch.cat([z_prefix_attention, z_self_attention, z_action_attention], dim=2)
 
         # action rows: original prefix + optional z condition + original
-        # action mask. Warmup disables only action->z; z flow remains intact.
+        # action mask. Warmup disables action->z; z flow remains in the graph
+        # but its effective loss weight is zeroed by the policy wrapper.
         action_z_attention = (
             z_pad_masks[:, None, :].expand(batch_size, horizon, z_count)
             if action_can_see_z
@@ -941,16 +945,21 @@ class SmolWPolicy(SmolVLAPolicy):
                 loss_per_dim = masked_flow.sum(dim=(0, 1)) / valid_steps
             per_sample_z_flow = output["z_flow_losses"]
             z_flow_loss = per_sample_z_flow.mean()
-            weighted_z_flow = self.config.z_loss_weight * z_flow_loss
+            # During action warmup, keep the z branch in the graph (important
+            # for DDP) but give it exactly zero gradient. At the same boundary
+            # action->z attention and the configured z objective turn on.
+            effective_z_loss_weight = self.config.z_loss_weight if output["z_condition_active"] else 0.0
+            weighted_z_flow = effective_z_loss_weight * z_flow_loss
             combined_flow_loss = flow_loss + weighted_z_flow
             scalar_terms.append(combined_flow_loss)
-            per_sample_terms.append(per_sample_flow + self.config.z_loss_weight * per_sample_z_flow)
+            per_sample_terms.append(per_sample_flow + effective_z_loss_weight * per_sample_z_flow)
             metrics.update(
                 {
                     "flow_loss": combined_flow_loss.item(),
                     "action_flow_loss": flow_loss.item(),
                     "z_flow_loss": z_flow_loss.item(),
                     "weighted_z_flow_loss": weighted_z_flow.item(),
+                    "effective_z_loss_weight": float(effective_z_loss_weight),
                     "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
                     "z_target_rms": output["z_target"].float().square().mean().sqrt().item(),
                     "z_condition_active": float(output["z_condition_active"]),

@@ -35,6 +35,7 @@ accelerate launch \
   --policy.z_condition_warmup_steps="${Z_CONDITION_WARMUP_STEPS}" \
   --policy.use_peft=false \
   --policy.freeze_vision_encoder=true \
+  --policy.train_state_proj=true \
   --policy.vidtwin_sample_posterior=false \
   --policy.motion_loss_weight=1.0 \
   --policy.z_loss_weight=1.0 \

@@ -76,8 +76,8 @@ class SmolWConfig(SmolVLAConfig):
     motion_loss_weight: float = 1.0
     detach_motion_condition: bool = False
     # For the first N action-training updates, action rows use the original
-    # SmolVLA attention path and cannot read z. z flow is still trained. The
-    # counter is stored in the model checkpoint and resumes automatically.
+    # SmolVLA attention path and cannot read z, and z loss has zero effective
+    # weight. The counter is stored in the checkpoint and resumes automatically.
     z_condition_warmup_steps: int = 0
 
     # Every training mode needs a full future video ending at t+H, either as a
