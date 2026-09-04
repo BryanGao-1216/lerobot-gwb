@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=3,5
 
 HORIZON="${HORIZON:-16}"
 N_ACTION_STEPS="${N_ACTION_STEPS:-${HORIZON}}"
@@ -6,17 +6,16 @@ MEMORY_STRIDE="${MEMORY_STRIDE:-1}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 
 
-OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-pret}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-stage1}"
 TENSORBOARD_LOG_DIR="${TENSORBOARD_LOG_DIR:-${OUTPUT_DIR}/tensorboard}"
 
 
-# accelerate launch \
-#   --multi_gpu \
-#   --num_processes=2 \
-#   --num_machines=1 \
-#   --main_process_port=25901 \
-  # "$(which lerobot-train)" \
-lerobot-train \
+accelerate launch \
+  --multi_gpu \
+  --num_processes=2 \
+  --num_machines=1 \
+  --main_process_port=25901 \
+  "$(which lerobot-train)" \
   --policy.path="/data1/gaowenbing/WorkSpace/models/smolw-base" \
   --policy.vidtwin_checkpoint_path="/data1/gaowenbing/WorkSpace/models/vidtwin-libero/checkpoint-best.ckpt" \
   --policy.motion_camera_key="observation.images.image" \
@@ -36,7 +35,7 @@ lerobot-train \
   --dataset.root="/data1/gaowenbing/WorkSpace/datasets/LIBERO-Lerobot" \
   --dataset.eval_split=0.0 \
   --output_dir="${OUTPUT_DIR}" \
-  --steps=60000 \
+  --steps=100000 \
   --save_freq=10000 \
   --batch_size="${BATCH_SIZE}" \
   --eval_steps=0 \
