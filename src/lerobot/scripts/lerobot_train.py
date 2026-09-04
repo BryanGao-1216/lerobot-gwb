@@ -670,8 +670,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "loss": float(train_tracker.loss.val),
                 "grad_norm": float(train_tracker.grad_norm.val),
                 "lr": float(train_tracker.lr.val),
-                "update_s": float(train_tracker.update_s.val),
-                "dataloading_s": float(train_tracker.dataloading_s.val),
+                # "update_s": float(train_tracker.update_s.val),
+                # "dataloading_s": float(train_tracker.dataloading_s.val),
             }
             if torch.cuda.is_available():
                 tensorboard_metrics["gpu_mem_gb"] = float(train_tracker.gpu_mem_gb.val)
