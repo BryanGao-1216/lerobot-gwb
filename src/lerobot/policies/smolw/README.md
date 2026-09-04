@@ -32,7 +32,7 @@ loss = motion_loss_weight * SmoothL1(pred_motion, target_motion)
 ```
 
 本模式训练 VLM 的有效层、`M_t`/motion projector 和 future-motion head；冻结 action
-expert、action 投影和 motion-to-action condition。视觉编码器是否冻结由
+expert、action 投影和 z flow heads。视觉编码器是否冻结由
 `freeze_vision_encoder` 控制。
 
 ### `action_only`
@@ -40,7 +40,7 @@ expert、action 投影和 motion-to-action condition。视觉编码器是否冻�
 模拟 future-motion 预测完全正确的情况：VidTwin 从真实未来窗口提取 1792 维 latent，
 将它转换成 16 个逐时间步 z latent，作为 flow matching 的 teacher target。VLM、
 `M_t`/motion projector 和 future-motion head 全部冻结；训练 action expert、SmolVLA
-action/time 投影、motion-to-z projection 和 z flow heads。
+action/time 投影和 z flow heads。
 
 ### `jointly`
 
@@ -59,17 +59,26 @@ expert 的 z loss 也会经过 z target 回传到 VLM/motion 分支。
 ## `(z, action)` suffix 与注意力
 
 VidTwin 的两个 `[B,8,16,7]` motion latent 沿通道拼接后按原 CoWVLA 顺序得到
-`[B,16,7,16]`。每个 temporal slot 的 `7*16=112` 维特征通过共享 MLP 投影成一个 z，
-最终得到 `[B,16,expert_hidden_size]`，不会用全局 Linear 混合16个时间位置。
+`[B,16,7,16]`。每个 temporal slot 的 `7*16=112` 维特征独立做无可训练参数的
+LayerNorm，直接形成固定目标 `[B,16,112]`，不会用 Linear 混合时间位置，也不会让
+target space 随训练漂移。noisy z 在进入 action expert 前才通过 `112→expert_hidden_size`
+的输入投影，expert 输出则通过 `expert_hidden_size→112` 回到 z velocity 空间。
 
 flow matching 内部 suffix 按 `[z_1,...,z_16,a_1,...,a_H]` 分块排列：
 
 - action-to-action 子矩阵保持原始 SmolVLA 因果注意力，`a_i` 可读取 `a_1...a_i`；
-- 每个 `a_i` 都能读取全部 `z_1...z_16`，因此完整 predicted motion 指导整个 action chunk；
+- warmup 结束后，每个 `a_i` 都能读取全部 `z_1...z_16`，因此完整 predicted motion
+  指导整个 action chunk；
 - 16 个 z token 互相可见，但任何 `z_i` 都不能读取 action，避免从 GT/noisy action 泄漏标签；
 - z 能读取包含 `M_t` 的完整 prefix，action 不直接读取 `M_t`，而是经 z 获得 motion 信息；
 - action 和 z 使用同一个 flow timestep，但分别采样噪声并分别预测 velocity；
 - 推理时联合去噪 16 个 z 和 H 个 action，策略最终只返回 action chunk。
+
+`z_condition_warmup_steps=m` 控制 action 条件课程学习：前 `m` 次 action 训练 forward
+中仅屏蔽 `action→z` 注意力，action 按原始 SmolVLA 路径学习，而 z flow loss 仍正常
+训练；从第 `m+1` 次开始恢复所有 `action→z` 边。计数器保存在 policy checkpoint 中，
+恢复训练不会重新开始 warmup；eval/推理始终启用 z condition。若设为 `0`，从第一步
+起就使用 z。
 
 当前 RTC 不支持这种联合状态去噪，启用时会明确报错。
 
@@ -121,6 +130,7 @@ bash train_smolw_lr.sh
 
 ```bash
 TRAIN_MODE=action_only \
+Z_CONDITION_WARMUP_STEPS=10000 \
 OUTPUT_DIR=/path/to/smolw-stage2 \
 HORIZON=16 MEMORY_STRIDE=1 \
 bash train_smolw_lr.sh
@@ -130,6 +140,7 @@ bash train_smolw_lr.sh
 
 ```bash
 TRAIN_MODE=jointly \
+Z_CONDITION_WARMUP_STEPS=10000 \
 OUTPUT_DIR=/path/to/smolw-joint \
 HORIZON=16 MEMORY_STRIDE=1 \
 bash train_smolw_lr.sh
@@ -148,3 +159,4 @@ tensorboard --logdir /path/to/output/tensorboard
 ```
 
 可通过 `TENSORBOARD_LOG_DIR` 覆盖日志目录。
+TensorBoard 还会记录 `z_condition_step` 和二值的 `z_condition_active`，便于确认课程切换。

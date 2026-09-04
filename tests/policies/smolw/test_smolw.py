@@ -63,6 +63,7 @@ def test_config_builds_past_and_future_lerobot_timestamps():
     assert not hasattr(config, "vidtwin_config_path")
     assert not config.tensorboard_enable
     assert config.tensorboard_log_freq == 100
+    assert config.z_condition_warmup_steps == 0
 
 
 @pytest.mark.parametrize("train_mode", ["motion_only", "action_only", "jointly"])
@@ -146,6 +147,17 @@ def test_z_loss_weight_must_be_non_negative():
             n_action_steps=HORIZON,
             motion_horizon=HORIZON,
             z_loss_weight=-1.0,
+            device="cpu",
+        )
+
+
+def test_z_condition_warmup_steps_must_be_non_negative():
+    with pytest.raises(ValueError, match="z_condition_warmup_steps"):
+        SmolWConfig(
+            chunk_size=HORIZON,
+            n_action_steps=HORIZON,
+            motion_horizon=HORIZON,
+            z_condition_warmup_steps=-1,
             device="cpu",
         )
 
@@ -365,11 +377,10 @@ def _mode_model(train_mode: str) -> SmolWFlowMatching:
     model.mt_query_embedding = nn.Embedding(1, 2)
     model.past_motion_projector = nn.Linear(2, 2)
     model.future_motion_head = nn.Linear(2, 2)
-    model.future_motion_token_to_z = nn.Linear(2, 2)
-    model.z_in_proj = nn.Linear(2, 2)
+    model.z_token_in_proj = nn.Linear(2, 2)
     model.z_time_mlp_in = nn.Linear(2, 2)
     model.z_time_mlp_out = nn.Linear(2, 2)
-    model.z_out_proj = nn.Linear(2, 2)
+    model.z_token_out_proj = nn.Linear(2, 2)
     model.action_in_proj = nn.Linear(2, 2)
     model.action_out_proj = nn.Linear(2, 2)
     model.action_time_mlp_in = nn.Linear(2, 2)
@@ -390,8 +401,8 @@ def test_train_mode_freezes_unselected_branch_and_vision_encoder():
     assert motion_model.vlm_with_expert.vlm.model.connector.weight.requires_grad
     assert motion_model.future_motion_head.weight.requires_grad
     assert not motion_model.vlm_with_expert.lm_expert.weight.requires_grad
-    assert not motion_model.future_motion_token_to_z.weight.requires_grad
-    assert not motion_model.z_out_proj.weight.requires_grad
+    assert not motion_model.z_token_in_proj.weight.requires_grad
+    assert not motion_model.z_token_out_proj.weight.requires_grad
 
     action_model = _mode_model("action_only")
     action_model.configure_train_mode()
@@ -400,8 +411,8 @@ def test_train_mode_freezes_unselected_branch_and_vision_encoder():
     assert not action_model.future_motion_head.weight.requires_grad
     assert action_model.vlm_with_expert.lm_expert.weight.requires_grad
     assert action_model.action_in_proj.weight.requires_grad
-    assert action_model.future_motion_token_to_z.weight.requires_grad
-    assert action_model.z_out_proj.weight.requires_grad
+    assert action_model.z_token_in_proj.weight.requires_grad
+    assert action_model.z_token_out_proj.weight.requires_grad
 
     action_model.train()
     assert not action_model.vlm_with_expert.vlm.training
@@ -413,8 +424,8 @@ def test_train_mode_freezes_unselected_branch_and_vision_encoder():
     assert joint_model.vlm_with_expert.vlm.model.text_model.weight.requires_grad
     assert joint_model.future_motion_head.weight.requires_grad
     assert joint_model.vlm_with_expert.lm_expert.weight.requires_grad
-    assert joint_model.future_motion_token_to_z.weight.requires_grad
-    assert joint_model.z_out_proj.weight.requires_grad
+    assert joint_model.z_token_in_proj.weight.requires_grad
+    assert joint_model.z_token_out_proj.weight.requires_grad
 
 
 def test_mt_query_is_appended_after_original_smolvla_prefix():
@@ -487,6 +498,40 @@ def test_all_actions_see_all_z_while_z_never_sees_actions():
     assert torch.equal(position_ids[:, 3:], original_position_ids)
     assert torch.equal(position_ids, torch.tensor([[3, 4, 5, 2, 3]]))
 
+    warmup_attention, warmup_position_ids = SmolWFlowMatching.make_action_z_attention(
+        prefix_masks,
+        z_masks,
+        action_masks,
+        action_attention,
+        action_can_see_z=False,
+    )
+    # During warmup, only action->z edges are removed. The original action
+    # mask, all z rows, and all position ids remain unchanged.
+    assert not warmup_attention[:, 3:, 4:7].any()
+    assert torch.equal(warmup_attention[:, :3], attention[:, :3])
+    assert torch.equal(warmup_attention[:, 3:].index_select(2, original_columns), original_attention)
+    assert torch.equal(warmup_position_ids, position_ids)
+
+
+def test_motion_to_z_uses_fixed_per_slot_normalization():
+    model = SmolWFlowMatching.__new__(SmolWFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        motion_latent_dim=8,
+        vidtwin_num_frames=2,
+        motion_token_dim=4,
+        detach_motion_condition=False,
+        motion_condition_scale=2.0,
+    )
+    future_motion = torch.tensor([[1.0, 2.0, 4.0, 8.0, 10.0, 20.0, 40.0, 80.0]])
+
+    z_target = model.motion_to_z(future_motion)
+    expected = torch.nn.functional.layer_norm(future_motion.reshape(1, 2, 4), (4,)) * 2.0
+
+    assert z_target.shape == (1, 2, 4)
+    assert torch.allclose(z_target, expected)
+    assert torch.allclose(z_target.mean(dim=-1), torch.zeros(1, 2), atol=1e-6)
+
 
 def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
     model = SmolWFlowMatching.__new__(SmolWFlowMatching)
@@ -498,6 +543,7 @@ def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
         motion_token_dim=2,
         motion_condition_scale=1.0,
         detach_motion_condition=False,
+        z_condition_warmup_steps=1,
         chunk_size=2,
         max_action_dim=2,
         min_period=4e-3,
@@ -516,11 +562,11 @@ def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
     model.mt_query_embedding = nn.Embedding(1, 4)
     model.past_motion_projector = nn.Sequential(nn.LayerNorm(4), nn.Linear(4, 4))
     model.future_motion_head = nn.Sequential(nn.LayerNorm(4), nn.Linear(4, 4))
-    model.future_motion_token_to_z = nn.Sequential(nn.LayerNorm(2), nn.Linear(2, 4))
-    model.z_in_proj = nn.Linear(4, 4)
+    model.z_token_in_proj = nn.Linear(2, 4)
     model.z_time_mlp_in = nn.Linear(8, 4)
     model.z_time_mlp_out = nn.Linear(4, 4)
-    model.z_out_proj = nn.Linear(4, 4)
+    model.z_token_out_proj = nn.Linear(4, 2)
+    model.register_buffer("z_condition_step", torch.zeros((), dtype=torch.long), persistent=True)
     model.rtc_processor = None
 
     inputs = {
@@ -536,13 +582,13 @@ def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
         actions=torch.ones(1, 2, 2),
         future_motion_target=torch.zeros(1, 4),
         noise=torch.zeros(1, 2, 2),
-        z_noise=torch.zeros(1, 2, 4),
+        z_noise=torch.zeros(1, 2, 2),
         time=torch.full((1,), 0.5),
     )
     actions = model.sample_actions(
         **inputs,
         noise=torch.zeros(1, 2, 2),
-        z_noise=torch.zeros(1, 2, 4),
+        z_noise=torch.zeros(1, 2, 2),
     )
 
     assert output["flow_losses"].shape == (1, 2, 2)
@@ -550,7 +596,11 @@ def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
     assert output["motion_losses"].shape == (1,)
     assert output["predicted_future_motion"].shape == (1, 4)
     assert torch.equal(output["z_motion_source"], output["predicted_future_motion"])
-    assert output["z_target"].shape == (1, 2, 4)
+    assert output["z_target"].shape == (1, 2, 2)
+    assert output["z_condition_active"] is False
+    assert output["z_condition_step"] == 0
+    assert model.z_condition_step.item() == 1
+    assert "z_condition_step" in model.state_dict()
     assert actions.shape == (1, 2, 2)
 
     oracle_motion = torch.full((1, 4), 7.0)
@@ -559,11 +609,14 @@ def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
         actions=torch.ones(1, 2, 2),
         z_motion_source=oracle_motion,
         noise=torch.zeros(1, 2, 2),
-        z_noise=torch.zeros(1, 2, 4),
+        z_noise=torch.zeros(1, 2, 2),
         time=torch.full((1,), 0.5),
         compute_motion_loss=False,
     )
     assert torch.equal(oracle_output["z_motion_source"], oracle_motion)
+    assert oracle_output["z_condition_active"] is True
+    assert oracle_output["z_condition_step"] == 1
+    assert model.z_condition_step.item() == 2
 
 
 def test_policy_combines_masked_flow_and_motion_losses():
@@ -579,6 +632,8 @@ def test_policy_combines_masked_flow_and_motion_losses():
                 "motion_losses": torch.tensor([4.0]),
                 "predicted_future_motion": torch.tensor([[2.0]]),
                 "z_target": torch.tensor([[3.0]]),
+                "z_condition_active": True,
+                "z_condition_step": 12,
             }
 
     class _MotionExtractor:
@@ -617,6 +672,8 @@ def test_policy_combines_masked_flow_and_motion_losses():
     assert metrics["action_flow_loss"] == pytest.approx(1.0)
     assert metrics["z_flow_loss"] == pytest.approx(2.0)
     assert metrics["motion_loss"] == pytest.approx(4.0)
+    assert metrics["z_condition_active"] == 1.0
+    assert metrics["z_condition_step"] == 12.0
 
 
 def test_motion_only_does_not_prepare_or_run_action_expert():
@@ -680,6 +737,8 @@ def test_action_only_uses_oracle_future_motion_without_motion_loss():
                 "predicted_future_motion": torch.tensor([[2.0]]),
                 "z_motion_source": kwargs["z_motion_source"],
                 "z_target": torch.tensor([[3.0]]),
+                "z_condition_active": False,
+                "z_condition_step": 3,
             }
 
     class _MotionExtractor:
@@ -718,4 +777,6 @@ def test_action_only_uses_oracle_future_motion_without_motion_loss():
     assert metrics["z_flow_loss"] == pytest.approx(0.5)
     assert metrics["oracle_motion_rms"] == pytest.approx(1.0)
     assert metrics["predicted_motion_rms"] == pytest.approx(2.0)
+    assert metrics["z_condition_active"] == 0.0
+    assert metrics["z_condition_step"] == 3.0
     assert "motion_loss" not in metrics

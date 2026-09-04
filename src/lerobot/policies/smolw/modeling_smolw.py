@@ -77,19 +77,14 @@ class SmolWFlowMatching(VLAFlowMatching):
             nn.SiLU(),
             nn.Linear(config.motion_projector_hidden_dim, config.motion_latent_dim),
         )
-        # Keep VidTwin's 16 temporal positions explicit. The same projector is
-        # shared by every 112-D temporal slot instead of globally mixing the
-        # flattened 1792-D horizon into one token.
-        self.future_motion_token_to_z = nn.Sequential(
-            nn.LayerNorm(config.motion_token_dim),
-            nn.Linear(config.motion_token_dim, config.motion_condition_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(config.motion_condition_hidden_dim, expert_hidden_size),
-        )
-        self.z_in_proj = nn.Linear(expert_hidden_size, expert_hidden_size)
+        # Flow matching operates directly in VidTwin's fixed, normalized
+        # per-temporal-slot space. Only the noisy z *input* is projected into
+        # the expert width; the regression target itself has no learned map.
+        self.z_token_in_proj = nn.Linear(config.motion_token_dim, expert_hidden_size)
         self.z_time_mlp_in = nn.Linear(expert_hidden_size * 2, expert_hidden_size)
         self.z_time_mlp_out = nn.Linear(expert_hidden_size, expert_hidden_size)
-        self.z_out_proj = nn.Linear(expert_hidden_size, expert_hidden_size)
+        self.z_token_out_proj = nn.Linear(expert_hidden_size, config.motion_token_dim)
+        self.register_buffer("z_condition_step", torch.zeros((), dtype=torch.long), persistent=True)
 
         nn.init.normal_(self.mt_query_embedding.weight, mean=0.0, std=0.02)
         self._train_mode_configured = False
@@ -122,11 +117,10 @@ class SmolWFlowMatching(VLAFlowMatching):
                 "action_out_proj.",
                 "action_time_mlp_in.",
                 "action_time_mlp_out.",
-                "future_motion_token_to_z.",
-                "z_in_proj.",
+                "z_token_in_proj.",
                 "z_time_mlp_in.",
                 "z_time_mlp_out.",
-                "z_out_proj.",
+                "z_token_out_proj.",
             )
         )
 
@@ -215,7 +209,7 @@ class SmolWFlowMatching(VLAFlowMatching):
         return self.future_motion_head(query_hidden.to(dtype=head_dtype)).float()
 
     def motion_to_z(self, future_motion: Tensor) -> Tensor:
-        """Convert flattened VidTwin motion into H time-aligned z targets."""
+        """Split and normalize flattened VidTwin motion into 16 fixed z targets."""
         if future_motion.ndim != 2 or future_motion.shape[-1] != self.config.motion_latent_dim:
             raise ValueError(
                 f"future_motion must have shape [B, motion_latent_dim], got {tuple(future_motion.shape)}."
@@ -226,9 +220,10 @@ class SmolWFlowMatching(VLAFlowMatching):
             self.config.vidtwin_num_frames,
             self.config.motion_token_dim,
         )
-        projection_dtype = self.future_motion_token_to_z[1].weight.dtype
-        z = self.future_motion_token_to_z(motion_tokens.to(dtype=projection_dtype))
-        return torch.tanh(z) * self.config.motion_condition_scale
+        # Layer normalization has no affine parameters here: target semantics
+        # stay fixed throughout training and across checkpoints.
+        z = F.layer_norm(motion_tokens.float(), (self.config.motion_token_dim,))
+        return z * self.config.motion_condition_scale
 
     def embed_action_z_suffix(
         self,
@@ -244,12 +239,12 @@ class SmolWFlowMatching(VLAFlowMatching):
         expected_z_shape = (
             noisy_actions.shape[0],
             self.config.vidtwin_num_frames,
-            self.vlm_with_expert.expert_hidden_size,
+            self.config.motion_token_dim,
         )
         if noisy_z.shape != expected_z_shape:
             raise ValueError(f"noisy_z must have shape {expected_z_shape}, got {tuple(noisy_z.shape)}.")
-        z_dtype = self.z_in_proj.weight.dtype
-        z_emb = self.z_in_proj(noisy_z.to(dtype=z_dtype))
+        z_dtype = self.z_token_in_proj.weight.dtype
+        z_emb = self.z_token_in_proj(noisy_z.to(dtype=z_dtype))
         z_time_emb = create_sinusoidal_pos_embedding(
             timestep,
             self.vlm_with_expert.expert_hidden_size,
@@ -343,6 +338,7 @@ class SmolWFlowMatching(VLAFlowMatching):
         z_pad_masks: Tensor,
         action_pad_masks: Tensor,
         action_att_masks: Tensor,
+        action_can_see_z: bool = True,
     ) -> tuple[Tensor, Tensor]:
         """Build attention for ``[z_1,...,z_16,a_1,...,a_H]``.
 
@@ -374,11 +370,23 @@ class SmolWFlowMatching(VLAFlowMatching):
         )
         z_rows = torch.cat([z_prefix_attention, z_self_attention, z_action_attention], dim=2)
 
-        # action rows: original prefix + every z token + original action mask.
+        # action rows: original prefix + optional z condition + original
+        # action mask. Warmup disables only action->z; z flow remains intact.
+        action_z_attention = (
+            z_pad_masks[:, None, :].expand(batch_size, horizon, z_count)
+            if action_can_see_z
+            else torch.zeros(
+                batch_size,
+                horizon,
+                z_count,
+                dtype=torch.bool,
+                device=action_pad_masks.device,
+            )
+        )
         action_rows = torch.cat(
             [
                 action_attention[:, :, :prefix_len],
-                z_pad_masks[:, None, :].expand(batch_size, horizon, z_count),
+                action_z_attention,
                 action_attention[:, :, prefix_len:],
             ],
             dim=2,
@@ -415,7 +423,7 @@ class SmolWFlowMatching(VLAFlowMatching):
         time: Tensor | None = None,
         compute_motion_loss: bool = True,
         compute_flow: bool = True,
-    ) -> dict[str, Tensor]:
+    ) -> dict[str, Tensor | bool | int]:
         """Run the selected motion-regression and/or action objectives."""
         (
             predicted_future_motion,
@@ -477,11 +485,14 @@ class SmolWFlowMatching(VLAFlowMatching):
                 z_x_t,
                 time,
             )
+            z_condition_step = int(self.z_condition_step.item())
+            action_can_see_z = not self.training or z_condition_step >= self.config.z_condition_warmup_steps
             attention, position_ids = self.make_action_z_attention(
                 prefix_pad_masks,
                 z_pad_masks,
                 action_pad_masks,
                 action_att_masks,
+                action_can_see_z=action_can_see_z,
             )
             outputs_embeds, _ = self.vlm_with_expert.forward(
                 attention_mask=attention,
@@ -493,7 +504,7 @@ class SmolWFlowMatching(VLAFlowMatching):
             )
             suffix_length = self.config.vidtwin_num_frames + self.config.chunk_size
             suffix_out = outputs_embeds[1][:, -suffix_length:].float()
-            z_velocity = self.z_out_proj(suffix_out[:, : self.config.vidtwin_num_frames])
+            z_velocity = self.z_token_out_proj(suffix_out[:, : self.config.vidtwin_num_frames])
             action_velocity = self.action_out_proj(suffix_out[:, self.config.vidtwin_num_frames :])
             output["flow_losses"] = F.mse_loss(action_u_t, action_velocity, reduction="none")
             output["z_flow_losses"] = F.mse_loss(
@@ -503,6 +514,13 @@ class SmolWFlowMatching(VLAFlowMatching):
             ).mean(dim=(1, 2))
             output["z_motion_source"] = z_motion_source
             output["z_target"] = z_target
+            output["z_condition_active"] = action_can_see_z
+            output["z_condition_step"] = z_condition_step
+            if self.training:
+                # One increment per optimizer-bound forward. All DDP ranks run
+                # the same number of forwards, and this persistent buffer is
+                # restored when resuming from a checkpoint.
+                self.z_condition_step.add_(1)
 
         return output
 
@@ -541,14 +559,14 @@ class SmolWFlowMatching(VLAFlowMatching):
                 (
                     batch_size,
                     self.config.vidtwin_num_frames,
-                    self.vlm_with_expert.expert_hidden_size,
+                    self.config.motion_token_dim,
                 ),
                 device,
             )
         expected_z_shape = (
             batch_size,
             self.config.vidtwin_num_frames,
-            self.vlm_with_expert.expert_hidden_size,
+            self.config.motion_token_dim,
         )
         if z_noise.shape != expected_z_shape:
             raise ValueError(f"z_noise must have shape {expected_z_shape}, got {tuple(z_noise.shape)}.")
@@ -606,7 +624,7 @@ class SmolWFlowMatching(VLAFlowMatching):
         )
         suffix_length = self.config.vidtwin_num_frames + self.config.chunk_size
         suffix_out = outputs_embeds[1][:, -suffix_length:].float()
-        z_velocity = self.z_out_proj(suffix_out[:, : self.config.vidtwin_num_frames])
+        z_velocity = self.z_token_out_proj(suffix_out[:, : self.config.vidtwin_num_frames])
         action_velocity = self.action_out_proj(suffix_out[:, self.config.vidtwin_num_frames :])
         return action_velocity, z_velocity
 
@@ -935,6 +953,8 @@ class SmolWPolicy(SmolVLAPolicy):
                     "weighted_z_flow_loss": weighted_z_flow.item(),
                     "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
                     "z_target_rms": output["z_target"].float().square().mean().sqrt().item(),
+                    "z_condition_active": float(output["z_condition_active"]),
+                    "z_condition_step": float(output["z_condition_step"]),
                 }
             )
 
@@ -979,10 +999,9 @@ class SmolWPolicy(SmolVLAPolicy):
             "mt_query_embedding",
             "past_motion_projector",
             "future_motion_head",
-            "future_motion_token_to_z",
-            "z_in_proj",
+            "z_token_in_proj",
             "z_time_mlp_in",
             "z_time_mlp_out",
-            "z_out_proj",
+            "z_token_out_proj",
         ]
         return defaults

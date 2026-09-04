@@ -8,6 +8,7 @@ HORIZON="${HORIZON:-16}"
 N_ACTION_STEPS="${N_ACTION_STEPS:-${HORIZON}}"
 MEMORY_STRIDE="${MEMORY_STRIDE:-1}"
 TRAIN_MODE="${TRAIN_MODE:-action_only}"
+Z_CONDITION_WARMUP_STEPS="${Z_CONDITION_WARMUP_STEPS:-10000}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 
 POLICY_PATH="${POLICY_PATH:-/data1/gaowenbing/WorkSpace/models/smolw-base}"
@@ -31,6 +32,7 @@ accelerate launch \
   --policy.n_action_steps="${N_ACTION_STEPS}" \
   --policy.drop_n_last_frames="${HORIZON}" \
   --policy.train_mode="${TRAIN_MODE}" \
+  --policy.z_condition_warmup_steps="${Z_CONDITION_WARMUP_STEPS}" \
   --policy.use_peft=false \
   --policy.freeze_vision_encoder=true \
   --policy.vidtwin_sample_posterior=false \

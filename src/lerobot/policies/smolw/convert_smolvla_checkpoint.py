@@ -127,11 +127,11 @@ def _copy_compatible_weights(source_policy: SmolVLAPolicy, target_policy: SmolWP
         "model.mt_query_embedding.",
         "model.past_motion_projector.",
         "model.future_motion_head.",
-        "model.future_motion_token_to_z.",
-        "model.z_in_proj.",
+        "model.z_token_in_proj.",
         "model.z_time_mlp_in.",
         "model.z_time_mlp_out.",
-        "model.z_out_proj.",
+        "model.z_token_out_proj.",
+        "model.z_condition_step",
     )
     unmatched_missing = [key for key in missing_keys if not key.startswith(expected_new_prefixes)]
     logging.info(

@@ -67,13 +67,18 @@ class SmolWConfig(SmolVLAConfig):
 
     # New SmolW branches.
     motion_projector_hidden_dim: int = 1024
-    # Every one of VidTwin's fixed 16 temporal slots is converted into one z
-    # target. The action horizon H remains independently configurable.
+    # Deprecated checkpoint/config compatibility. z targets now stay in the
+    # native per-temporal-slot VidTwin space instead of passing through a
+    # trainable target projector.
     motion_condition_hidden_dim: int = 1024
     motion_condition_scale: float = 1.0
     z_loss_weight: float = 1.0
     motion_loss_weight: float = 1.0
     detach_motion_condition: bool = False
+    # For the first N action-training updates, action rows use the original
+    # SmolVLA attention path and cannot read z. z flow is still trained. The
+    # counter is stored in the model checkpoint and resumes automatically.
+    z_condition_warmup_steps: int = 0
 
     # Every training mode needs a full future video ending at t+H, either as a
     # regression target or as the oracle action condition. ``None`` drops
@@ -147,6 +152,10 @@ class SmolWConfig(SmolVLAConfig):
         if self.motion_condition_scale < 0:
             raise ValueError(
                 f"motion_condition_scale must be non-negative, got {self.motion_condition_scale}."
+            )
+        if self.z_condition_warmup_steps < 0:
+            raise ValueError(
+                f"z_condition_warmup_steps must be non-negative, got {self.z_condition_warmup_steps}."
             )
         if self.z_loss_weight < 0:
             raise ValueError(f"z_loss_weight must be non-negative, got {self.z_loss_weight}.")
