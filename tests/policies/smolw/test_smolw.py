@@ -22,14 +22,15 @@ from lerobot.utils.constants import (
 )
 
 CAMERA = "observation.images.image"
+HORIZON = 16
 
 
 def test_policy_is_independently_registered():
     config = make_policy_config(
         "smolw",
-        chunk_size=4,
-        n_action_steps=4,
-        motion_horizon=4,
+        chunk_size=HORIZON,
+        n_action_steps=HORIZON,
+        motion_horizon=HORIZON,
         device="cpu",
     )
 
@@ -39,20 +40,21 @@ def test_policy_is_independently_registered():
 
 def test_config_builds_past_and_future_lerobot_timestamps():
     config = SmolWConfig(
-        chunk_size=4,
-        n_action_steps=4,
-        motion_horizon=4,
+        chunk_size=HORIZON,
+        n_action_steps=HORIZON,
+        motion_horizon=HORIZON,
         memory_stride=2,
         device="cpu",
     )
 
-    assert config.past_motion_delta_indices == [-6, -4, -2, 0]
-    assert config.future_motion_delta_indices == [1, 2, 3, 4]
-    assert config.observation_delta_indices == [-6, -4, -2, 0, 1, 2, 3, 4]
-    assert config.past_motion_positions == [0, 1, 2, 3]
-    assert config.future_motion_positions == [4, 5, 6, 7]
-    assert config.current_observation_position == 3
-    assert config.drop_n_last_frames == 4
+    assert config.past_motion_delta_indices == list(range(-30, 1, 2))
+    assert config.future_motion_delta_indices == list(range(1, HORIZON + 1))
+    assert config.observation_delta_indices == list(range(-30, 1, 2)) + list(range(1, HORIZON + 1))
+    assert config.past_motion_positions == list(range(HORIZON))
+    assert config.future_motion_positions == list(range(HORIZON, 2 * HORIZON))
+    assert config.current_observation_position == HORIZON - 1
+    assert config.drop_n_last_frames == HORIZON
+    assert config.motion_token_dim == 112
     assert config.train_mode == "motion_only"
     assert config.training_stage is None
     assert not config.train_expert_only
@@ -66,26 +68,26 @@ def test_config_builds_past_and_future_lerobot_timestamps():
 @pytest.mark.parametrize("train_mode", ["motion_only", "action_only", "jointly"])
 def test_all_train_modes_request_future_motion_target(train_mode):
     config = SmolWConfig(
-        chunk_size=4,
-        n_action_steps=4,
-        motion_horizon=4,
+        chunk_size=HORIZON,
+        n_action_steps=HORIZON,
+        motion_horizon=HORIZON,
         memory_stride=2,
         train_mode=train_mode,
         device="cpu",
     )
 
-    assert config.observation_delta_indices == [-6, -4, -2, 0, 1, 2, 3, 4]
-    assert config.past_motion_positions == [0, 1, 2, 3]
-    assert config.future_motion_positions == [4, 5, 6, 7]
-    assert config.drop_n_last_frames == 4
+    assert config.observation_delta_indices == list(range(-30, 1, 2)) + list(range(1, HORIZON + 1))
+    assert config.past_motion_positions == list(range(HORIZON))
+    assert config.future_motion_positions == list(range(HORIZON, 2 * HORIZON))
+    assert config.drop_n_last_frames == HORIZON
 
 
 def test_config_rejects_unknown_train_mode():
     with pytest.raises(ValueError, match="train_mode"):
         SmolWConfig(
-            chunk_size=4,
-            n_action_steps=4,
-            motion_horizon=4,
+            chunk_size=HORIZON,
+            n_action_steps=HORIZON,
+            motion_horizon=HORIZON,
             train_mode="unknown",
             device="cpu",
         )
@@ -94,9 +96,9 @@ def test_config_rejects_unknown_train_mode():
 def test_config_enforces_fixed_vidtwin_frame_count():
     with pytest.raises(ValueError, match="vidtwin_num_frames=16"):
         SmolWConfig(
-            chunk_size=4,
-            n_action_steps=4,
-            motion_horizon=4,
+            chunk_size=HORIZON,
+            n_action_steps=HORIZON,
+            motion_horizon=HORIZON,
             vidtwin_num_frames=8,
             device="cpu",
         )
@@ -104,9 +106,9 @@ def test_config_enforces_fixed_vidtwin_frame_count():
 
 def test_config_can_be_loaded_with_train_mode_override(tmp_path):
     motion_config = SmolWConfig(
-        chunk_size=4,
-        n_action_steps=4,
-        motion_horizon=4,
+        chunk_size=HORIZON,
+        n_action_steps=HORIZON,
+        motion_horizon=HORIZON,
         train_mode="motion_only",
         device="cpu",
     )
@@ -119,15 +121,15 @@ def test_config_can_be_loaded_with_train_mode_override(tmp_path):
 
     assert isinstance(action_config, SmolWConfig)
     assert action_config.train_mode == "action_only"
-    assert action_config.observation_delta_indices == [-3, -2, -1, 0, 1, 2, 3, 4]
-    assert action_config.drop_n_last_frames == 4
+    assert action_config.observation_delta_indices == list(range(-15, HORIZON + 1))
+    assert action_config.drop_n_last_frames == HORIZON
 
 
 def test_legacy_training_stage_is_migrated_to_train_mode():
     config = SmolWConfig(
-        chunk_size=4,
-        n_action_steps=4,
-        motion_horizon=4,
+        chunk_size=HORIZON,
+        n_action_steps=HORIZON,
+        motion_horizon=HORIZON,
         training_stage="action_expert_only",
         device="cpu",
     )
@@ -140,9 +142,9 @@ def test_legacy_training_stage_is_migrated_to_train_mode():
 def test_z_loss_weight_must_be_non_negative():
     with pytest.raises(ValueError, match="z_loss_weight"):
         SmolWConfig(
-            chunk_size=4,
-            n_action_steps=4,
-            motion_horizon=4,
+            chunk_size=HORIZON,
+            n_action_steps=HORIZON,
+            motion_horizon=HORIZON,
             z_loss_weight=-1.0,
             device="cpu",
         )
@@ -160,9 +162,9 @@ def test_z_loss_weight_must_be_non_negative():
 def test_tensorboard_intervals_must_be_positive(field):
     with pytest.raises(ValueError, match=field):
         SmolWConfig(
-            chunk_size=4,
-            n_action_steps=4,
-            motion_horizon=4,
+            chunk_size=HORIZON,
+            n_action_steps=HORIZON,
+            motion_horizon=HORIZON,
             device="cpu",
             **{field: 0},
         )
@@ -194,11 +196,24 @@ def test_bundled_qformer_runs_with_lerobot_transformers_version():
 def test_config_keeps_motion_and_action_horizons_aligned():
     with pytest.raises(ValueError, match="motion_horizon == chunk_size"):
         SmolWConfig(
-            chunk_size=4,
-            n_action_steps=4,
-            motion_horizon=3,
+            chunk_size=HORIZON,
+            n_action_steps=HORIZON,
+            motion_horizon=HORIZON - 1,
             device="cpu",
         )
+
+
+def test_action_horizon_can_differ_from_fixed_vidtwin_token_count():
+    config = SmolWConfig(
+        chunk_size=4,
+        n_action_steps=4,
+        motion_horizon=4,
+        device="cpu",
+    )
+
+    assert config.motion_horizon == 4
+    assert config.vidtwin_num_frames == 16
+    assert config.motion_token_dim == 112
 
 
 def test_flatten_motion_latents_matches_cowvla_order():
@@ -350,7 +365,7 @@ def _mode_model(train_mode: str) -> SmolWFlowMatching:
     model.mt_query_embedding = nn.Embedding(1, 2)
     model.past_motion_projector = nn.Linear(2, 2)
     model.future_motion_head = nn.Linear(2, 2)
-    model.future_motion_to_z = nn.Linear(2, 2)
+    model.future_motion_token_to_z = nn.Linear(2, 2)
     model.z_in_proj = nn.Linear(2, 2)
     model.z_time_mlp_in = nn.Linear(2, 2)
     model.z_time_mlp_out = nn.Linear(2, 2)
@@ -375,7 +390,7 @@ def test_train_mode_freezes_unselected_branch_and_vision_encoder():
     assert motion_model.vlm_with_expert.vlm.model.connector.weight.requires_grad
     assert motion_model.future_motion_head.weight.requires_grad
     assert not motion_model.vlm_with_expert.lm_expert.weight.requires_grad
-    assert not motion_model.future_motion_to_z.weight.requires_grad
+    assert not motion_model.future_motion_token_to_z.weight.requires_grad
     assert not motion_model.z_out_proj.weight.requires_grad
 
     action_model = _mode_model("action_only")
@@ -385,7 +400,7 @@ def test_train_mode_freezes_unselected_branch_and_vision_encoder():
     assert not action_model.future_motion_head.weight.requires_grad
     assert action_model.vlm_with_expert.lm_expert.weight.requires_grad
     assert action_model.action_in_proj.weight.requires_grad
-    assert action_model.future_motion_to_z.weight.requires_grad
+    assert action_model.future_motion_token_to_z.weight.requires_grad
     assert action_model.z_out_proj.weight.requires_grad
 
     action_model.train()
@@ -398,7 +413,7 @@ def test_train_mode_freezes_unselected_branch_and_vision_encoder():
     assert joint_model.vlm_with_expert.vlm.model.text_model.weight.requires_grad
     assert joint_model.future_motion_head.weight.requires_grad
     assert joint_model.vlm_with_expert.lm_expert.weight.requires_grad
-    assert joint_model.future_motion_to_z.weight.requires_grad
+    assert joint_model.future_motion_token_to_z.weight.requires_grad
     assert joint_model.z_out_proj.weight.requires_grad
 
 
@@ -432,8 +447,9 @@ def test_mt_query_is_appended_after_original_smolvla_prefix():
     assert torch.allclose(embeddings[0, -1], expected_query)
 
 
-def test_action_attention_is_unchanged_while_z_sees_actions_and_mt():
+def test_all_actions_see_all_z_while_z_never_sees_actions():
     prefix_masks = torch.tensor([[True, True, False, True]])
+    z_masks = torch.tensor([[True, True, True]])
     action_masks = torch.tensor([[True, True]])
     action_attention = torch.ones(1, 2, dtype=torch.bool)
 
@@ -444,23 +460,42 @@ def test_action_attention_is_unchanged_while_z_sees_actions_and_mt():
     )
     attention, position_ids = SmolWFlowMatching.make_action_z_attention(
         prefix_masks,
+        z_masks,
         action_masks,
         action_attention,
     )
 
-    assert attention.shape == (1, 3, 7)
-    assert torch.equal(attention[:, :2, :6], original_attention)
-    assert not attention[:, :2, -1].any()
-    assert torch.equal(attention[0, -1], torch.tensor([True, True, False, True, True, True, True]))
-    assert torch.equal(position_ids[:, :2], original_position_ids)
-    assert torch.equal(position_ids, torch.tensor([[2, 3, 4]]))
+    assert attention.shape == (1, 5, 9)
+    assert torch.equal(
+        attention[0],
+        torch.tensor(
+            [
+                # Every z sees the full valid prefix and all z, but no action.
+                [True, True, False, True, True, True, True, False, False],
+                [True, True, False, True, True, True, True, False, False],
+                [True, True, False, True, True, True, True, False, False],
+                # Every action sees all z while retaining original a-to-a causality.
+                [True, True, False, False, True, True, True, True, False],
+                [True, True, False, False, True, True, True, True, True],
+            ]
+        ),
+    )
+    # Extract [prefix, action] columns and verify that
+    # action-to-action behavior is byte-for-byte the original SmolVLA mask.
+    original_columns = torch.tensor([0, 1, 2, 3, 7, 8])
+    assert torch.equal(attention[:, 3:].index_select(2, original_columns), original_attention)
+    assert torch.equal(position_ids[:, 3:], original_position_ids)
+    assert torch.equal(position_ids, torch.tensor([[3, 4, 5, 2, 3]]))
 
 
 def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
     model = SmolWFlowMatching.__new__(SmolWFlowMatching)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
-        motion_latent_dim=3,
+        motion_latent_dim=4,
+        motion_horizon=2,
+        vidtwin_num_frames=2,
+        motion_token_dim=2,
         motion_condition_scale=1.0,
         detach_motion_condition=False,
         chunk_size=2,
@@ -479,9 +514,9 @@ def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
     model.action_time_mlp_out = nn.Linear(4, 4)
     model.action_out_proj = nn.Linear(4, 2)
     model.mt_query_embedding = nn.Embedding(1, 4)
-    model.past_motion_projector = nn.Sequential(nn.LayerNorm(3), nn.Linear(3, 4))
-    model.future_motion_head = nn.Sequential(nn.LayerNorm(4), nn.Linear(4, 3))
-    model.future_motion_to_z = nn.Sequential(nn.LayerNorm(3), nn.Linear(3, 4))
+    model.past_motion_projector = nn.Sequential(nn.LayerNorm(4), nn.Linear(4, 4))
+    model.future_motion_head = nn.Sequential(nn.LayerNorm(4), nn.Linear(4, 4))
+    model.future_motion_token_to_z = nn.Sequential(nn.LayerNorm(2), nn.Linear(2, 4))
     model.z_in_proj = nn.Linear(4, 4)
     model.z_time_mlp_in = nn.Linear(8, 4)
     model.z_time_mlp_out = nn.Linear(4, 4)
@@ -494,37 +529,37 @@ def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
         "lang_tokens": torch.tensor([[2, 3]]),
         "lang_masks": torch.tensor([[True, True]]),
         "state": torch.ones(1, 2),
-        "past_motion": torch.ones(1, 3),
+        "past_motion": torch.ones(1, 4),
     }
     output = model.forward(
         **inputs,
         actions=torch.ones(1, 2, 2),
-        future_motion_target=torch.zeros(1, 3),
+        future_motion_target=torch.zeros(1, 4),
         noise=torch.zeros(1, 2, 2),
-        z_noise=torch.zeros(1, 4),
+        z_noise=torch.zeros(1, 2, 4),
         time=torch.full((1,), 0.5),
     )
     actions = model.sample_actions(
         **inputs,
         noise=torch.zeros(1, 2, 2),
-        z_noise=torch.zeros(1, 4),
+        z_noise=torch.zeros(1, 2, 4),
     )
 
     assert output["flow_losses"].shape == (1, 2, 2)
     assert output["z_flow_losses"].shape == (1,)
     assert output["motion_losses"].shape == (1,)
-    assert output["predicted_future_motion"].shape == (1, 3)
+    assert output["predicted_future_motion"].shape == (1, 4)
     assert torch.equal(output["z_motion_source"], output["predicted_future_motion"])
-    assert output["z_target"].shape == (1, 4)
+    assert output["z_target"].shape == (1, 2, 4)
     assert actions.shape == (1, 2, 2)
 
-    oracle_motion = torch.full((1, 3), 7.0)
+    oracle_motion = torch.full((1, 4), 7.0)
     oracle_output = model.forward(
         **inputs,
         actions=torch.ones(1, 2, 2),
         z_motion_source=oracle_motion,
         noise=torch.zeros(1, 2, 2),
-        z_noise=torch.zeros(1, 4),
+        z_noise=torch.zeros(1, 2, 4),
         time=torch.full((1,), 0.5),
         compute_motion_loss=False,
     )

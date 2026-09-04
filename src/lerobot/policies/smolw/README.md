@@ -12,8 +12,8 @@ LeRobot 格式数据。
 - action chunk：`[a_t, ..., a_{t+H-1}]`。
 
 这样未来窗口的最后一帧 `o_{t+H}` 正好是执行完 `H` 个 action 后的观测。VidTwin
-内部始终使用固定 16 帧：两个窗口都会通过 `linspace` 均匀采样为 16 帧。因此当
-`H=16` 时逐帧输入；`H>16` 时下采样，`H<16` 时会重复部分帧。
+内部始终使用固定 16 帧：两个窗口都会通过 `linspace` 均匀采样为 16 帧。因此 action
+horizon `H` 可以独立配置，而 VidTwin motion 和 z token 数始终固定为 16。
 
 VLM 的普通视觉、语言和状态输入仍只使用当前观测 `o_t`。历史窗口由冻结的 VidTwin
 编码为 latent motion，并通过追加在 VLM prefix 末尾的 `M_t` query 输入模型。
@@ -38,7 +38,7 @@ expert、action 投影和 motion-to-action condition。视觉编码器是否冻�
 ### `action_only`
 
 模拟 future-motion 预测完全正确的情况：VidTwin 从真实未来窗口提取 1792 维 latent，
-将它转换成一个 horizon 级 z latent，作为 flow matching 的 teacher target。VLM、
+将它转换成 16 个逐时间步 z latent，作为 flow matching 的 teacher target。VLM、
 `M_t`/motion projector 和 future-motion head 全部冻结；训练 action expert、SmolVLA
 action/time 投影、motion-to-z projection 和 z flow heads。
 
@@ -58,17 +58,20 @@ expert 的 z loss 也会经过 z target 回传到 VLM/motion 分支。
 
 ## `(z, action)` suffix 与注意力
 
-flow matching 不再把 predicted motion 直接加到每个 action token 上。内部 suffix 按
-`[a_1, ..., a_H, z]` 排列，其中 z 是一个代表完整 horizon 的全局 latent token，连续
-维度等于 action expert hidden size：
+VidTwin 的两个 `[B,8,16,7]` motion latent 沿通道拼接后按原 CoWVLA 顺序得到
+`[B,16,7,16]`。每个 temporal slot 的 `7*16=112` 维特征通过共享 MLP 投影成一个 z，
+最终得到 `[B,16,expert_hidden_size]`，不会用全局 Linear 混合16个时间位置。
 
-- H 个 action token 的注意力与原始 SmolVLA 完全相同，不能读取 `M_t` 或 z；
-- z token 可以读取普通 VLM prefix、`M_t`、全部 H 个 action token 和自身；
+flow matching 内部 suffix 按 `[z_1,...,z_16,a_1,...,a_H]` 分块排列：
+
+- action-to-action 子矩阵保持原始 SmolVLA 因果注意力，`a_i` 可读取 `a_1...a_i`；
+- 每个 `a_i` 都能读取全部 `z_1...z_16`，因此完整 predicted motion 指导整个 action chunk；
+- 16 个 z token 互相可见，但任何 `z_i` 都不能读取 action，避免从 GT/noisy action 泄漏标签；
+- z 能读取包含 `M_t` 的完整 prefix，action 不直接读取 `M_t`，而是经 z 获得 motion 信息；
 - action 和 z 使用同一个 flow timestep，但分别采样噪声并分别预测 velocity；
-- 推理时联合去噪 `(z, action)`，策略最终只返回 action chunk。
+- 推理时联合去噪 16 个 z 和 H 个 action，策略最终只返回 action chunk。
 
-因此 motion 不再作为 action token 的显式加法 condition，而是通过 horizon-level z
-辅助目标与 action expert 对齐。当前 RTC 不支持这种联合状态去噪，启用时会明确报错。
+当前 RTC 不支持这种联合状态去噪，启用时会明确报错。
 
 所有可训练参数均使用 SmolVLA 配置中的同一个 `optimizer_lr`，当前没有模块级学习率分组。
 

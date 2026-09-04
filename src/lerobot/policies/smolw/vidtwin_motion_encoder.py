@@ -249,6 +249,12 @@ class VidTwinMotionExtractor:
         autocast_enabled = video.device.type == "cuda" and self.dtype in {torch.float16, torch.bfloat16}
         with torch.autocast(device_type=video.device.type, dtype=self.dtype, enabled=autocast_enabled):
             _, _, z_motion_x, z_motion_y = self.model.encode(video)
+        if z_motion_x.shape[2] != self.num_frames or z_motion_y.shape[2] != self.num_frames:
+            raise ValueError(
+                "VidTwin motion latent temporal length must match its input frame count so SmolW can "
+                "align one z token with each action step; got "
+                f"{tuple(z_motion_x.shape)} and {tuple(z_motion_y.shape)}, expected F={self.num_frames}."
+            )
         motion = self.flatten_motion_latents(z_motion_x, z_motion_y).detach().float()
         if motion.shape[-1] != self.expected_latent_dim:
             raise ValueError(

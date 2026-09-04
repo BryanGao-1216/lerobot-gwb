@@ -17,7 +17,7 @@
 """Convert an original SmolVLA artifact into a SmolW base artifact.
 
 Only shape-compatible original SmolVLA tensors are transferred. The M_t query,
-motion prediction head, and horizon-level z flow modules retain their SmolW
+motion prediction head, and temporal z flow modules retain their SmolW
 initialization.
 
 Example:
@@ -127,7 +127,7 @@ def _copy_compatible_weights(source_policy: SmolVLAPolicy, target_policy: SmolWP
         "model.mt_query_embedding.",
         "model.past_motion_projector.",
         "model.future_motion_head.",
-        "model.future_motion_to_z.",
+        "model.future_motion_token_to_z.",
         "model.z_in_proj.",
         "model.z_time_mlp_in.",
         "model.z_time_mlp_out.",

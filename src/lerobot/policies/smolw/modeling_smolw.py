@@ -77,9 +77,12 @@ class SmolWFlowMatching(VLAFlowMatching):
             nn.SiLU(),
             nn.Linear(config.motion_projector_hidden_dim, config.motion_latent_dim),
         )
-        self.future_motion_to_z = nn.Sequential(
-            nn.LayerNorm(config.motion_latent_dim),
-            nn.Linear(config.motion_latent_dim, config.motion_condition_hidden_dim),
+        # Keep VidTwin's 16 temporal positions explicit. The same projector is
+        # shared by every 112-D temporal slot instead of globally mixing the
+        # flattened 1792-D horizon into one token.
+        self.future_motion_token_to_z = nn.Sequential(
+            nn.LayerNorm(config.motion_token_dim),
+            nn.Linear(config.motion_token_dim, config.motion_condition_hidden_dim),
             nn.SiLU(),
             nn.Linear(config.motion_condition_hidden_dim, expert_hidden_size),
         )
@@ -119,7 +122,7 @@ class SmolWFlowMatching(VLAFlowMatching):
                 "action_out_proj.",
                 "action_time_mlp_in.",
                 "action_time_mlp_out.",
-                "future_motion_to_z.",
+                "future_motion_token_to_z.",
                 "z_in_proj.",
                 "z_time_mlp_in.",
                 "z_time_mlp_out.",
@@ -212,10 +215,19 @@ class SmolWFlowMatching(VLAFlowMatching):
         return self.future_motion_head(query_hidden.to(dtype=head_dtype)).float()
 
     def motion_to_z(self, future_motion: Tensor) -> Tensor:
-        """Convert one 1792-D horizon motion prediction into the z flow target."""
+        """Convert flattened VidTwin motion into H time-aligned z targets."""
+        if future_motion.ndim != 2 or future_motion.shape[-1] != self.config.motion_latent_dim:
+            raise ValueError(
+                f"future_motion must have shape [B, motion_latent_dim], got {tuple(future_motion.shape)}."
+            )
         motion_for_z = future_motion.detach() if self.config.detach_motion_condition else future_motion
-        projection_dtype = self.future_motion_to_z[1].weight.dtype
-        z = self.future_motion_to_z(motion_for_z.to(dtype=projection_dtype))
+        motion_tokens = motion_for_z.reshape(
+            motion_for_z.shape[0],
+            self.config.vidtwin_num_frames,
+            self.config.motion_token_dim,
+        )
+        projection_dtype = self.future_motion_token_to_z[1].weight.dtype
+        z = self.future_motion_token_to_z(motion_tokens.to(dtype=projection_dtype))
         return torch.tanh(z) * self.config.motion_condition_scale
 
     def embed_action_z_suffix(
@@ -224,13 +236,18 @@ class SmolWFlowMatching(VLAFlowMatching):
         noisy_z: Tensor,
         timestep: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Embed H action steps followed by one horizon-level z step."""
+        """Embed the suffix ``[z_1,...,z_16,a_1,...,a_H]``."""
         action_embs, action_pad_masks, action_att_masks = super().embed_suffix(
             noisy_actions,
             timestep,
         )
-        if noisy_z.ndim != 2 or noisy_z.shape[0] != noisy_actions.shape[0]:
-            raise ValueError(f"noisy_z must have shape [B, expert_hidden_size], got {tuple(noisy_z.shape)}.")
+        expected_z_shape = (
+            noisy_actions.shape[0],
+            self.config.vidtwin_num_frames,
+            self.vlm_with_expert.expert_hidden_size,
+        )
+        if noisy_z.shape != expected_z_shape:
+            raise ValueError(f"noisy_z must have shape {expected_z_shape}, got {tuple(noisy_z.shape)}.")
         z_dtype = self.z_in_proj.weight.dtype
         z_emb = self.z_in_proj(noisy_z.to(dtype=z_dtype))
         z_time_emb = create_sinusoidal_pos_embedding(
@@ -240,17 +257,18 @@ class SmolWFlowMatching(VLAFlowMatching):
             self.config.max_period,
             device=z_emb.device,
         ).to(dtype=z_emb.dtype)
+        z_time_emb = z_time_emb[:, None, :].expand_as(z_emb)
         z_emb = self.z_time_mlp_out(F.silu(self.z_time_mlp_in(torch.cat([z_emb, z_time_emb], dim=-1))))
-        z_emb = z_emb[:, None, :].to(dtype=action_embs.dtype)
+        z_emb = z_emb.to(dtype=action_embs.dtype)
         z_pad_mask = torch.ones(
             noisy_actions.shape[0],
-            1,
+            self.config.vidtwin_num_frames,
             dtype=torch.bool,
             device=action_pad_masks.device,
         )
         return (
-            torch.cat([action_embs, z_emb], dim=1),
-            torch.cat([action_pad_masks, z_pad_mask], dim=1),
+            torch.cat([z_emb, action_embs], dim=1),
+            z_pad_mask,
             action_pad_masks,
             action_att_masks,
         )
@@ -322,39 +340,63 @@ class SmolWFlowMatching(VLAFlowMatching):
     def make_action_z_attention(
         cls,
         prefix_pad_masks: Tensor,
+        z_pad_masks: Tensor,
         action_pad_masks: Tensor,
         action_att_masks: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Keep the H action rows unchanged and append one action-reading z row.
+        """Build attention for ``[z_1,...,z_16,a_1,...,a_H]``.
 
-        Internally the suffix is ordered as ``[a_1, ..., a_H, z]``. Action
-        queries cannot see z and retain the original SmolVLA attention exactly.
-        The final z query can see every valid prefix token (including M_t), all
-        action tokens, and itself.
+        All z tokens attend bidirectionally within the z block and never read
+        actions. Every action reads the complete z block. The action-to-action
+        and action-to-prefix submatrices remain exactly the original SmolVLA
+        masks, except that M_t stays hidden from actions so z is the explicit
+        motion-conditioning path.
         """
         action_attention, action_position_ids = cls.make_action_attention(
             prefix_pad_masks,
             action_pad_masks,
             action_att_masks,
         )
-        z_column = torch.zeros(
-            action_attention.shape[0],
-            action_attention.shape[1],
-            1,
+        batch_size, horizon = action_pad_masks.shape
+        z_count = z_pad_masks.shape[1]
+        prefix_len = prefix_pad_masks.shape[1]
+        suffix_len = z_count + horizon
+
+        # z rows: complete valid prefix + all z tokens + no action tokens.
+        z_prefix_attention = prefix_pad_masks[:, None, :].expand(batch_size, z_count, prefix_len)
+        z_self_attention = z_pad_masks[:, None, :].expand(batch_size, z_count, z_count)
+        z_action_attention = torch.zeros(
+            batch_size,
+            z_count,
+            horizon,
             dtype=torch.bool,
-            device=action_attention.device,
+            device=action_pad_masks.device,
         )
-        action_rows = torch.cat([action_attention, z_column], dim=-1)
-        z_self_mask = torch.ones(
-            prefix_pad_masks.shape[0],
-            1,
-            dtype=torch.bool,
-            device=prefix_pad_masks.device,
+        z_rows = torch.cat([z_prefix_attention, z_self_attention, z_action_attention], dim=2)
+
+        # action rows: original prefix + every z token + original action mask.
+        action_rows = torch.cat(
+            [
+                action_attention[:, :, :prefix_len],
+                z_pad_masks[:, None, :].expand(batch_size, horizon, z_count),
+                action_attention[:, :, prefix_len:],
+            ],
+            dim=2,
         )
-        z_row = torch.cat([prefix_pad_masks, action_pad_masks, z_self_mask], dim=-1)[:, None, :]
-        attention = torch.cat([action_rows, z_row], dim=1)
-        z_position_id = action_position_ids[:, -1:] + 1
-        position_ids = torch.cat([action_position_ids, z_position_id], dim=1)
+        attention = torch.cat([z_rows, action_rows], dim=1)
+
+        suffix_pad_masks = torch.cat([z_pad_masks, action_pad_masks], dim=1)
+        attention &= suffix_pad_masks[:, :, None]
+        attention &= torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)[:, None, :]
+
+        # Preserve the original action positions. z gets its own ordered range
+        # immediately after M_t, encoding VidTwin temporal order without
+        # shifting the pretrained action RoPE coordinates.
+        z_offsets = prefix_pad_masks.sum(dim=1, keepdim=True)
+        z_position_ids = z_offsets + torch.arange(z_count, device=prefix_pad_masks.device)[None, :]
+        position_ids = torch.cat([z_position_ids, action_position_ids], dim=1)
+        if attention.shape != (batch_size, suffix_len, prefix_len + suffix_len):
+            raise RuntimeError(f"Unexpected z/action attention shape {tuple(attention.shape)}.")
         return attention, position_ids
 
     def forward(
@@ -427,16 +469,17 @@ class SmolWFlowMatching(VLAFlowMatching):
             time_expanded = time[:, None, None]
             action_x_t = time_expanded * noise + (1 - time_expanded) * actions
             action_u_t = noise - actions
-            z_time = time[:, None]
+            z_time = time[:, None, None]
             z_x_t = z_time * z_noise + (1 - z_time) * z_target
             z_u_t = z_noise - z_target
-            suffix_embs, _, action_pad_masks, action_att_masks = self.embed_action_z_suffix(
+            suffix_embs, z_pad_masks, action_pad_masks, action_att_masks = self.embed_action_z_suffix(
                 action_x_t,
                 z_x_t,
                 time,
             )
             attention, position_ids = self.make_action_z_attention(
                 prefix_pad_masks,
+                z_pad_masks,
                 action_pad_masks,
                 action_att_masks,
             )
@@ -448,13 +491,16 @@ class SmolWFlowMatching(VLAFlowMatching):
                 use_cache=True,
                 fill_kv_cache=False,
             )
-            suffix_out = outputs_embeds[1][:, -(self.config.chunk_size + 1) :].float()
-            action_velocity = self.action_out_proj(suffix_out[:, : self.config.chunk_size])
-            z_velocity = self.z_out_proj(suffix_out[:, -1])
+            suffix_length = self.config.vidtwin_num_frames + self.config.chunk_size
+            suffix_out = outputs_embeds[1][:, -suffix_length:].float()
+            z_velocity = self.z_out_proj(suffix_out[:, : self.config.vidtwin_num_frames])
+            action_velocity = self.action_out_proj(suffix_out[:, self.config.vidtwin_num_frames :])
             output["flow_losses"] = F.mse_loss(action_u_t, action_velocity, reduction="none")
-            output["z_flow_losses"] = F.mse_loss(z_u_t.float(), z_velocity.float(), reduction="none").mean(
-                dim=-1
-            )
+            output["z_flow_losses"] = F.mse_loss(
+                z_u_t.float(),
+                z_velocity.float(),
+                reduction="none",
+            ).mean(dim=(1, 2))
             output["z_motion_source"] = z_motion_source
             output["z_target"] = z_target
 
@@ -473,7 +519,7 @@ class SmolWFlowMatching(VLAFlowMatching):
         z_noise: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """Jointly denoise one z token and H actions, then return only actions."""
+        """Jointly denoise 16 temporal z tokens and H actions, then return actions."""
         batch_size = state.shape[0]
         device = state.device
         _, prefix_pad_masks, _, _, past_key_values = self.run_motion_prefix(
@@ -492,14 +538,20 @@ class SmolWFlowMatching(VLAFlowMatching):
             )
         if z_noise is None:
             z_noise = self.sample_noise(
-                (batch_size, self.vlm_with_expert.expert_hidden_size),
+                (
+                    batch_size,
+                    self.config.vidtwin_num_frames,
+                    self.vlm_with_expert.expert_hidden_size,
+                ),
                 device,
             )
-        elif z_noise.shape != (batch_size, self.vlm_with_expert.expert_hidden_size):
-            raise ValueError(
-                "z_noise must have shape "
-                f"{(batch_size, self.vlm_with_expert.expert_hidden_size)}, got {tuple(z_noise.shape)}."
-            )
+        expected_z_shape = (
+            batch_size,
+            self.config.vidtwin_num_frames,
+            self.vlm_with_expert.expert_hidden_size,
+        )
+        if z_noise.shape != expected_z_shape:
+            raise ValueError(f"z_noise must have shape {expected_z_shape}, got {tuple(z_noise.shape)}.")
         if self._rtc_enabled():
             raise NotImplementedError("RTC is not supported by SmolW's joint (z, action) denoising.")
 
@@ -533,13 +585,14 @@ class SmolWFlowMatching(VLAFlowMatching):
         z_x_t: Tensor,
         timestep: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        suffix_embs, _, action_pad_masks, action_att_masks = self.embed_action_z_suffix(
+        suffix_embs, z_pad_masks, action_pad_masks, action_att_masks = self.embed_action_z_suffix(
             action_x_t,
             z_x_t,
             timestep,
         )
         attention, position_ids = self.make_action_z_attention(
             prefix_pad_masks,
+            z_pad_masks,
             action_pad_masks,
             action_att_masks,
         )
@@ -551,9 +604,10 @@ class SmolWFlowMatching(VLAFlowMatching):
             use_cache=True,
             fill_kv_cache=False,
         )
-        suffix_out = outputs_embeds[1][:, -(self.config.chunk_size + 1) :].float()
-        action_velocity = self.action_out_proj(suffix_out[:, : self.config.chunk_size])
-        z_velocity = self.z_out_proj(suffix_out[:, -1])
+        suffix_length = self.config.vidtwin_num_frames + self.config.chunk_size
+        suffix_out = outputs_embeds[1][:, -suffix_length:].float()
+        z_velocity = self.z_out_proj(suffix_out[:, : self.config.vidtwin_num_frames])
+        action_velocity = self.action_out_proj(suffix_out[:, self.config.vidtwin_num_frames :])
         return action_velocity, z_velocity
 
 
@@ -925,7 +979,7 @@ class SmolWPolicy(SmolVLAPolicy):
             "mt_query_embedding",
             "past_motion_projector",
             "future_motion_head",
-            "future_motion_to_z",
+            "future_motion_token_to_z",
             "z_in_proj",
             "z_time_mlp_in",
             "z_time_mlp_out",

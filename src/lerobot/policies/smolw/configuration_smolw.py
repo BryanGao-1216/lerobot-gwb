@@ -60,14 +60,15 @@ class SmolWConfig(SmolVLAConfig):
     vidtwin_sample_posterior: bool = False
 
     # The released CoWVLA VidTwin configuration produces two [8, 16, 7]
-    # motion tensors, which are concatenated and flattened to 1792 values.
+    # motion tensors. After concatenating x/y channels, each of the 16
+    # temporal positions owns 7 * 16 = 112 values (16 * 112 = 1792).
     motion_latent_dim: int = 1792
     motion_camera_key: str | None = None
 
     # New SmolW branches.
     motion_projector_hidden_dim: int = 1024
-    # Predicted VidTwin motion is converted into one horizon-level z target in
-    # the action expert hidden space. Flow matching jointly denoises (z, a).
+    # Every one of VidTwin's fixed 16 temporal slots is converted into one z
+    # target. The action horizon H remains independently configurable.
     motion_condition_hidden_dim: int = 1024
     motion_condition_scale: float = 1.0
     z_loss_weight: float = 1.0
@@ -136,6 +137,11 @@ class SmolWConfig(SmolVLAConfig):
             )
         if self.motion_latent_dim <= 0:
             raise ValueError(f"motion_latent_dim must be positive, got {self.motion_latent_dim}.")
+        if self.motion_latent_dim % self.vidtwin_num_frames != 0:
+            raise ValueError(
+                "motion_latent_dim must be divisible by vidtwin_num_frames for temporal z tokenization; got "
+                f"{self.motion_latent_dim} and {self.vidtwin_num_frames}."
+            )
         if self.motion_projector_hidden_dim <= 0 or self.motion_condition_hidden_dim <= 0:
             raise ValueError("SmolW motion projector hidden dimensions must be positive.")
         if self.motion_condition_scale < 0:
@@ -193,6 +199,11 @@ class SmolWConfig(SmolVLAConfig):
         """H future observations following t, aligned with H actions."""
         assert self.motion_horizon is not None
         return list(range(1, self.motion_horizon + 1))
+
+    @property
+    def motion_token_dim(self) -> int:
+        """VidTwin values carried by one temporal position (1792 / 16 = 112)."""
+        return self.motion_latent_dim // self.vidtwin_num_frames
 
     @property
     def observation_delta_indices(self) -> list[int]:
