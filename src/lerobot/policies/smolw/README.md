@@ -18,41 +18,64 @@ LeRobot 格式数据。
 VLM 的普通视觉、语言和状态输入仍只使用当前观测 `o_t`。历史窗口由冻结的 VidTwin
 编码为 latent motion，并通过追加在 VLM prefix 末尾的 `M_t` query 输入模型。
 
-## 两阶段训练
+## 三种训练模式
 
-### 第一阶段：`world_model`
+训练目标统一由 `train_mode` 切换。
 
-第一阶段不准备 action、不添加 flow noise，也不运行 action expert，只训练以下两个能力：
+### `motion_only`
 
-1. VLM 根据当前观测和历史 VidTwin latent，预测未来窗口的 VidTwin latent；
-2. 使用当前帧 visual tokens 和预测的 future motion，预测 `o_{t+H}` 的 visual tokens。
-
-未来 visual token 的 teacher 是冻结的 SmolVLM `vision_model + connector`。预测头采用
-“当前帧 tokens + future residual”的形式；decoder 只直接读取当前 tokens 和预测出的
-future motion，不直接旁路读取真实 future latent，确保图像预测损失能够约束 motion
-prediction。损失为：
+不准备 action、不添加 flow noise，也不运行 action expert。VLM 根据当前观测和历史
+VidTwin latent，回归未来窗口的 1792 维 VidTwin latent：
 
 ```text
 loss = motion_loss_weight * SmoothL1(pred_motion, target_motion)
-     + future_visual_loss_weight * (
-           SmoothL1(pred_visual_tokens, target_visual_tokens)
-           + future_visual_cosine_weight * cosine_loss
-       )
 ```
 
-本阶段训练 VLM 的有效文本层、`M_t`/motion projector、future-motion head 和 visual-token
-decoder；冻结 action expert、action 投影、motion-to-action condition，以及作为 teacher
-的视觉编码器和 connector。
+本模式训练 VLM 的有效层、`M_t`/motion projector 和 future-motion head；冻结 action
+expert、action 投影和 motion-to-action condition。视觉编码器是否冻结由
+`freeze_vision_encoder` 控制。
 
-### 第二阶段：`action_expert_only`
+### `action_only`
 
-第二阶段应从第一阶段 checkpoint 加载整个策略。VLM、motion prediction 和 visual-token
-decoder 全部冻结；每个 batch 只读取历史窗口，不再读取未来图像或生成未来监督。
-冻结的一阶段模型先预测 future motion，然后仅训练 action expert、SmolVLA action/time
-投影和 `future_motion_condition_proj`，用原有 flow matching 输出 action chunk。
+模拟 future-motion 预测完全正确的情况：VidTwin 从真实未来窗口提取 1792 维 latent，
+将它转换成一个 horizon 级 z latent，作为 flow matching 的 teacher target。VLM、
+`M_t`/motion projector 和 future-motion head 全部冻结；训练 action expert、SmolVLA
+action/time 投影、motion-to-z projection 和 z flow heads。
+
+### `jointly`
+
+同时计算 motion regression 和 `(z, action)` flow-matching loss。z target 由 VLM 自己预测
+的 future motion 转换而来，而不使用真实 future motion，因此训练路径和实际推理路径一致：
+
+```text
+loss = action_flow_loss
+     + z_loss_weight * z_flow_loss
+     + motion_loss_weight * SmoothL1(pred_motion, target_motion)
+```
+
+VLM/motion 分支和 action expert 分支同时训练。若 `detach_motion_condition=false`，action
+expert 的 z loss 也会经过 z target 回传到 VLM/motion 分支。
+
+## `(z, action)` suffix 与注意力
+
+flow matching 不再把 predicted motion 直接加到每个 action token 上。内部 suffix 按
+`[a_1, ..., a_H, z]` 排列，其中 z 是一个代表完整 horizon 的全局 latent token，连续
+维度等于 action expert hidden size：
+
+- H 个 action token 的注意力与原始 SmolVLA 完全相同，不能读取 `M_t` 或 z；
+- z token 可以读取普通 VLM prefix、`M_t`、全部 H 个 action token 和自身；
+- action 和 z 使用同一个 flow timestep，但分别采样噪声并分别预测 velocity；
+- 推理时联合去噪 `(z, action)`，策略最终只返回 action chunk。
+
+因此 motion 不再作为 action token 的显式加法 condition，而是通过 horizon-level z
+辅助目标与 action expert 对齐。当前 RTC 不支持这种联合状态去噪，启用时会明确报错。
 
 所有可训练参数均使用 SmolVLA 配置中的同一个 `optimizer_lr`，当前没有模块级学习率分组。
-`joint` 模式保留用于联合训练或消融，但不是默认两阶段流程。
+
+无论使用哪种模式，训练 batch 都需要未来窗口：`motion_only`/`jointly` 用它生成 motion
+监督，`action_only` 用它生成 oracle motion condition。实际仿真推理始终只能使用模型预测
+的 future motion；因此只训练 `action_only` 的模型不能独立验证完整链路，通常需要加载
+已经训练过 motion 分支的 checkpoint。
 
 ## 准备 base
 
@@ -65,9 +88,6 @@ VIDTWIN_CHECKPOINT_PATH=/path/to/vidtwin.ckpt \
 HORIZON=16 MEMORY_STRIDE=1 \
 bash convert_smolw_base.sh
 ```
-
-这次新增了 visual-token decoder 参数，因此旧版 SmolW base 不能直接作为第一阶段起点，
-需要重新执行一次转换脚本。
 
 外部只需要 VidTwin `.ckpt`；网络源码和
 `vidtwin_structure_7_7_8_dynamics_7_8.yaml` 已放在 SmolW 的 `vidtwin/` 子目录，运行时
@@ -85,31 +105,37 @@ Transformers 版本与当前 LeRobot 不一致。
 
 ## 启动训练
 
-第一阶段：
+只训练 motion：
 
 ```bash
-TRAINING_STAGE=world_model \
-POLICY_PATH=/path/to/smolw-base \
+TRAIN_MODE=motion_only \
 OUTPUT_DIR=/path/to/smolw-stage1 \
 HORIZON=16 MEMORY_STRIDE=1 \
 bash train_smolw_lr.sh
 ```
 
-第二阶段，把 `POLICY_PATH` 指向第一阶段保存的 `pretrained_model` 目录：
+使用真实 future motion 只训练 action：
 
 ```bash
-TRAINING_STAGE=action_expert_only \
-POLICY_PATH=/path/to/smolw-stage1/checkpoints/<step>/pretrained_model \
+TRAIN_MODE=action_only \
 OUTPUT_DIR=/path/to/smolw-stage2 \
 HORIZON=16 MEMORY_STRIDE=1 \
 bash train_smolw_lr.sh
 ```
 
-启动脚本会为 `world_model`/`joint` 自动设置 `drop_n_last_frames=H`，为
-`action_expert_only` 设置为 0；可用 `DROP_N_LAST_FRAMES` 覆盖。若不设置
-`MOTION_CAMERA_KEY`，策略默认使用配置中的第一个视觉输入。episode 开头缺少的历史帧
-沿用 LeRobot 的边界补帧，推理时也会重复最早可用帧填满历史。action chunk 长度固定为
-`HORIZON`，推理时每次实际执行的步数可用 `N_ACTION_STEPS` 单独设置。
+共同训练：
+
+```bash
+TRAIN_MODE=jointly \
+OUTPUT_DIR=/path/to/smolw-joint \
+HORIZON=16 MEMORY_STRIDE=1 \
+bash train_smolw_lr.sh
+```
+
+模型输入/输出目录和 checkpoint 路径由训练启动脚本中的参数控制。三个模式都会设置
+`drop_n_last_frames=H`，避免未来窗口跨过 episode 末尾。episode 开头缺少的历史帧沿用
+LeRobot 的边界补帧，推理时也会重复最早可用帧填满历史。action chunk 长度固定为
+`HORIZON`。
 
 训练脚本默认每 10 step 写一次 TensorBoard scalar，日志目录为
 `${OUTPUT_DIR}/tensorboard`：
@@ -118,4 +144,4 @@ bash train_smolw_lr.sh
 tensorboard --logdir /path/to/output/tensorboard
 ```
 
-可通过 `TENSORBOARD_ENABLE`、`TENSORBOARD_LOG_FREQ` 和 `TENSORBOARD_LOG_DIR` 覆盖。
+可通过 `TENSORBOARD_LOG_DIR` 覆盖日志目录。

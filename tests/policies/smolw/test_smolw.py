@@ -53,7 +53,9 @@ def test_config_builds_past_and_future_lerobot_timestamps():
     assert config.future_motion_positions == [4, 5, 6, 7]
     assert config.current_observation_position == 3
     assert config.drop_n_last_frames == 4
-    assert config.training_stage == "world_model"
+    assert config.train_mode == "motion_only"
+    assert config.training_stage is None
+    assert not config.train_expert_only
     assert not config.vidtwin_sample_posterior
     assert not hasattr(config, "vidtwin_repo_path")
     assert not hasattr(config, "vidtwin_config_path")
@@ -61,29 +63,30 @@ def test_config_builds_past_and_future_lerobot_timestamps():
     assert config.tensorboard_log_freq == 100
 
 
-def test_action_expert_stage_requests_only_history_and_keeps_episode_tail():
+@pytest.mark.parametrize("train_mode", ["motion_only", "action_only", "jointly"])
+def test_all_train_modes_request_future_motion_target(train_mode):
     config = SmolWConfig(
         chunk_size=4,
         n_action_steps=4,
         motion_horizon=4,
         memory_stride=2,
-        training_stage="action_expert_only",
+        train_mode=train_mode,
         device="cpu",
     )
 
-    assert config.observation_delta_indices == [-6, -4, -2, 0]
+    assert config.observation_delta_indices == [-6, -4, -2, 0, 1, 2, 3, 4]
     assert config.past_motion_positions == [0, 1, 2, 3]
-    assert config.future_motion_positions == []
-    assert config.drop_n_last_frames == 0
+    assert config.future_motion_positions == [4, 5, 6, 7]
+    assert config.drop_n_last_frames == 4
 
 
-def test_config_rejects_unknown_training_stage():
-    with pytest.raises(ValueError, match="training_stage"):
+def test_config_rejects_unknown_train_mode():
+    with pytest.raises(ValueError, match="train_mode"):
         SmolWConfig(
             chunk_size=4,
             n_action_steps=4,
             motion_horizon=4,
-            training_stage="unknown",
+            train_mode="unknown",
             device="cpu",
         )
 
@@ -99,28 +102,50 @@ def test_config_enforces_fixed_vidtwin_frame_count():
         )
 
 
-def test_stage_one_config_can_be_loaded_with_stage_two_overrides(tmp_path):
-    stage_one = SmolWConfig(
+def test_config_can_be_loaded_with_train_mode_override(tmp_path):
+    motion_config = SmolWConfig(
         chunk_size=4,
         n_action_steps=4,
         motion_horizon=4,
-        training_stage="world_model",
+        train_mode="motion_only",
         device="cpu",
     )
-    stage_one.save_pretrained(tmp_path)
+    motion_config.save_pretrained(tmp_path)
 
-    stage_two = PreTrainedConfig.from_pretrained(
+    action_config = PreTrainedConfig.from_pretrained(
         tmp_path,
-        cli_overrides=[
-            "--training_stage=action_expert_only",
-            "--drop_n_last_frames=0",
-        ],
+        cli_overrides=["--train_mode=action_only"],
     )
 
-    assert isinstance(stage_two, SmolWConfig)
-    assert stage_two.training_stage == "action_expert_only"
-    assert stage_two.observation_delta_indices == [-3, -2, -1, 0]
-    assert stage_two.drop_n_last_frames == 0
+    assert isinstance(action_config, SmolWConfig)
+    assert action_config.train_mode == "action_only"
+    assert action_config.observation_delta_indices == [-3, -2, -1, 0, 1, 2, 3, 4]
+    assert action_config.drop_n_last_frames == 4
+
+
+def test_legacy_training_stage_is_migrated_to_train_mode():
+    config = SmolWConfig(
+        chunk_size=4,
+        n_action_steps=4,
+        motion_horizon=4,
+        training_stage="action_expert_only",
+        device="cpu",
+    )
+
+    assert config.train_mode == "action_only"
+    assert config.training_stage is None
+    assert not config.train_expert_only
+
+
+def test_z_loss_weight_must_be_non_negative():
+    with pytest.raises(ValueError, match="z_loss_weight"):
+        SmolWConfig(
+            chunk_size=4,
+            n_action_steps=4,
+            motion_horizon=4,
+            z_loss_weight=-1.0,
+            device="cpu",
+        )
 
 
 @pytest.mark.parametrize(
@@ -316,107 +341,65 @@ class _StageVLMWithExpert(nn.Module):
         return self.vlm.model
 
 
-def _stage_model(stage: str) -> SmolWFlowMatching:
+def _mode_model(train_mode: str) -> SmolWFlowMatching:
     model = SmolWFlowMatching.__new__(SmolWFlowMatching)
     nn.Module.__init__(model)
-    model.config = SimpleNamespace(training_stage=stage)
+    model.config = SimpleNamespace(train_mode=train_mode, freeze_vision_encoder=True)
     model.vlm_with_expert = _StageVLMWithExpert()
     model.state_proj = nn.Linear(2, 2)
     model.mt_query_embedding = nn.Embedding(1, 2)
     model.past_motion_projector = nn.Linear(2, 2)
     model.future_motion_head = nn.Linear(2, 2)
-    model.future_motion_condition_proj = nn.Linear(2, 2)
-    model.future_visual_queries = nn.Embedding(1, 2)
-    model.future_motion_visual_proj = nn.Linear(2, 2)
-    model.future_visual_decoder = nn.Linear(2, 2)
-    model.future_visual_out_proj = nn.Linear(2, 2)
+    model.future_motion_to_z = nn.Linear(2, 2)
+    model.z_in_proj = nn.Linear(2, 2)
+    model.z_time_mlp_in = nn.Linear(2, 2)
+    model.z_time_mlp_out = nn.Linear(2, 2)
+    model.z_out_proj = nn.Linear(2, 2)
     model.action_in_proj = nn.Linear(2, 2)
     model.action_out_proj = nn.Linear(2, 2)
     model.action_time_mlp_in = nn.Linear(2, 2)
     model.action_time_mlp_out = nn.Linear(2, 2)
-    model._training_stage_configured = False
+    model._train_mode_configured = False
     return model
 
 
-def test_training_stage_freezes_the_other_branch_and_visual_teacher():
-    world_model = _stage_model("world_model")
+def test_train_mode_freezes_unselected_branch_and_vision_encoder():
+    motion_model = _mode_model("motion_only")
     # Simulate a tensor SmolVLA already froze to avoid DDP unused parameters.
-    world_model.vlm_with_expert.vlm.model.text_model.bias.requires_grad_(False)
-    world_model.configure_training_stage()
+    motion_model.vlm_with_expert.vlm.model.text_model.bias.requires_grad_(False)
+    motion_model.configure_train_mode()
 
-    assert world_model.vlm_with_expert.vlm.model.text_model.weight.requires_grad
-    assert not world_model.vlm_with_expert.vlm.model.text_model.bias.requires_grad
-    assert not world_model.vlm_with_expert.vlm.model.vision_model.weight.requires_grad
-    assert not world_model.vlm_with_expert.vlm.model.connector.weight.requires_grad
-    assert world_model.future_motion_head.weight.requires_grad
-    assert world_model.future_visual_out_proj.weight.requires_grad
-    assert not world_model.vlm_with_expert.lm_expert.weight.requires_grad
-    assert not world_model.future_motion_condition_proj.weight.requires_grad
+    assert motion_model.vlm_with_expert.vlm.model.text_model.weight.requires_grad
+    assert not motion_model.vlm_with_expert.vlm.model.text_model.bias.requires_grad
+    assert not motion_model.vlm_with_expert.vlm.model.vision_model.weight.requires_grad
+    assert motion_model.vlm_with_expert.vlm.model.connector.weight.requires_grad
+    assert motion_model.future_motion_head.weight.requires_grad
+    assert not motion_model.vlm_with_expert.lm_expert.weight.requires_grad
+    assert not motion_model.future_motion_to_z.weight.requires_grad
+    assert not motion_model.z_out_proj.weight.requires_grad
 
-    action_model = _stage_model("action_expert_only")
-    action_model.configure_training_stage()
+    action_model = _mode_model("action_only")
+    action_model.configure_train_mode()
 
     assert not action_model.vlm_with_expert.vlm.model.text_model.weight.requires_grad
     assert not action_model.future_motion_head.weight.requires_grad
-    assert not action_model.future_visual_out_proj.weight.requires_grad
     assert action_model.vlm_with_expert.lm_expert.weight.requires_grad
     assert action_model.action_in_proj.weight.requires_grad
-    assert action_model.future_motion_condition_proj.weight.requires_grad
+    assert action_model.future_motion_to_z.weight.requires_grad
+    assert action_model.z_out_proj.weight.requires_grad
 
     action_model.train()
     assert not action_model.vlm_with_expert.vlm.training
     assert action_model.vlm_with_expert.lm_expert.training
 
+    joint_model = _mode_model("jointly")
+    joint_model.configure_train_mode()
 
-def test_future_visual_loss_backpropagates_through_predicted_motion():
-    class _PassThroughDecoder(nn.Module):
-        @staticmethod
-        def forward(tgt, memory):
-            del memory
-            return tgt
-
-    model = SmolWFlowMatching.__new__(SmolWFlowMatching)
-    nn.Module.__init__(model)
-    model.config = SimpleNamespace(future_visual_cosine_weight=0.1)
-    model.future_visual_num_tokens = 2
-    model.future_visual_queries = nn.Embedding(2, 4)
-    nn.init.zeros_(model.future_visual_queries.weight)
-    model.future_motion_visual_proj = nn.Sequential(nn.LayerNorm(4), nn.Linear(4, 4, bias=False))
-    nn.init.eye_(model.future_motion_visual_proj[1].weight)
-    model.future_visual_decoder = _PassThroughDecoder()
-    model.future_visual_out_proj = nn.Linear(4, 4, bias=False)
-    nn.init.eye_(model.future_visual_out_proj.weight)
-    model.encode_visual_teacher = lambda image: image
-
-    current_tokens = torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]])
-    future_tokens = current_tokens + 0.5
-    predicted_motion = torch.tensor([[0.0, 1.0, 2.0, 4.0]], requires_grad=True)
-
-    losses = model.compute_future_visual_losses(
-        current_tokens,
-        future_tokens,
-        predicted_motion,
-    )
-    losses["future_visual_losses"].mean().backward()
-
-    assert losses["future_visual_losses"].shape == (1,)
-    assert losses["copy_current_visual_losses"].item() > 0
-    assert predicted_motion.grad is not None
-    assert torch.any(predicted_motion.grad != 0)
-
-
-def test_visual_token_count_matches_smolvlm_connector_grid():
-    model = SmolWFlowMatching.__new__(SmolWFlowMatching)
-    nn.Module.__init__(model)
-    model.config = SimpleNamespace(resize_imgs_with_padding=(512, 512))
-    model.vlm_with_expert = SimpleNamespace(
-        config=SimpleNamespace(
-            vision_config=SimpleNamespace(patch_size=16),
-            scale_factor=4,
-        )
-    )
-
-    assert model._infer_visual_token_count() == 64
+    assert joint_model.vlm_with_expert.vlm.model.text_model.weight.requires_grad
+    assert joint_model.future_motion_head.weight.requires_grad
+    assert joint_model.vlm_with_expert.lm_expert.weight.requires_grad
+    assert joint_model.future_motion_to_z.weight.requires_grad
+    assert joint_model.z_out_proj.weight.requires_grad
 
 
 def test_mt_query_is_appended_after_original_smolvla_prefix():
@@ -449,22 +432,28 @@ def test_mt_query_is_appended_after_original_smolvla_prefix():
     assert torch.allclose(embeddings[0, -1], expected_query)
 
 
-def test_action_expert_cannot_attend_mt_query_directly():
+def test_action_attention_is_unchanged_while_z_sees_actions_and_mt():
     prefix_masks = torch.tensor([[True, True, False, True]])
-    suffix_masks = torch.tensor([[True, True]])
-    suffix_attention = torch.ones(1, 2, dtype=torch.bool)
+    action_masks = torch.tensor([[True, True]])
+    action_attention = torch.ones(1, 2, dtype=torch.bool)
 
-    attention, position_ids = SmolWFlowMatching.make_action_attention(
+    original_attention, original_position_ids = SmolWFlowMatching.make_action_attention(
         prefix_masks,
-        suffix_masks,
-        suffix_attention,
+        action_masks,
+        action_attention,
+    )
+    attention, position_ids = SmolWFlowMatching.make_action_z_attention(
+        prefix_masks,
+        action_masks,
+        action_attention,
     )
 
-    assert attention.shape == (1, 2, 6)
-    assert not attention[:, :, 2].any()
-    assert not attention[:, :, 3].any()
-    assert attention[:, :, :2].all()
-    assert torch.equal(position_ids, torch.tensor([[2, 3]]))
+    assert attention.shape == (1, 3, 7)
+    assert torch.equal(attention[:, :2, :6], original_attention)
+    assert not attention[:, :2, -1].any()
+    assert torch.equal(attention[0, -1], torch.tensor([True, True, False, True, True, True, True]))
+    assert torch.equal(position_ids[:, :2], original_position_ids)
+    assert torch.equal(position_ids, torch.tensor([[2, 3, 4]]))
 
 
 def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
@@ -480,7 +469,6 @@ def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
         max_period=4.0,
         num_steps=2,
         rtc_config=None,
-        future_visual_loss_weight=0.0,
     )
     model.vlm_with_expert = _DummyVLMWithExpert()
     model.add_image_special_tokens = False
@@ -493,7 +481,11 @@ def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
     model.mt_query_embedding = nn.Embedding(1, 4)
     model.past_motion_projector = nn.Sequential(nn.LayerNorm(3), nn.Linear(3, 4))
     model.future_motion_head = nn.Sequential(nn.LayerNorm(4), nn.Linear(4, 3))
-    model.future_motion_condition_proj = nn.Sequential(nn.LayerNorm(3), nn.Linear(3, 4))
+    model.future_motion_to_z = nn.Sequential(nn.LayerNorm(3), nn.Linear(3, 4))
+    model.z_in_proj = nn.Linear(4, 4)
+    model.z_time_mlp_in = nn.Linear(8, 4)
+    model.z_time_mlp_out = nn.Linear(4, 4)
+    model.z_out_proj = nn.Linear(4, 4)
     model.rtc_processor = None
 
     inputs = {
@@ -509,24 +501,49 @@ def test_motion_first_forward_and_sampling_keep_smolvla_action_shapes():
         actions=torch.ones(1, 2, 2),
         future_motion_target=torch.zeros(1, 3),
         noise=torch.zeros(1, 2, 2),
+        z_noise=torch.zeros(1, 4),
         time=torch.full((1,), 0.5),
     )
-    actions = model.sample_actions(**inputs, noise=torch.zeros(1, 2, 2))
+    actions = model.sample_actions(
+        **inputs,
+        noise=torch.zeros(1, 2, 2),
+        z_noise=torch.zeros(1, 4),
+    )
 
     assert output["flow_losses"].shape == (1, 2, 2)
+    assert output["z_flow_losses"].shape == (1,)
     assert output["motion_losses"].shape == (1,)
     assert output["predicted_future_motion"].shape == (1, 3)
+    assert torch.equal(output["z_motion_source"], output["predicted_future_motion"])
+    assert output["z_target"].shape == (1, 4)
     assert actions.shape == (1, 2, 2)
+
+    oracle_motion = torch.full((1, 3), 7.0)
+    oracle_output = model.forward(
+        **inputs,
+        actions=torch.ones(1, 2, 2),
+        z_motion_source=oracle_motion,
+        noise=torch.zeros(1, 2, 2),
+        z_noise=torch.zeros(1, 4),
+        time=torch.full((1,), 0.5),
+        compute_motion_loss=False,
+    )
+    assert torch.equal(oracle_output["z_motion_source"], oracle_motion)
 
 
 def test_policy_combines_masked_flow_and_motion_losses():
     class _FlowModel(nn.Module):
         def forward(self, *args, **kwargs):
-            del args, kwargs
+            del args
+            assert kwargs["z_motion_source"] is None
+            assert kwargs["compute_motion_loss"]
+            assert kwargs["compute_flow"]
             return {
                 "flow_losses": torch.tensor([[[1.0], [4.0], [9.0]]]),
+                "z_flow_losses": torch.tensor([2.0]),
                 "motion_losses": torch.tensor([4.0]),
                 "predicted_future_motion": torch.tensor([[2.0]]),
+                "z_target": torch.tensor([[3.0]]),
             }
 
     class _MotionExtractor:
@@ -541,8 +558,8 @@ def test_policy_combines_masked_flow_and_motion_losses():
         adapt_to_pi_aloha=False,
         action_feature=SimpleNamespace(shape=(1,)),
         motion_loss_weight=0.5,
-        future_visual_loss_weight=0.0,
-        training_stage="joint",
+        z_loss_weight=0.25,
+        train_mode="jointly",
     )
     policy.model = _FlowModel()
     policy.motion_extractor = _MotionExtractor()
@@ -560,17 +577,20 @@ def test_policy_combines_masked_flow_and_motion_losses():
 
     loss, metrics = policy.forward(batch)
 
-    assert loss.item() == pytest.approx(3.0)
-    assert metrics["flow_loss"] == pytest.approx(1.0)
+    assert loss.item() == pytest.approx(3.5)
+    assert metrics["flow_loss"] == pytest.approx(1.5)
+    assert metrics["action_flow_loss"] == pytest.approx(1.0)
+    assert metrics["z_flow_loss"] == pytest.approx(2.0)
     assert metrics["motion_loss"] == pytest.approx(4.0)
 
 
-def test_world_model_stage_does_not_prepare_or_run_action_expert():
-    class _WorldModel(nn.Module):
+def test_motion_only_does_not_prepare_or_run_action_expert():
+    class _MotionModel(nn.Module):
         def forward(self, *args, **kwargs):
             del args
             assert kwargs["actions"] is None
-            assert kwargs["compute_world_model"]
+            assert kwargs["z_motion_source"] is None
+            assert kwargs["compute_motion_loss"]
             assert not kwargs["compute_flow"]
             return {
                 "motion_losses": torch.tensor([4.0]),
@@ -588,14 +608,14 @@ def test_world_model_stage_does_not_prepare_or_run_action_expert():
     policy.config = SimpleNamespace(
         adapt_to_pi_aloha=False,
         motion_loss_weight=0.5,
-        future_visual_loss_weight=0.0,
-        training_stage="world_model",
+        z_loss_weight=1.0,
+        train_mode="motion_only",
     )
-    policy.model = _WorldModel()
+    policy.model = _MotionModel()
     policy.motion_extractor = _MotionExtractor()
     policy.prepare_images = lambda batch: ([], [])
     policy.prepare_state = lambda batch: batch[OBS_STATE]
-    policy.prepare_action = lambda batch: pytest.fail("stage one must not prepare actions")
+    policy.prepare_action = lambda batch: pytest.fail("motion_only must not prepare actions")
     policy.prepare_motion_clips = lambda batch: (torch.empty(1), torch.empty(1))
     batch = {
         OBS_STATE: torch.zeros(1, 1),
@@ -610,26 +630,28 @@ def test_world_model_stage_does_not_prepare_or_run_action_expert():
     assert metrics["motion_loss"] == pytest.approx(4.0)
 
 
-def test_action_expert_stage_does_not_read_future_supervision():
+def test_action_only_uses_oracle_future_motion_without_motion_loss():
     class _ActionModel(nn.Module):
         def forward(self, *args, **kwargs):
             del args
             assert kwargs["actions"] is not None
-            assert kwargs["future_motion_target"] is None
-            assert kwargs["current_visual_image"] is None
-            assert kwargs["future_visual_image"] is None
-            assert not kwargs["compute_world_model"]
+            assert torch.equal(kwargs["future_motion_target"], torch.tensor([[1.0]]))
+            assert torch.equal(kwargs["z_motion_source"], torch.tensor([[1.0]]))
+            assert not kwargs["compute_motion_loss"]
             assert kwargs["compute_flow"]
             return {
                 "flow_losses": torch.tensor([[[1.0], [4.0]]]),
+                "z_flow_losses": torch.tensor([0.5]),
                 "predicted_future_motion": torch.tensor([[2.0]]),
+                "z_motion_source": kwargs["z_motion_source"],
+                "z_target": torch.tensor([[3.0]]),
             }
 
     class _MotionExtractor:
         @staticmethod
-        def encode(past_frames):
-            del past_frames
-            return torch.tensor([[0.0]])
+        def encode_pair(past_frames, future_frames):
+            del past_frames, future_frames
+            return torch.tensor([[0.0]]), torch.tensor([[1.0]])
 
     policy = SmolWPolicy.__new__(SmolWPolicy)
     nn.Module.__init__(policy)
@@ -637,19 +659,15 @@ def test_action_expert_stage_does_not_read_future_supervision():
         adapt_to_pi_aloha=False,
         action_feature=SimpleNamespace(shape=(1,)),
         motion_loss_weight=1.0,
-        future_visual_loss_weight=1.0,
-        training_stage="action_expert_only",
+        z_loss_weight=1.0,
+        train_mode="action_only",
     )
     policy.model = _ActionModel()
     policy.motion_extractor = _MotionExtractor()
     policy.prepare_images = lambda batch: ([], [])
     policy.prepare_state = lambda batch: batch[OBS_STATE]
     policy.prepare_action = lambda batch: batch[ACTION]
-    policy.prepare_past_motion_clip = lambda batch: torch.empty(1)
-    policy.prepare_motion_clips = lambda batch: pytest.fail("stage two must not request future frames")
-    policy.prepare_future_visual_pair = lambda batch: pytest.fail(
-        "stage two must not request the future visual target"
-    )
+    policy.prepare_motion_clips = lambda batch: (torch.empty(1), torch.empty(1))
     batch = {
         ACTION: torch.zeros(1, 2, 1),
         OBS_STATE: torch.zeros(1, 1),
@@ -659,6 +677,10 @@ def test_action_expert_stage_does_not_read_future_supervision():
 
     loss, metrics = policy.forward(batch)
 
-    assert loss.item() == pytest.approx(2.5)
-    assert metrics["flow_loss"] == pytest.approx(2.5)
+    assert loss.item() == pytest.approx(3.0)
+    assert metrics["flow_loss"] == pytest.approx(3.0)
+    assert metrics["action_flow_loss"] == pytest.approx(2.5)
+    assert metrics["z_flow_loss"] == pytest.approx(0.5)
+    assert metrics["oracle_motion_rms"] == pytest.approx(1.0)
+    assert metrics["predicted_motion_rms"] == pytest.approx(2.0)
     assert "motion_loss" not in metrics

@@ -29,9 +29,8 @@ class SmolWConfig(SmolVLAConfig):
     """SmolVLA with a past-motion query and a predicted future-motion condition.
 
     The VLM still receives only the current observation. Temporal frames are
-    requested from a LeRobot dataset through ``observation_delta_indices``.
-    VidTwin consumes the history/future clips, while the frozen SmolVLM visual
-    encoder supplies the current/future endpoint token targets for stage one.
+    requested from a LeRobot dataset through ``observation_delta_indices`` and
+    are consumed by the frozen VidTwin motion extractor.
     """
 
     # Motion/action temporal contract. ``None`` keeps the motion horizon tied to
@@ -39,9 +38,14 @@ class SmolWConfig(SmolVLAConfig):
     motion_horizon: int | None = None
     memory_stride: int = 1
 
-    # Two-stage training. ``joint`` is kept for ablations/backward-compatible
-    # experiments, but the intended recipe is world_model -> action_expert_only.
-    training_stage: str = "world_model"
+    # Training objective. ``None`` exists only so checkpoints written before
+    # ``train_mode`` can be migrated in ``__post_init__``.
+    train_mode: str | None = None
+    # Deprecated checkpoint compatibility; consulted only when train_mode is
+    # absent, then cleared immediately.
+    training_stage: str | None = None
+    # SmolVLA needs this construction-time field, but SmolW derives all
+    # parameter freezing exclusively from ``train_mode``.
     train_expert_only: bool = False
 
     # The frozen VidTwin extractor is external to the policy state dict. Its
@@ -62,19 +66,17 @@ class SmolWConfig(SmolVLAConfig):
 
     # New SmolW branches.
     motion_projector_hidden_dim: int = 1024
+    # Predicted VidTwin motion is converted into one horizon-level z target in
+    # the action expert hidden space. Flow matching jointly denoises (z, a).
     motion_condition_hidden_dim: int = 1024
     motion_condition_scale: float = 1.0
+    z_loss_weight: float = 1.0
     motion_loss_weight: float = 1.0
     detach_motion_condition: bool = False
 
-    # Stage-one future visual-token residual prediction.
-    future_visual_loss_weight: float = 1.0
-    future_visual_cosine_weight: float = 0.1
-    future_visual_decoder_layers: int = 2
-
-    # A full future video ending at t+H is required in stage one. ``None`` drops
-    # exactly the final H episode frames in the LeRobot sampler. Stage two has
-    # no future-observation dependency and defaults to zero.
+    # Every training mode needs a full future video ending at t+H, either as a
+    # regression target or as the oracle action condition. ``None`` drops
+    # exactly the final H episode frames in the LeRobot sampler.
     drop_n_last_frames: int | None = None
 
     # TensorBoard logging is performed by lerobot-train on the main process.
@@ -94,13 +96,25 @@ class SmolWConfig(SmolVLAConfig):
 
         if self.motion_horizon is None:
             self.motion_horizon = self.chunk_size
-        if self.train_expert_only:
-            self.training_stage = "action_expert_only"
-        valid_training_stages = {"world_model", "action_expert_only", "joint"}
-        if self.training_stage not in valid_training_stages:
-            raise ValueError(
-                f"training_stage must be one of {sorted(valid_training_stages)}, got {self.training_stage!r}."
+        if self.train_mode is None:
+            legacy_modes = {
+                "world_model": "motion_only",
+                "action_expert_only": "action_only",
+                "joint": "jointly",
+            }
+            self.train_mode = legacy_modes.get(
+                self.training_stage,
+                "action_only" if self.train_expert_only else "motion_only",
             )
+        valid_train_modes = {"motion_only", "action_only", "jointly"}
+        if self.train_mode not in valid_train_modes:
+            raise ValueError(
+                f"train_mode must be one of {sorted(valid_train_modes)}, got {self.train_mode!r}."
+            )
+        # Keep the inherited SmolVLA implementation from independently
+        # selecting a training branch. SmolW's train_mode is the only switch.
+        self.training_stage = None
+        self.train_expert_only = False
         if self.motion_horizon <= 0:
             raise ValueError(f"motion_horizon must be positive, got {self.motion_horizon}.")
         if self.motion_horizon != self.chunk_size:
@@ -128,27 +142,12 @@ class SmolWConfig(SmolVLAConfig):
             raise ValueError(
                 f"motion_condition_scale must be non-negative, got {self.motion_condition_scale}."
             )
+        if self.z_loss_weight < 0:
+            raise ValueError(f"z_loss_weight must be non-negative, got {self.z_loss_weight}.")
         if self.motion_loss_weight < 0:
             raise ValueError(f"motion_loss_weight must be non-negative, got {self.motion_loss_weight}.")
-        if self.future_visual_loss_weight < 0:
-            raise ValueError(
-                f"future_visual_loss_weight must be non-negative, got {self.future_visual_loss_weight}."
-            )
-        if self.future_visual_cosine_weight < 0:
-            raise ValueError(
-                f"future_visual_cosine_weight must be non-negative, got {self.future_visual_cosine_weight}."
-            )
-        if self.future_visual_decoder_layers <= 0:
-            raise ValueError(
-                f"future_visual_decoder_layers must be positive, got {self.future_visual_decoder_layers}."
-            )
-        if self.training_stage == "world_model" and (
-            self.motion_loss_weight == 0 and self.future_visual_loss_weight == 0
-        ):
-            raise ValueError(
-                "world_model training requires motion_loss_weight or "
-                "future_visual_loss_weight to be positive."
-            )
+        if self.train_mode in {"motion_only", "jointly"} and self.motion_loss_weight == 0:
+            raise ValueError(f"{self.train_mode} training requires motion_loss_weight to be positive.")
         if not self.use_cache:
             raise ValueError("SmolW requires use_cache=True for motion-first prefix execution.")
         if self.vidtwin_dtype not in {"float32", "float16", "bfloat16"}:
@@ -167,16 +166,16 @@ class SmolWConfig(SmolVLAConfig):
                 f"tensorboard_histogram_freq must be positive, got {self.tensorboard_histogram_freq}."
             )
 
-        # H actions a_t...a_{t+H-1} end at observation o_{t+H}. Stage one
-        # therefore needs H future observations after the current frame.
+        # H actions a_t...a_{t+H-1} end at observation o_{t+H}. All modes need
+        # H future observations for the target/oracle future-motion latent.
         if self.drop_n_last_frames is not None and self.drop_n_last_frames < 0:
             raise ValueError(f"drop_n_last_frames must be non-negative, got {self.drop_n_last_frames}.")
-        required_tail_drop = self.motion_horizon if self.training_stage != "action_expert_only" else 0
+        required_tail_drop = self.motion_horizon
         if self.drop_n_last_frames is None:
             self.drop_n_last_frames = required_tail_drop
-        elif self.training_stage != "action_expert_only" and self.drop_n_last_frames < required_tail_drop:
+        elif self.drop_n_last_frames < required_tail_drop:
             raise ValueError(
-                "SmolW future-motion supervision requires dropping at least motion_horizon "
+                "SmolW future-motion target extraction requires dropping at least motion_horizon "
                 f"episode-tail frames; got drop_n_last_frames={self.drop_n_last_frames}, "
                 f"required>={required_tail_drop}."
             )
@@ -197,9 +196,7 @@ class SmolWConfig(SmolVLAConfig):
 
     @property
     def observation_delta_indices(self) -> list[int]:
-        """Request future supervision only for stages that consume it."""
-        if self.training_stage == "action_expert_only":
-            return self.past_motion_delta_indices
+        """Request history plus the future target/oracle-condition window."""
         return sorted(set(self.past_motion_delta_indices + self.future_motion_delta_indices))
 
     @property
@@ -213,7 +210,5 @@ class SmolWConfig(SmolVLAConfig):
 
     @property
     def future_motion_positions(self) -> list[int]:
-        if self.training_stage == "action_expert_only":
-            return []
         deltas = self.observation_delta_indices
         return [deltas.index(delta) for delta in self.future_motion_delta_indices]

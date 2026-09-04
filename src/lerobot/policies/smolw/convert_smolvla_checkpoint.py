@@ -16,9 +16,9 @@
 
 """Convert an original SmolVLA artifact into a SmolW base artifact.
 
-Only shape-compatible original SmolVLA tensors are transferred.  The M_t
-query, motion prediction head, and action-conditioning projection retain their
-SmolW initialization.
+Only shape-compatible original SmolVLA tensors are transferred. The M_t query,
+motion prediction head, and horizon-level z flow modules retain their SmolW
+initialization.
 
 Example:
 
@@ -57,8 +57,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-action-steps", type=int)
     parser.add_argument("--motion-camera-key")
     parser.add_argument("--motion-loss-weight", type=float, default=1.0)
-    parser.add_argument("--future-visual-loss-weight", type=float, default=1.0)
-    parser.add_argument("--future-visual-cosine-weight", type=float, default=0.1)
     parser.add_argument("--motion-latent-dim", type=int, default=1792)
     parser.add_argument(
         "--overwrite",
@@ -97,10 +95,9 @@ def _make_target_config(source_policy: SmolVLAPolicy, args: argparse.Namespace) 
             "vidtwin_sample_posterior": False,
             "motion_camera_key": args.motion_camera_key,
             "motion_loss_weight": args.motion_loss_weight,
-            "future_visual_loss_weight": args.future_visual_loss_weight,
-            "future_visual_cosine_weight": args.future_visual_cosine_weight,
             "motion_latent_dim": args.motion_latent_dim,
-            "training_stage": "world_model",
+            "train_mode": "motion_only",
+            "training_stage": None,
             "train_expert_only": False,
             # The converter transfers the complete original SmolVLA state, so
             # the target does not need to download VLM weights a second time.
@@ -130,11 +127,11 @@ def _copy_compatible_weights(source_policy: SmolVLAPolicy, target_policy: SmolWP
         "model.mt_query_embedding.",
         "model.past_motion_projector.",
         "model.future_motion_head.",
-        "model.future_motion_condition_proj.",
-        "model.future_visual_queries.",
-        "model.future_motion_visual_proj.",
-        "model.future_visual_decoder.",
-        "model.future_visual_out_proj.",
+        "model.future_motion_to_z.",
+        "model.z_in_proj.",
+        "model.z_time_mlp_in.",
+        "model.z_time_mlp_out.",
+        "model.z_out_proj.",
     )
     unmatched_missing = [key for key in missing_keys if not key.startswith(expected_new_prefixes)]
     logging.info(

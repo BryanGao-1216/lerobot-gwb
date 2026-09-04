@@ -34,6 +34,7 @@ from ..smolvla.modeling_smolvla import (
     ActionSelectKwargs,
     SmolVLAPolicy,
     VLAFlowMatching,
+    create_sinusoidal_pos_embedding,
     make_att_2d_masks,
     pad_vector,
 )
@@ -43,7 +44,7 @@ from .vidtwin_motion_encoder import VidTwinMotionExtractor
 
 
 class SmolWFlowMatching(VLAFlowMatching):
-    """Original SmolVLA action expert with a predicted-motion suffix condition."""
+    """Original SmolVLA action expert with a future-motion suffix condition."""
 
     def __init__(self, config: SmolWConfig, rtc_processor=None):
         # The parent compiles its methods inside __init__. Delay compilation
@@ -51,7 +52,7 @@ class SmolWFlowMatching(VLAFlowMatching):
         compile_model = config.compile_model
         train_expert_only = config.train_expert_only
         config.compile_model = False
-        # Stage-specific freezing is applied after all SmolW modules exist.
+        # Mode-specific freezing is applied after all SmolW modules exist.
         config.train_expert_only = False
         try:
             super().__init__(config, rtc_processor=rtc_processor)
@@ -76,87 +77,30 @@ class SmolWFlowMatching(VLAFlowMatching):
             nn.SiLU(),
             nn.Linear(config.motion_projector_hidden_dim, config.motion_latent_dim),
         )
-        self.future_motion_condition_proj = nn.Sequential(
+        self.future_motion_to_z = nn.Sequential(
             nn.LayerNorm(config.motion_latent_dim),
             nn.Linear(config.motion_latent_dim, config.motion_condition_hidden_dim),
             nn.SiLU(),
             nn.Linear(config.motion_condition_hidden_dim, expert_hidden_size),
         )
-
-        self.future_visual_num_tokens = self._infer_visual_token_count()
-        self.future_visual_queries = nn.Embedding(self.future_visual_num_tokens, vlm_hidden_size)
-        self.future_motion_visual_proj = nn.Sequential(
-            nn.LayerNorm(config.motion_latent_dim),
-            nn.Linear(config.motion_latent_dim, vlm_hidden_size),
-        )
-        visual_decoder_layer = nn.TransformerDecoderLayer(
-            d_model=vlm_hidden_size,
-            nhead=self.vlm_with_expert.config.text_config.num_attention_heads,
-            dim_feedforward=config.motion_projector_hidden_dim,
-            dropout=0.0,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.future_visual_decoder = nn.TransformerDecoder(
-            visual_decoder_layer,
-            num_layers=config.future_visual_decoder_layers,
-            norm=nn.LayerNorm(vlm_hidden_size),
-        )
-        self.future_visual_out_proj = nn.Linear(vlm_hidden_size, vlm_hidden_size)
+        self.z_in_proj = nn.Linear(expert_hidden_size, expert_hidden_size)
+        self.z_time_mlp_in = nn.Linear(expert_hidden_size * 2, expert_hidden_size)
+        self.z_time_mlp_out = nn.Linear(expert_hidden_size, expert_hidden_size)
+        self.z_out_proj = nn.Linear(expert_hidden_size, expert_hidden_size)
 
         nn.init.normal_(self.mt_query_embedding.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.future_visual_queries.weight, mean=0.0, std=0.02)
-        # Preserve the original SmolVLA vector field at initialization: the
-        # action expert cannot attend M_t directly, and this explicit predicted
-        # motion residual starts at zero.
-        nn.init.zeros_(self.future_motion_condition_proj[-1].weight)
-        nn.init.zeros_(self.future_motion_condition_proj[-1].bias)
-        # Stage one starts at the copy-current visual-token baseline and learns
-        # only the future residual that motion introduces.
-        nn.init.zeros_(self.future_visual_out_proj.weight)
-        nn.init.zeros_(self.future_visual_out_proj.bias)
-
-        self._training_stage_configured = False
-        self.configure_training_stage()
+        self._train_mode_configured = False
+        self.configure_train_mode()
 
         if compile_model:
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
-    def _infer_visual_token_count(self) -> int:
-        """Infer connector token count from the actual image and VLM configs."""
-        if self.config.resize_imgs_with_padding is None:
-            raise ValueError(
-                "SmolW future visual prediction requires resize_imgs_with_padding "
-                "to provide a fixed visual-token grid."
-            )
-        width, height = self.config.resize_imgs_with_padding
-        patch_size = self.vlm_with_expert.config.vision_config.patch_size
-        if isinstance(patch_size, int):
-            patch_height = patch_width = patch_size
-        else:
-            patch_height, patch_width = patch_size
-        scale_factor = self.vlm_with_expert.config.scale_factor
-        patch_tokens = (height // patch_height) * (width // patch_width)
-        scale_tokens = scale_factor**2
-        if patch_tokens <= 0 or patch_tokens % scale_tokens != 0:
-            raise ValueError(
-                "Cannot infer a valid SmolVLM connector token count from "
-                f"image={height}x{width}, patch={patch_height}x{patch_width}, "
-                f"scale_factor={scale_factor}."
-            )
-        return patch_tokens // scale_tokens
-
     @staticmethod
-    def _is_world_model_parameter(name: str) -> bool:
+    def _is_motion_parameter(name: str) -> bool:
         is_vlm = name.startswith("vlm_with_expert.vlm.") and not name.startswith(
-            (
-                "vlm_with_expert.vlm.lm_head.",
-                "vlm_with_expert.vlm.model.vision_model.",
-                "vlm_with_expert.vlm.model.connector.",
-            )
+            "vlm_with_expert.vlm.lm_head."
         )
         return is_vlm or name.startswith(
             (
@@ -164,10 +108,6 @@ class SmolWFlowMatching(VLAFlowMatching):
                 "mt_query_embedding.",
                 "past_motion_projector.",
                 "future_motion_head.",
-                "future_visual_queries.",
-                "future_motion_visual_proj.",
-                "future_visual_decoder.",
-                "future_visual_out_proj.",
             )
         )
 
@@ -179,121 +119,50 @@ class SmolWFlowMatching(VLAFlowMatching):
                 "action_out_proj.",
                 "action_time_mlp_in.",
                 "action_time_mlp_out.",
-                "future_motion_condition_proj.",
+                "future_motion_to_z.",
+                "z_in_proj.",
+                "z_time_mlp_in.",
+                "z_time_mlp_out.",
+                "z_out_proj.",
             )
         )
 
-    @staticmethod
-    def _is_frozen_visual_teacher_parameter(name: str) -> bool:
-        return name.startswith(
-            (
-                "vlm_with_expert.vlm.model.vision_model.",
-                "vlm_with_expert.vlm.model.connector.",
-            )
-        )
-
-    def configure_training_stage(self) -> int:
-        """Freeze everything outside the selected stage before optimizer setup."""
-        stage = self.config.training_stage
-        first_configuration = not self._training_stage_configured
+    def configure_train_mode(self) -> int:
+        """Freeze everything outside the selected train mode before optimizer setup."""
+        mode = self.config.train_mode
+        first_configuration = not self._train_mode_configured
         for name, parameter in self.named_parameters():
-            is_world = self._is_world_model_parameter(name)
+            is_motion = self._is_motion_parameter(name)
             is_expert = self._is_action_expert_parameter(name)
-            is_teacher = self._is_frozen_visual_teacher_parameter(name)
-            included = (stage in {"world_model", "joint"} and is_world) or (
-                stage in {"action_expert_only", "joint"} and is_expert
+            is_frozen_vision = self.config.freeze_vision_encoder and name.startswith(
+                "vlm_with_expert.vlm.model.vision_model."
+            )
+            included = (mode in {"motion_only", "jointly"} and is_motion) or (
+                mode in {"action_only", "jointly"} and is_expert
             )
             if first_configuration:
                 # Preserve tensors that the original SmolVLA implementation
                 # freezes because they are unused by its truncated VLM/expert
                 # layer pairing. Re-enabling them breaks DDP without
                 # find_unused_parameters=True.
-                parameter.requires_grad_(parameter.requires_grad and included and not is_teacher)
-            elif not included or is_teacher:
+                parameter.requires_grad_(parameter.requires_grad and included and not is_frozen_vision)
+            elif not included or is_frozen_vision:
                 # Re-run after PEFT injection without re-enabling base tensors
                 # that PEFT deliberately froze.
                 parameter.requires_grad_(False)
 
-        self._training_stage_configured = True
+        self._train_mode_configured = True
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # Both sides of the future-token regression must use one stable visual
-        # coordinate system throughout stage one.
-        self.vlm_with_expert.get_vlm_model().vision_model.eval()
-        self.vlm_with_expert.get_vlm_model().connector.eval()
-        if self.config.training_stage == "action_expert_only":
-            # Stage two consumes the frozen stage-one prediction as a stable
-            # condition. In particular, do not leave VLM dropout active merely
-            # because the outer policy is in training mode.
+        if self.config.freeze_vision_encoder:
+            self.vlm_with_expert.get_vlm_model().vision_model.eval()
+        if self.config.train_mode == "action_only":
+            # action_only consumes an oracle future-motion condition and keeps
+            # the complete motion/VLM path frozen.
             self.vlm_with_expert.vlm.eval()
         return self
-
-    @torch.no_grad()
-    def encode_visual_teacher(self, image: Tensor) -> Tensor:
-        tokens = self.vlm_with_expert.embed_image(image)
-        if tokens.shape[1] != self.future_visual_num_tokens:
-            raise ValueError(
-                "SmolVLM connector emitted a different number of tokens than inferred: "
-                f"got {tokens.shape[1]}, expected {self.future_visual_num_tokens}."
-            )
-        return tokens.detach()
-
-    def predict_future_visual_tokens(
-        self,
-        current_image: Tensor,
-        predicted_future_motion: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        """Predict a residual over the frozen current-camera visual tokens."""
-        current_tokens = self.encode_visual_teacher(current_image)
-        decoder_dtype = self.future_visual_queries.weight.dtype
-        current_tokens = current_tokens.to(dtype=decoder_dtype)
-        motion_condition = self.future_motion_visual_proj(
-            predicted_future_motion.to(dtype=self.future_motion_visual_proj[1].weight.dtype)
-        ).to(dtype=decoder_dtype)
-        queries = self.future_visual_queries.weight[None].expand(current_tokens.shape[0], -1, -1)
-        queries = queries + motion_condition[:, None, :]
-        decoded = self.future_visual_decoder(tgt=queries, memory=current_tokens)
-        residual = self.future_visual_out_proj(decoded)
-        return current_tokens + residual, current_tokens
-
-    def compute_future_visual_losses(
-        self,
-        current_image: Tensor,
-        future_image: Tensor,
-        predicted_future_motion: Tensor,
-    ) -> dict[str, Tensor]:
-        predicted_tokens, current_tokens = self.predict_future_visual_tokens(
-            current_image,
-            predicted_future_motion,
-        )
-        target_tokens = self.encode_visual_teacher(future_image).to(dtype=predicted_tokens.dtype)
-        smooth_l1 = F.smooth_l1_loss(
-            predicted_tokens.float(),
-            target_tokens.float(),
-            reduction="none",
-        ).mean(dim=(1, 2))
-        cosine = (
-            1.0
-            - F.cosine_similarity(
-                predicted_tokens.float(),
-                target_tokens.float(),
-                dim=-1,
-            )
-        ).mean(dim=1)
-        copy_current = F.smooth_l1_loss(
-            current_tokens.float(),
-            target_tokens.float(),
-            reduction="none",
-        ).mean(dim=(1, 2))
-        total = smooth_l1 + self.config.future_visual_cosine_weight * cosine
-        return {
-            "future_visual_losses": total,
-            "future_visual_smooth_l1_losses": smooth_l1,
-            "future_visual_cosine_losses": cosine,
-            "copy_current_visual_losses": copy_current,
-        }
 
     def embed_prefix_with_motion(
         self,
@@ -342,24 +211,49 @@ class SmolWFlowMatching(VLAFlowMatching):
         head_dtype = self.future_motion_head[1].weight.dtype
         return self.future_motion_head(query_hidden.to(dtype=head_dtype)).float()
 
-    def embed_suffix_with_motion(
+    def motion_to_z(self, future_motion: Tensor) -> Tensor:
+        """Convert one 1792-D horizon motion prediction into the z flow target."""
+        motion_for_z = future_motion.detach() if self.config.detach_motion_condition else future_motion
+        projection_dtype = self.future_motion_to_z[1].weight.dtype
+        z = self.future_motion_to_z(motion_for_z.to(dtype=projection_dtype))
+        return torch.tanh(z) * self.config.motion_condition_scale
+
+    def embed_action_z_suffix(
         self,
         noisy_actions: Tensor,
+        noisy_z: Tensor,
         timestep: Tensor,
-        predicted_future_motion: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Add predicted future motion to every original action/time suffix token."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks = super().embed_suffix(noisy_actions, timestep)
-        motion_for_condition = (
-            predicted_future_motion.detach()
-            if self.config.detach_motion_condition
-            else predicted_future_motion
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Embed H action steps followed by one horizon-level z step."""
+        action_embs, action_pad_masks, action_att_masks = super().embed_suffix(
+            noisy_actions,
+            timestep,
         )
-        projection_dtype = self.future_motion_condition_proj[1].weight.dtype
-        condition = self.future_motion_condition_proj(motion_for_condition.to(dtype=projection_dtype))
-        condition = torch.tanh(condition) * self.config.motion_condition_scale
-        suffix_embs = suffix_embs + condition[:, None, :].to(dtype=suffix_embs.dtype)
-        return suffix_embs, suffix_pad_masks, suffix_att_masks
+        if noisy_z.ndim != 2 or noisy_z.shape[0] != noisy_actions.shape[0]:
+            raise ValueError(f"noisy_z must have shape [B, expert_hidden_size], got {tuple(noisy_z.shape)}.")
+        z_dtype = self.z_in_proj.weight.dtype
+        z_emb = self.z_in_proj(noisy_z.to(dtype=z_dtype))
+        z_time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.vlm_with_expert.expert_hidden_size,
+            self.config.min_period,
+            self.config.max_period,
+            device=z_emb.device,
+        ).to(dtype=z_emb.dtype)
+        z_emb = self.z_time_mlp_out(F.silu(self.z_time_mlp_in(torch.cat([z_emb, z_time_emb], dim=-1))))
+        z_emb = z_emb[:, None, :].to(dtype=action_embs.dtype)
+        z_pad_mask = torch.ones(
+            noisy_actions.shape[0],
+            1,
+            dtype=torch.bool,
+            device=action_pad_masks.device,
+        )
+        return (
+            torch.cat([action_embs, z_emb], dim=1),
+            torch.cat([action_pad_masks, z_pad_mask], dim=1),
+            action_pad_masks,
+            action_att_masks,
+        )
 
     def run_motion_prefix(
         self,
@@ -405,8 +299,8 @@ class SmolWFlowMatching(VLAFlowMatching):
     ) -> tuple[Tensor, Tensor]:
         """Build suffix attention while hiding M_t from the action expert.
 
-        M_t is always the final cached prefix token.  The action expert receives
-        its information only through ``predicted_future_motion``; current image,
+        M_t is always the final cached prefix token. The action expert receives
+        no direct motion condition through its action rows; current image,
         language, and state prefix tokens retain the original SmolVLA path.
         """
         suffix_len = suffix_pad_masks.shape[1]
@@ -424,6 +318,45 @@ class SmolWFlowMatching(VLAFlowMatching):
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
         return attention, position_ids
 
+    @classmethod
+    def make_action_z_attention(
+        cls,
+        prefix_pad_masks: Tensor,
+        action_pad_masks: Tensor,
+        action_att_masks: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Keep the H action rows unchanged and append one action-reading z row.
+
+        Internally the suffix is ordered as ``[a_1, ..., a_H, z]``. Action
+        queries cannot see z and retain the original SmolVLA attention exactly.
+        The final z query can see every valid prefix token (including M_t), all
+        action tokens, and itself.
+        """
+        action_attention, action_position_ids = cls.make_action_attention(
+            prefix_pad_masks,
+            action_pad_masks,
+            action_att_masks,
+        )
+        z_column = torch.zeros(
+            action_attention.shape[0],
+            action_attention.shape[1],
+            1,
+            dtype=torch.bool,
+            device=action_attention.device,
+        )
+        action_rows = torch.cat([action_attention, z_column], dim=-1)
+        z_self_mask = torch.ones(
+            prefix_pad_masks.shape[0],
+            1,
+            dtype=torch.bool,
+            device=prefix_pad_masks.device,
+        )
+        z_row = torch.cat([prefix_pad_masks, action_pad_masks, z_self_mask], dim=-1)[:, None, :]
+        attention = torch.cat([action_rows, z_row], dim=1)
+        z_position_id = action_position_ids[:, -1:] + 1
+        position_ids = torch.cat([action_position_ids, z_position_id], dim=1)
+        return attention, position_ids
+
     def forward(
         self,
         images,
@@ -434,14 +367,14 @@ class SmolWFlowMatching(VLAFlowMatching):
         past_motion: Tensor,
         actions: Tensor | None = None,
         future_motion_target: Tensor | None = None,
-        current_visual_image: Tensor | None = None,
-        future_visual_image: Tensor | None = None,
+        z_motion_source: Tensor | None = None,
         noise: Tensor | None = None,
+        z_noise: Tensor | None = None,
         time: Tensor | None = None,
-        compute_world_model: bool = True,
+        compute_motion_loss: bool = True,
         compute_flow: bool = True,
     ) -> dict[str, Tensor]:
-        """Run the selected world-model and/or action-expert objectives."""
+        """Run the selected motion-regression and/or action objectives."""
         (
             predicted_future_motion,
             prefix_pad_masks,
@@ -460,47 +393,52 @@ class SmolWFlowMatching(VLAFlowMatching):
             "predicted_future_motion": predicted_future_motion,
         }
 
-        if compute_world_model:
+        if compute_motion_loss:
             if future_motion_target is None:
-                raise ValueError("World-model training requires future_motion_target.")
+                raise ValueError("Motion training requires future_motion_target.")
             output["motion_losses"] = F.smooth_l1_loss(
                 predicted_future_motion,
                 future_motion_target.float(),
                 reduction="none",
             ).mean(dim=-1)
-            if self.config.future_visual_loss_weight > 0:
-                if current_visual_image is None or future_visual_image is None:
-                    raise ValueError(
-                        "Future visual-token training requires current_visual_image and future_visual_image."
-                    )
-                output.update(
-                    self.compute_future_visual_losses(
-                        current_visual_image,
-                        future_visual_image,
-                        predicted_future_motion,
-                    )
-                )
 
         if compute_flow:
             if actions is None:
                 raise ValueError("Action-expert training requires actions.")
+            if z_motion_source is None:
+                z_motion_source = predicted_future_motion
+            elif z_motion_source.shape != predicted_future_motion.shape:
+                raise ValueError(
+                    "z_motion_source must match predicted future-motion shape; got "
+                    f"{tuple(z_motion_source.shape)} and {tuple(predicted_future_motion.shape)}."
+                )
+            z_target = self.motion_to_z(z_motion_source)
             if noise is None:
                 noise = self.sample_noise(actions.shape, actions.device)
+            if z_noise is None:
+                z_noise = self.sample_noise(z_target.shape, z_target.device)
+            elif z_noise.shape != z_target.shape:
+                raise ValueError(
+                    f"z_noise must have shape {tuple(z_target.shape)}, got {tuple(z_noise.shape)}."
+                )
             if time is None:
                 time = self.sample_time(actions.shape[0], actions.device)
 
             time_expanded = time[:, None, None]
-            x_t = time_expanded * noise + (1 - time_expanded) * actions
-            u_t = noise - actions
-            suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix_with_motion(
-                x_t,
+            action_x_t = time_expanded * noise + (1 - time_expanded) * actions
+            action_u_t = noise - actions
+            z_time = time[:, None]
+            z_x_t = z_time * z_noise + (1 - z_time) * z_target
+            z_u_t = z_noise - z_target
+            suffix_embs, _, action_pad_masks, action_att_masks = self.embed_action_z_suffix(
+                action_x_t,
+                z_x_t,
                 time,
-                predicted_future_motion,
             )
-            attention, position_ids = self.make_action_attention(
+            attention, position_ids = self.make_action_z_attention(
                 prefix_pad_masks,
-                suffix_pad_masks,
-                suffix_att_masks,
+                action_pad_masks,
+                action_att_masks,
             )
             outputs_embeds, _ = self.vlm_with_expert.forward(
                 attention_mask=attention,
@@ -510,9 +448,15 @@ class SmolWFlowMatching(VLAFlowMatching):
                 use_cache=True,
                 fill_kv_cache=False,
             )
-            suffix_out = outputs_embeds[1][:, -self.config.chunk_size :].float()
-            velocity = self.action_out_proj(suffix_out)
-            output["flow_losses"] = F.mse_loss(u_t, velocity, reduction="none")
+            suffix_out = outputs_embeds[1][:, -(self.config.chunk_size + 1) :].float()
+            action_velocity = self.action_out_proj(suffix_out[:, : self.config.chunk_size])
+            z_velocity = self.z_out_proj(suffix_out[:, -1])
+            output["flow_losses"] = F.mse_loss(action_u_t, action_velocity, reduction="none")
+            output["z_flow_losses"] = F.mse_loss(z_u_t.float(), z_velocity.float(), reduction="none").mean(
+                dim=-1
+            )
+            output["z_motion_source"] = z_motion_source
+            output["z_target"] = z_target
 
         return output
 
@@ -526,12 +470,13 @@ class SmolWFlowMatching(VLAFlowMatching):
         state: Tensor,
         past_motion: Tensor,
         noise: Tensor | None = None,
+        z_noise: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """Run one motion prediction followed by the original Euler denoising loop."""
+        """Jointly denoise one z token and H actions, then return only actions."""
         batch_size = state.shape[0]
         device = state.device
-        predicted_future_motion, prefix_pad_masks, _, _, past_key_values = self.run_motion_prefix(
+        _, prefix_pad_masks, _, _, past_key_values = self.run_motion_prefix(
             images,
             img_masks,
             lang_tokens,
@@ -545,58 +490,58 @@ class SmolWFlowMatching(VLAFlowMatching):
                 (batch_size, self.config.chunk_size, self.config.max_action_dim),
                 device,
             )
+        if z_noise is None:
+            z_noise = self.sample_noise(
+                (batch_size, self.vlm_with_expert.expert_hidden_size),
+                device,
+            )
+        elif z_noise.shape != (batch_size, self.vlm_with_expert.expert_hidden_size):
+            raise ValueError(
+                "z_noise must have shape "
+                f"{(batch_size, self.vlm_with_expert.expert_hidden_size)}, got {tuple(z_noise.shape)}."
+            )
+        if self._rtc_enabled():
+            raise NotImplementedError("RTC is not supported by SmolW's joint (z, action) denoising.")
 
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
-        x_t = noise
+        action_x_t = noise
+        z_x_t = z_noise
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(batch_size)
-
-            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
-                return self.denoise_step_with_motion(
-                    prefix_pad_masks=prefix_pad_masks,
-                    past_key_values=past_key_values,
-                    x_t=input_x_t,
-                    timestep=current_timestep,
-                    predicted_future_motion=predicted_future_motion,
-                )
-
-            if self._rtc_enabled():
-                v_t = self.rtc_processor.denoise_step(
-                    x_t=x_t,
-                    prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
-                    inference_delay=kwargs.get("inference_delay"),
-                    time=time,
-                    original_denoise_step_partial=denoise_step_partial_call,
-                    execution_horizon=kwargs.get("execution_horizon"),
-                )
-            else:
-                v_t = denoise_step_partial_call(x_t)
-            x_t = x_t + dt * v_t
+            action_v_t, z_v_t = self.denoise_step_with_z(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                action_x_t=action_x_t,
+                z_x_t=z_x_t,
+                timestep=time_tensor,
+            )
+            action_x_t = action_x_t + dt * action_v_t
+            z_x_t = z_x_t + dt * z_v_t
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
-        return x_t
+                self.rtc_processor.track(time=time, x_t=action_x_t, v_t=action_v_t)
+        return action_x_t
 
-    def denoise_step_with_motion(
+    def denoise_step_with_z(
         self,
         *,
         prefix_pad_masks: Tensor,
         past_key_values,
-        x_t: Tensor,
+        action_x_t: Tensor,
+        z_x_t: Tensor,
         timestep: Tensor,
-        predicted_future_motion: Tensor,
-    ) -> Tensor:
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix_with_motion(
-            x_t,
+    ) -> tuple[Tensor, Tensor]:
+        suffix_embs, _, action_pad_masks, action_att_masks = self.embed_action_z_suffix(
+            action_x_t,
+            z_x_t,
             timestep,
-            predicted_future_motion,
         )
-        attention, position_ids = self.make_action_attention(
+        attention, position_ids = self.make_action_z_attention(
             prefix_pad_masks,
-            suffix_pad_masks,
-            suffix_att_masks,
+            action_pad_masks,
+            action_att_masks,
         )
         outputs_embeds, _ = self.vlm_with_expert.forward(
             attention_mask=attention,
@@ -606,8 +551,10 @@ class SmolWFlowMatching(VLAFlowMatching):
             use_cache=True,
             fill_kv_cache=False,
         )
-        suffix_out = outputs_embeds[1][:, -self.config.chunk_size :].float()
-        return self.action_out_proj(suffix_out)
+        suffix_out = outputs_embeds[1][:, -(self.config.chunk_size + 1) :].float()
+        action_velocity = self.action_out_proj(suffix_out[:, : self.config.chunk_size])
+        z_velocity = self.z_out_proj(suffix_out[:, -1])
+        return action_velocity, z_velocity
 
 
 class SmolWPolicy(SmolVLAPolicy):
@@ -651,21 +598,19 @@ class SmolWPolicy(SmolVLAPolicy):
         )
         self.reset()
 
-    def configure_training_stage(self) -> int:
-        num_trainable = self.model.configure_training_stage()
+    def configure_train_mode(self) -> int:
+        num_trainable = self.model.configure_train_mode()
         if num_trainable == 0:
-            raise RuntimeError(
-                f"SmolW training_stage={self.config.training_stage!r} left no trainable parameters."
-            )
+            raise RuntimeError(f"SmolW train_mode={self.config.train_mode!r} left no trainable parameters.")
         logging.info(
-            "Configured SmolW training_stage=%s with %d trainable parameters.",
-            self.config.training_stage,
+            "Configured SmolW train_mode=%s with %d trainable parameters.",
+            self.config.train_mode,
             num_trainable,
         )
         return num_trainable
 
     def get_optim_params(self):
-        self.configure_training_stage()
+        self.configure_train_mode()
         return (parameter for parameter in self.parameters() if parameter.requires_grad)
 
     def reset(self) -> None:
@@ -773,15 +718,6 @@ class SmolWPolicy(SmolVLAPolicy):
                 )
         return frames.index_select(1, past_positions), frames.index_select(1, future_positions)
 
-    def prepare_future_visual_pair(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """Apply the regular VLM preprocessing to t and the future endpoint."""
-        frames = self._temporal_motion_frames(batch)
-        current_frame = frames[:, self.config.current_observation_position]
-        future_frame = frames[:, self.config.future_motion_positions[-1]]
-        current_images, _ = super().prepare_images({self.motion_camera_key: current_frame})
-        future_images, _ = super().prepare_images({self.motion_camera_key: future_frame})
-        return current_images[0], future_images[0]
-
     def _append_current_motion_frame(self, batch: dict[str, Tensor]) -> None:
         frames = batch.get(self.motion_camera_key)
         if frames is None:
@@ -864,6 +800,7 @@ class SmolWPolicy(SmolVLAPolicy):
         self,
         batch: dict[str, Tensor],
         noise: Tensor | None = None,
+        z_noise: Tensor | None = None,
         time: Tensor | None = None,
         reduction: str = "mean",
     ) -> tuple[Tensor, dict[str, float | list[float]]]:
@@ -874,27 +811,22 @@ class SmolWPolicy(SmolVLAPolicy):
             batch = dict(batch)
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION].clone())
 
-        stage = self.config.training_stage
-        compute_world_model = stage in {"world_model", "joint"}
-        compute_flow = stage in {"action_expert_only", "joint"}
+        train_mode = self.config.train_mode
+        compute_motion_loss = train_mode in {"motion_only", "jointly"}
+        compute_flow = train_mode in {"action_only", "jointly"}
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch) if compute_flow else None
 
-        future_motion_target = None
-        current_visual_image = None
-        future_visual_image = None
-        if compute_world_model:
-            past_frames, future_frames = self.prepare_motion_clips(batch)
-            past_motion, future_motion_target = self.motion_extractor.encode_pair(
-                past_frames,
-                future_frames,
-            )
-            if self.config.future_visual_loss_weight > 0:
-                current_visual_image, future_visual_image = self.prepare_future_visual_pair(batch)
-        else:
-            past_frames = self.prepare_past_motion_clip(batch)
-            past_motion = self.motion_extractor.encode(past_frames)
+        past_frames, future_frames = self.prepare_motion_clips(batch)
+        past_motion, future_motion_target = self.motion_extractor.encode_pair(
+            past_frames,
+            future_frames,
+        )
+        # action_only isolates action learning by pretending the motion
+        # predictor is perfect. jointly must use its own prediction so action
+        # gradients can train the complete causal chain.
+        z_motion_source = future_motion_target if train_mode == "action_only" else None
 
         output = self.model.forward(
             images,
@@ -905,11 +837,11 @@ class SmolWPolicy(SmolVLAPolicy):
             past_motion,
             actions=actions,
             future_motion_target=future_motion_target,
-            current_visual_image=current_visual_image,
-            future_visual_image=future_visual_image,
+            z_motion_source=z_motion_source,
             noise=noise,
+            z_noise=z_noise,
             time=time,
-            compute_world_model=compute_world_model,
+            compute_motion_loss=compute_motion_loss,
             compute_flow=compute_flow,
         )
 
@@ -935,16 +867,24 @@ class SmolWPolicy(SmolVLAPolicy):
                 per_sample_flow = masked_flow.sum(dim=(1, 2)) / (per_sample_steps * action_dim)
                 flow_loss = masked_flow.sum() / (valid_steps * action_dim)
                 loss_per_dim = masked_flow.sum(dim=(0, 1)) / valid_steps
-            scalar_terms.append(flow_loss)
-            per_sample_terms.append(per_sample_flow)
+            per_sample_z_flow = output["z_flow_losses"]
+            z_flow_loss = per_sample_z_flow.mean()
+            weighted_z_flow = self.config.z_loss_weight * z_flow_loss
+            combined_flow_loss = flow_loss + weighted_z_flow
+            scalar_terms.append(combined_flow_loss)
+            per_sample_terms.append(per_sample_flow + self.config.z_loss_weight * per_sample_z_flow)
             metrics.update(
                 {
-                    "flow_loss": flow_loss.item(),
+                    "flow_loss": combined_flow_loss.item(),
+                    "action_flow_loss": flow_loss.item(),
+                    "z_flow_loss": z_flow_loss.item(),
+                    "weighted_z_flow_loss": weighted_z_flow.item(),
                     "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
+                    "z_target_rms": output["z_target"].float().square().mean().sqrt().item(),
                 }
             )
 
-        if compute_world_model:
+        if compute_motion_loss:
             per_sample_motion = output["motion_losses"]
             motion_loss = per_sample_motion.mean()
             weighted_motion = self.config.motion_loss_weight * motion_loss
@@ -957,24 +897,9 @@ class SmolWPolicy(SmolVLAPolicy):
                     "target_motion_rms": future_motion_target.float().square().mean().sqrt().item(),
                 }
             )
-            if self.config.future_visual_loss_weight > 0:
-                per_sample_visual = output["future_visual_losses"]
-                visual_loss = per_sample_visual.mean()
-                weighted_visual = self.config.future_visual_loss_weight * visual_loss
-                scalar_terms.append(weighted_visual)
-                per_sample_terms.append(self.config.future_visual_loss_weight * per_sample_visual)
-                metrics.update(
-                    {
-                        "future_visual_loss": visual_loss.item(),
-                        "weighted_future_visual_loss": weighted_visual.item(),
-                        "future_visual_smooth_l1": output["future_visual_smooth_l1_losses"].mean().item(),
-                        "future_visual_cosine": output["future_visual_cosine_losses"].mean().item(),
-                        "copy_current_visual_loss": output["copy_current_visual_losses"].mean().item(),
-                    }
-                )
 
         if not scalar_terms:
-            raise RuntimeError(f"SmolW stage {stage!r} did not produce any training objective.")
+            raise RuntimeError(f"SmolW train_mode {train_mode!r} did not produce any training objective.")
         total_loss = torch.stack(scalar_terms).sum()
         per_sample_total = torch.stack(per_sample_terms, dim=0).sum(dim=0)
         metrics.update(
@@ -988,6 +913,8 @@ class SmolWPolicy(SmolVLAPolicy):
                 .item(),
             }
         )
+        if train_mode == "action_only":
+            metrics["oracle_motion_rms"] = future_motion_target.float().square().mean().sqrt().item()
         if reduction == "none":
             return per_sample_total, metrics
         return total_loss, metrics
@@ -998,10 +925,10 @@ class SmolWPolicy(SmolVLAPolicy):
             "mt_query_embedding",
             "past_motion_projector",
             "future_motion_head",
-            "future_motion_condition_proj",
-            "future_visual_queries",
-            "future_motion_visual_proj",
-            "future_visual_decoder",
-            "future_visual_out_proj",
+            "future_motion_to_z",
+            "z_in_proj",
+            "z_time_mlp_in",
+            "z_time_mlp_out",
+            "z_out_proj",
         ]
         return defaults
