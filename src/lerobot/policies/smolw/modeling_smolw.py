@@ -14,11 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SmolW: SmolVLA conditioned on predicted VidTwin latent motion."""
+"""SmolW: joint flow matching over VidTwin z tokens and an action chunk."""
 
 from __future__ import annotations
 
-import logging
 from collections import deque
 from typing import Unpack
 
@@ -44,21 +43,17 @@ from .vidtwin_motion_encoder import VidTwinMotionExtractor
 
 
 class SmolWFlowMatching(VLAFlowMatching):
-    """Original SmolVLA action expert with a future-motion suffix condition."""
+    """Joint flow matching over future VidTwin z and the action chunk."""
 
     def __init__(self, config: SmolWConfig, rtc_processor=None):
         # The parent compiles its methods inside __init__. Delay compilation
         # until all SmolW modules exist so torch.compile sees the final graph.
         compile_model = config.compile_model
-        train_expert_only = config.train_expert_only
         config.compile_model = False
-        # Mode-specific freezing is applied after all SmolW modules exist.
-        config.train_expert_only = False
         try:
             super().__init__(config, rtc_processor=rtc_processor)
         finally:
             config.compile_model = compile_model
-            config.train_expert_only = train_expert_only
 
         self.config = config
         vlm_hidden_size = self.vlm_with_expert.config.text_config.hidden_size
@@ -71,12 +66,6 @@ class SmolWFlowMatching(VLAFlowMatching):
             nn.SiLU(),
             nn.Linear(config.motion_projector_hidden_dim, vlm_hidden_size),
         )
-        self.future_motion_head = nn.Sequential(
-            nn.LayerNorm(vlm_hidden_size),
-            nn.Linear(vlm_hidden_size, config.motion_projector_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(config.motion_projector_hidden_dim, config.motion_latent_dim),
-        )
         # Flow matching operates directly in VidTwin's fixed, normalized
         # per-temporal-slot space. Only the noisy z *input* is projected into
         # the expert width; the regression target itself has no learned map.
@@ -84,85 +73,13 @@ class SmolWFlowMatching(VLAFlowMatching):
         self.z_time_mlp_in = nn.Linear(expert_hidden_size * 2, expert_hidden_size)
         self.z_time_mlp_out = nn.Linear(expert_hidden_size, expert_hidden_size)
         self.z_token_out_proj = nn.Linear(expert_hidden_size, config.motion_token_dim)
-        self.register_buffer("z_condition_step", torch.zeros((), dtype=torch.long), persistent=True)
 
         nn.init.normal_(self.mt_query_embedding.weight, mean=0.0, std=0.02)
-        self._train_mode_configured = False
-        self.configure_train_mode()
 
         if compile_model:
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
-
-    @staticmethod
-    def _is_motion_parameter(name: str) -> bool:
-        is_vlm = name.startswith("vlm_with_expert.vlm.") and not name.startswith(
-            "vlm_with_expert.vlm.lm_head."
-        )
-        return is_vlm or name.startswith(
-            (
-                "state_proj.",
-                "mt_query_embedding.",
-                "past_motion_projector.",
-                "future_motion_head.",
-            )
-        )
-
-    @staticmethod
-    def _is_action_expert_parameter(name: str) -> bool:
-        return name.startswith("vlm_with_expert.lm_expert.") or name.startswith(
-            (
-                "state_proj.",
-                "action_in_proj.",
-                "action_out_proj.",
-                "action_time_mlp_in.",
-                "action_time_mlp_out.",
-                "z_token_in_proj.",
-                "z_time_mlp_in.",
-                "z_time_mlp_out.",
-                "z_token_out_proj.",
-            )
-        )
-
-    def configure_train_mode(self) -> int:
-        """Freeze everything outside the selected train mode before optimizer setup."""
-        mode = self.config.train_mode
-        first_configuration = not self._train_mode_configured
-        for name, parameter in self.named_parameters():
-            is_motion = self._is_motion_parameter(name)
-            is_expert = self._is_action_expert_parameter(name)
-            is_frozen_vision = self.config.freeze_vision_encoder and name.startswith(
-                "vlm_with_expert.vlm.model.vision_model."
-            )
-            included = (mode in {"motion_only", "jointly"} and is_motion) or (
-                mode in {"action_only", "jointly"} and is_expert
-            )
-            if name.startswith("state_proj.") and not self.config.train_state_proj:
-                included = False
-            if first_configuration:
-                # Preserve tensors that the original SmolVLA implementation
-                # freezes because they are unused by its truncated VLM/expert
-                # layer pairing. Re-enabling them breaks DDP without
-                # find_unused_parameters=True.
-                parameter.requires_grad_(parameter.requires_grad and included and not is_frozen_vision)
-            elif not included or is_frozen_vision:
-                # Re-run after PEFT injection without re-enabling base tensors
-                # that PEFT deliberately froze.
-                parameter.requires_grad_(False)
-
-        self._train_mode_configured = True
-        return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if self.config.freeze_vision_encoder:
-            self.vlm_with_expert.get_vlm_model().vision_model.eval()
-        if self.config.train_mode == "action_only":
-            # action_only consumes an oracle future-motion condition and keeps
-            # the complete motion/VLM path frozen.
-            self.vlm_with_expert.vlm.eval()
-        return self
 
     def embed_prefix_with_motion(
         self,
@@ -205,28 +122,20 @@ class SmolWFlowMatching(VLAFlowMatching):
             torch.cat([prefix_att_masks, query_attention], dim=1),
         )
 
-    def predict_future_motion(self, prefix_out: Tensor) -> Tensor:
-        """Decode future VidTwin motion from the final M_t hidden state."""
-        query_hidden = prefix_out[:, -1, :]
-        head_dtype = self.future_motion_head[1].weight.dtype
-        return self.future_motion_head(query_hidden.to(dtype=head_dtype)).float()
-
     def motion_to_z(self, future_motion: Tensor) -> Tensor:
         """Split and normalize flattened VidTwin motion into 16 fixed z targets."""
         if future_motion.ndim != 2 or future_motion.shape[-1] != self.config.motion_latent_dim:
             raise ValueError(
                 f"future_motion must have shape [B, motion_latent_dim], got {tuple(future_motion.shape)}."
             )
-        motion_for_z = future_motion.detach() if self.config.detach_motion_condition else future_motion
-        motion_tokens = motion_for_z.reshape(
-            motion_for_z.shape[0],
+        motion_tokens = future_motion.reshape(
+            future_motion.shape[0],
             self.config.vidtwin_num_frames,
             self.config.motion_token_dim,
         )
         # Layer normalization has no affine parameters here: target semantics
         # stay fixed throughout training and across checkpoints.
-        z = F.layer_norm(motion_tokens.float(), (self.config.motion_token_dim,))
-        return z * self.config.motion_condition_scale
+        return F.layer_norm(motion_tokens.float(), (self.config.motion_token_dim,))
 
     def embed_action_z_suffix(
         self,
@@ -271,7 +180,7 @@ class SmolWFlowMatching(VLAFlowMatching):
             action_att_masks,
         )
 
-    def run_motion_prefix(
+    def run_condition_prefix(
         self,
         images,
         img_masks,
@@ -279,7 +188,7 @@ class SmolWFlowMatching(VLAFlowMatching):
         lang_masks,
         state: Tensor,
         past_motion: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, dict]:
+    ) -> tuple[Tensor, dict]:
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix_with_motion(
             images,
             img_masks,
@@ -290,7 +199,7 @@ class SmolWFlowMatching(VLAFlowMatching):
         )
         prefix_attention = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        (prefix_out, _), past_key_values = self.vlm_with_expert.forward(
+        _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_attention,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -298,14 +207,7 @@ class SmolWFlowMatching(VLAFlowMatching):
             use_cache=True,
             fill_kv_cache=True,
         )
-        predicted_future_motion = self.predict_future_motion(prefix_out)
-        return (
-            predicted_future_motion,
-            prefix_pad_masks,
-            prefix_att_masks,
-            prefix_position_ids,
-            past_key_values,
-        )
+        return prefix_pad_masks, past_key_values
 
     @staticmethod
     def make_action_attention(
@@ -341,7 +243,6 @@ class SmolWFlowMatching(VLAFlowMatching):
         z_pad_masks: Tensor,
         action_pad_masks: Tensor,
         action_att_masks: Tensor,
-        action_can_see_z: bool = True,
     ) -> tuple[Tensor, Tensor]:
         """Build attention for ``[z_1,...,z_16,a_1,...,a_H]``.
 
@@ -373,20 +274,8 @@ class SmolWFlowMatching(VLAFlowMatching):
         )
         z_rows = torch.cat([z_prefix_attention, z_self_attention, z_action_attention], dim=2)
 
-        # action rows: original prefix + optional z condition + original
-        # action mask. Warmup disables action->z; z flow remains in the graph
-        # but its effective loss weight is zeroed by the policy wrapper.
-        action_z_attention = (
-            z_pad_masks[:, None, :].expand(batch_size, horizon, z_count)
-            if action_can_see_z
-            else torch.zeros(
-                batch_size,
-                horizon,
-                z_count,
-                dtype=torch.bool,
-                device=action_pad_masks.device,
-            )
-        )
+        # action rows: original prefix + every z token + original action mask.
+        action_z_attention = z_pad_masks[:, None, :].expand(batch_size, horizon, z_count)
         action_rows = torch.cat(
             [
                 action_attention[:, :, :prefix_len],
@@ -419,23 +308,14 @@ class SmolWFlowMatching(VLAFlowMatching):
         lang_masks,
         state: Tensor,
         past_motion: Tensor,
-        actions: Tensor | None = None,
-        future_motion_target: Tensor | None = None,
-        z_motion_source: Tensor | None = None,
+        actions: Tensor,
+        future_motion: Tensor,
         noise: Tensor | None = None,
         z_noise: Tensor | None = None,
         time: Tensor | None = None,
-        compute_motion_loss: bool = True,
-        compute_flow: bool = True,
-    ) -> dict[str, Tensor | bool | int]:
-        """Run the selected motion-regression and/or action objectives."""
-        (
-            predicted_future_motion,
-            prefix_pad_masks,
-            _,
-            _,
-            past_key_values,
-        ) = self.run_motion_prefix(
+    ) -> dict[str, Tensor]:
+        """Train joint flow matching over GT future-video z and actions."""
+        prefix_pad_masks, past_key_values = self.run_condition_prefix(
             images,
             img_masks,
             lang_tokens,
@@ -443,90 +323,53 @@ class SmolWFlowMatching(VLAFlowMatching):
             state,
             past_motion,
         )
-        output = {
-            "predicted_future_motion": predicted_future_motion,
-        }
+        z_target = self.motion_to_z(future_motion)
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+        if z_noise is None:
+            z_noise = self.sample_noise(z_target.shape, z_target.device)
+        elif z_noise.shape != z_target.shape:
+            raise ValueError(f"z_noise must have shape {tuple(z_target.shape)}, got {tuple(z_noise.shape)}.")
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
 
-        if compute_motion_loss:
-            if future_motion_target is None:
-                raise ValueError("Motion training requires future_motion_target.")
-            output["motion_losses"] = F.smooth_l1_loss(
-                predicted_future_motion,
-                future_motion_target.float(),
-                reduction="none",
-            ).mean(dim=-1)
-
-        if compute_flow:
-            if actions is None:
-                raise ValueError("Action-expert training requires actions.")
-            if z_motion_source is None:
-                z_motion_source = predicted_future_motion
-            elif z_motion_source.shape != predicted_future_motion.shape:
-                raise ValueError(
-                    "z_motion_source must match predicted future-motion shape; got "
-                    f"{tuple(z_motion_source.shape)} and {tuple(predicted_future_motion.shape)}."
-                )
-            z_target = self.motion_to_z(z_motion_source)
-            if noise is None:
-                noise = self.sample_noise(actions.shape, actions.device)
-            if z_noise is None:
-                z_noise = self.sample_noise(z_target.shape, z_target.device)
-            elif z_noise.shape != z_target.shape:
-                raise ValueError(
-                    f"z_noise must have shape {tuple(z_target.shape)}, got {tuple(z_noise.shape)}."
-                )
-            if time is None:
-                time = self.sample_time(actions.shape[0], actions.device)
-
-            time_expanded = time[:, None, None]
-            action_x_t = time_expanded * noise + (1 - time_expanded) * actions
-            action_u_t = noise - actions
-            z_time = time[:, None, None]
-            z_x_t = z_time * z_noise + (1 - z_time) * z_target
-            z_u_t = z_noise - z_target
-            suffix_embs, z_pad_masks, action_pad_masks, action_att_masks = self.embed_action_z_suffix(
-                action_x_t,
-                z_x_t,
-                time,
-            )
-            z_condition_step = int(self.z_condition_step.item())
-            action_can_see_z = not self.training or z_condition_step >= self.config.z_condition_warmup_steps
-            attention, position_ids = self.make_action_z_attention(
-                prefix_pad_masks,
-                z_pad_masks,
-                action_pad_masks,
-                action_att_masks,
-                action_can_see_z=action_can_see_z,
-            )
-            outputs_embeds, _ = self.vlm_with_expert.forward(
-                attention_mask=attention,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=[None, suffix_embs],
-                use_cache=True,
-                fill_kv_cache=False,
-            )
-            suffix_length = self.config.vidtwin_num_frames + self.config.chunk_size
-            suffix_out = outputs_embeds[1][:, -suffix_length:].float()
-            z_velocity = self.z_token_out_proj(suffix_out[:, : self.config.vidtwin_num_frames])
-            action_velocity = self.action_out_proj(suffix_out[:, self.config.vidtwin_num_frames :])
-            output["flow_losses"] = F.mse_loss(action_u_t, action_velocity, reduction="none")
-            output["z_flow_losses"] = F.mse_loss(
+        time_expanded = time[:, None, None]
+        action_x_t = time_expanded * noise + (1 - time_expanded) * actions
+        action_u_t = noise - actions
+        z_x_t = time_expanded * z_noise + (1 - time_expanded) * z_target
+        z_u_t = z_noise - z_target
+        suffix_embs, z_pad_masks, action_pad_masks, action_att_masks = self.embed_action_z_suffix(
+            action_x_t,
+            z_x_t,
+            time,
+        )
+        attention, position_ids = self.make_action_z_attention(
+            prefix_pad_masks,
+            z_pad_masks,
+            action_pad_masks,
+            action_att_masks,
+        )
+        outputs_embeds, _ = self.vlm_with_expert.forward(
+            attention_mask=attention,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=True,
+            fill_kv_cache=False,
+        )
+        suffix_length = self.config.vidtwin_num_frames + self.config.chunk_size
+        suffix_out = outputs_embeds[1][:, -suffix_length:].float()
+        z_velocity = self.z_token_out_proj(suffix_out[:, : self.config.vidtwin_num_frames])
+        action_velocity = self.action_out_proj(suffix_out[:, self.config.vidtwin_num_frames :])
+        return {
+            "flow_losses": F.mse_loss(action_u_t, action_velocity, reduction="none"),
+            "z_flow_losses": F.mse_loss(
                 z_u_t.float(),
                 z_velocity.float(),
                 reduction="none",
-            ).mean(dim=(1, 2))
-            output["z_motion_source"] = z_motion_source
-            output["z_target"] = z_target
-            output["z_condition_active"] = action_can_see_z
-            output["z_condition_step"] = z_condition_step
-            if self.training:
-                # One increment per optimizer-bound forward. All DDP ranks run
-                # the same number of forwards, and this persistent buffer is
-                # restored when resuming from a checkpoint.
-                self.z_condition_step.add_(1)
-
-        return output
+            ).mean(dim=(1, 2)),
+            "z_target": z_target,
+        }
 
     @torch.no_grad()
     def sample_actions(
@@ -544,7 +387,7 @@ class SmolWFlowMatching(VLAFlowMatching):
         """Jointly denoise 16 temporal z tokens and H actions, then return actions."""
         batch_size = state.shape[0]
         device = state.device
-        _, prefix_pad_masks, _, _, past_key_values = self.run_motion_prefix(
+        prefix_pad_masks, past_key_values = self.run_condition_prefix(
             images,
             img_masks,
             lang_tokens,
@@ -674,19 +517,7 @@ class SmolWPolicy(SmolVLAPolicy):
         )
         self.reset()
 
-    def configure_train_mode(self) -> int:
-        num_trainable = self.model.configure_train_mode()
-        if num_trainable == 0:
-            raise RuntimeError(f"SmolW train_mode={self.config.train_mode!r} left no trainable parameters.")
-        logging.info(
-            "Configured SmolW train_mode=%s with %d trainable parameters.",
-            self.config.train_mode,
-            num_trainable,
-        )
-        return num_trainable
-
     def get_optim_params(self):
-        self.configure_train_mode()
         return (parameter for parameter in self.parameters() if parameter.requires_grad)
 
     def reset(self) -> None:
@@ -887,22 +718,15 @@ class SmolWPolicy(SmolVLAPolicy):
             batch = dict(batch)
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION].clone())
 
-        train_mode = self.config.train_mode
-        compute_motion_loss = train_mode in {"motion_only", "jointly"}
-        compute_flow = train_mode in {"action_only", "jointly"}
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
-        actions = self.prepare_action(batch) if compute_flow else None
+        actions = self.prepare_action(batch)
 
         past_frames, future_frames = self.prepare_motion_clips(batch)
-        past_motion, future_motion_target = self.motion_extractor.encode_pair(
+        past_motion, future_motion = self.motion_extractor.encode_pair(
             past_frames,
             future_frames,
         )
-        # action_only isolates action learning by pretending the motion
-        # predictor is perfect. jointly must use its own prediction so action
-        # gradients can train the complete causal chain.
-        z_motion_source = future_motion_target if train_mode == "action_only" else None
 
         output = self.model.forward(
             images,
@@ -911,93 +735,46 @@ class SmolWPolicy(SmolVLAPolicy):
             batch[OBS_LANGUAGE_ATTENTION_MASK],
             state,
             past_motion,
-            actions=actions,
-            future_motion_target=future_motion_target,
-            z_motion_source=z_motion_source,
+            actions,
+            future_motion,
             noise=noise,
             z_noise=z_noise,
             time=time,
-            compute_motion_loss=compute_motion_loss,
-            compute_flow=compute_flow,
         )
 
-        scalar_terms: list[Tensor] = []
-        per_sample_terms: list[Tensor] = []
-        metrics: dict[str, float | list[float]] = {}
-        if compute_flow:
-            action_dim = self.config.action_feature.shape[0]
-            flow_losses = output["flow_losses"][:, :, :action_dim]
-            actions_is_pad = batch.get("action_is_pad")
-            if actions_is_pad is None:
-                per_sample_flow = flow_losses.mean(dim=(1, 2))
-                flow_loss = per_sample_flow.mean()
-                loss_per_dim = flow_losses.mean(dim=(0, 1))
-            else:
-                valid = (~actions_is_pad.bool()).to(
-                    dtype=flow_losses.dtype,
-                    device=flow_losses.device,
-                )
-                masked_flow = flow_losses * valid.unsqueeze(-1)
-                valid_steps = valid.sum().clamp_min(1)
-                per_sample_steps = valid.sum(dim=1).clamp_min(1)
-                per_sample_flow = masked_flow.sum(dim=(1, 2)) / (per_sample_steps * action_dim)
-                flow_loss = masked_flow.sum() / (valid_steps * action_dim)
-                loss_per_dim = masked_flow.sum(dim=(0, 1)) / valid_steps
-            per_sample_z_flow = output["z_flow_losses"]
-            z_flow_loss = per_sample_z_flow.mean()
-            # During action warmup, keep the z branch in the graph (important
-            # for DDP) but give it exactly zero gradient. At the same boundary
-            # action->z attention and the configured z objective turn on.
-            effective_z_loss_weight = self.config.z_loss_weight if output["z_condition_active"] else 0.0
-            weighted_z_flow = effective_z_loss_weight * z_flow_loss
-            combined_flow_loss = flow_loss + weighted_z_flow
-            scalar_terms.append(combined_flow_loss)
-            per_sample_terms.append(per_sample_flow + effective_z_loss_weight * per_sample_z_flow)
-            metrics.update(
-                {
-                    "flow_loss": combined_flow_loss.item(),
-                    "action_flow_loss": flow_loss.item(),
-                    "z_flow_loss": z_flow_loss.item(),
-                    "weighted_z_flow_loss": weighted_z_flow.item(),
-                    "effective_z_loss_weight": float(effective_z_loss_weight),
-                    "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
-                    "z_target_rms": output["z_target"].float().square().mean().sqrt().item(),
-                    "z_condition_active": float(output["z_condition_active"]),
-                    "z_condition_step": float(output["z_condition_step"]),
-                }
+        action_dim = self.config.action_feature.shape[0]
+        flow_losses = output["flow_losses"][:, :, :action_dim]
+        actions_is_pad = batch.get("action_is_pad")
+        if actions_is_pad is None:
+            per_sample_flow = flow_losses.mean(dim=(1, 2))
+            action_flow_loss = per_sample_flow.mean()
+            loss_per_dim = flow_losses.mean(dim=(0, 1))
+        else:
+            valid = (~actions_is_pad.bool()).to(
+                dtype=flow_losses.dtype,
+                device=flow_losses.device,
             )
+            masked_flow = flow_losses * valid.unsqueeze(-1)
+            valid_steps = valid.sum().clamp_min(1)
+            per_sample_steps = valid.sum(dim=1).clamp_min(1)
+            per_sample_flow = masked_flow.sum(dim=(1, 2)) / (per_sample_steps * action_dim)
+            action_flow_loss = masked_flow.sum() / (valid_steps * action_dim)
+            loss_per_dim = masked_flow.sum(dim=(0, 1)) / valid_steps
 
-        if compute_motion_loss:
-            per_sample_motion = output["motion_losses"]
-            motion_loss = per_sample_motion.mean()
-            weighted_motion = self.config.motion_loss_weight * motion_loss
-            scalar_terms.append(weighted_motion)
-            per_sample_terms.append(self.config.motion_loss_weight * per_sample_motion)
-            metrics.update(
-                {
-                    "motion_loss": motion_loss.item(),
-                    "weighted_motion_loss": weighted_motion.item(),
-                    "target_motion_rms": future_motion_target.float().square().mean().sqrt().item(),
-                }
-            )
-
-        if not scalar_terms:
-            raise RuntimeError(f"SmolW train_mode {train_mode!r} did not produce any training objective.")
-        total_loss = torch.stack(scalar_terms).sum()
-        per_sample_total = torch.stack(per_sample_terms, dim=0).sum(dim=0)
-        metrics.update(
-            {
-                "loss": total_loss.item(),
-                "predicted_motion_rms": output["predicted_future_motion"]
-                .float()
-                .square()
-                .mean()
-                .sqrt()
-                .item(),
-            }
-        )
-        if train_mode == "action_only":
-            metrics["oracle_motion_rms"] = future_motion_target.float().square().mean().sqrt().item()
+        per_sample_z_flow = output["z_flow_losses"]
+        z_flow_loss = per_sample_z_flow.mean()
+        weighted_z_flow = self.config.z_loss_weight * z_flow_loss
+        total_loss = action_flow_loss + weighted_z_flow
+        per_sample_total = per_sample_flow + self.config.z_loss_weight * per_sample_z_flow
+        metrics: dict[str, float | list[float]] = {
+            "loss": total_loss.item(),
+            "flow_loss": total_loss.item(),
+            "action_flow_loss": action_flow_loss.item(),
+            "z_flow_loss": z_flow_loss.item(),
+            "weighted_z_flow_loss": weighted_z_flow.item(),
+            "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
+            "z_target_rms": output["z_target"].float().square().mean().sqrt().item(),
+        }
         if reduction == "none":
             return per_sample_total, metrics
         return total_loss, metrics
@@ -1007,7 +784,6 @@ class SmolWPolicy(SmolVLAPolicy):
         defaults["modules_to_save"] = [
             "mt_query_embedding",
             "past_motion_projector",
-            "future_motion_head",
             "z_token_in_proj",
             "z_time_mlp_in",
             "z_time_mlp_out",

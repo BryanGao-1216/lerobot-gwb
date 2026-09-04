@@ -16,9 +16,8 @@
 
 """Convert an original SmolVLA artifact into a SmolW base artifact.
 
-Only shape-compatible original SmolVLA tensors are transferred. The M_t query,
-motion prediction head, and temporal z flow modules retain their SmolW
-initialization.
+Only shape-compatible original SmolVLA tensors are transferred. The M_t query
+and temporal z flow modules retain their SmolW initialization.
 
 Example:
 
@@ -56,7 +55,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-stride", type=int, default=1)
     parser.add_argument("--n-action-steps", type=int)
     parser.add_argument("--motion-camera-key")
-    parser.add_argument("--motion-loss-weight", type=float, default=1.0)
     parser.add_argument("--motion-latent-dim", type=int, default=1792)
     parser.add_argument(
         "--overwrite",
@@ -94,10 +92,7 @@ def _make_target_config(source_policy: SmolVLAPolicy, args: argparse.Namespace) 
             "vidtwin_checkpoint_path": str(args.vidtwin_checkpoint_path.expanduser().resolve()),
             "vidtwin_sample_posterior": False,
             "motion_camera_key": args.motion_camera_key,
-            "motion_loss_weight": args.motion_loss_weight,
             "motion_latent_dim": args.motion_latent_dim,
-            "train_mode": "motion_only",
-            "training_stage": None,
             "train_expert_only": False,
             # The converter transfers the complete original SmolVLA state, so
             # the target does not need to download VLM weights a second time.
@@ -126,12 +121,10 @@ def _copy_compatible_weights(source_policy: SmolVLAPolicy, target_policy: SmolWP
     expected_new_prefixes = (
         "model.mt_query_embedding.",
         "model.past_motion_projector.",
-        "model.future_motion_head.",
         "model.z_token_in_proj.",
         "model.z_time_mlp_in.",
         "model.z_time_mlp_out.",
         "model.z_token_out_proj.",
-        "model.z_condition_step",
     )
     unmatched_missing = [key for key in missing_keys if not key.startswith(expected_new_prefixes)]
     logging.info(
