@@ -1,27 +1,18 @@
-#!/usr/bin/env bash
+export CUDA_VISIBLE_DEVICES=0,2
 
-set -euo pipefail
-
-export CUDA_VISIBLE_DEVICES=0,2,5
-
-HORIZON="${HORIZON:-20}"
+HORIZON="${HORIZON:-16}"
+N_ACTION_STEPS="${N_ACTION_STEPS:-${HORIZON}}"
 MEMORY_STRIDE="${MEMORY_STRIDE:-1}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
-TRAIN_MODE="${TRAIN_MODE:-motion_only}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-libero}"
+
+
+OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-pret}"
 TENSORBOARD_LOG_DIR="${TENSORBOARD_LOG_DIR:-${OUTPUT_DIR}/tensorboard}"
 
-case "${TRAIN_MODE}" in
-  motion_only|action_only|jointly) ;;
-  *)
-    echo "TRAIN_MODE must be motion_only, action_only, or jointly; got: ${TRAIN_MODE}" >&2
-    exit 2
-    ;;
-esac
 
 accelerate launch \
   --multi_gpu \
-  --num_processes=3 \
+  --num_processes=2 \
   --num_machines=1 \
   --main_process_port=25901 \
   "$(which lerobot-train)" \
@@ -31,11 +22,14 @@ accelerate launch \
   --policy.motion_horizon="${HORIZON}" \
   --policy.memory_stride="${MEMORY_STRIDE}" \
   --policy.chunk_size="${HORIZON}" \
-  --policy.n_action_steps="${HORIZON}" \
-  --policy.drop_n_last_frames="${HORIZON}" \
-  --policy.train_mode="${TRAIN_MODE}" \
-  --policy.z_loss_weight=1.0 \
+  --policy.training_stage=world_model \
+  --policy.train_expert_only=false \
+  --policy.use_peft=false \
   --policy.freeze_vision_encoder=true \
+  --policy.vidtwin_sample_posterior=false \
+  --policy.motion_loss_weight=1.0 \
+  --policy.future_visual_loss_weight=1.0 \
+  --policy.future_visual_cosine_weight=0.1 \
   --policy.input_features=null \
   --policy.output_features=null \
   --dataset_type=lerobot \
