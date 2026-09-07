@@ -615,14 +615,9 @@ class SmolWPolicy(SmolVLAPolicy):
             dtype=torch.long,
             device=frames.device,
         )
-        future_pad_key = f"{self.motion_camera_key}_is_pad"
-        if future_pad_key in batch:
-            future_is_pad = batch[future_pad_key].index_select(1, future_positions).bool()
-            if torch.any(future_is_pad):
-                raise ValueError(
-                    "SmolW received padded future frames. Ensure the LeRobot sampler uses "
-                    "config.drop_n_last_frames >= motion_horizon."
-                )
+        # LeRobot clamps indices beyond an episode to its final frame. Keep
+        # those repeated frames: they define the intended absorbing/static
+        # future used by the VidTwin z target near episode boundaries.
         return frames.index_select(1, past_positions), frames.index_select(1, future_positions)
 
     def _append_current_motion_frame(self, batch: dict[str, Tensor]) -> None:

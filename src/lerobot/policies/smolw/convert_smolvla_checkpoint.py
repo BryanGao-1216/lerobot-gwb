@@ -44,6 +44,7 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 
 from .configuration_smolw import SmolWConfig
 from .modeling_smolw import SmolWPolicy
+from .processor_smolw import reconcile_smolw_processors
 
 
 def _parse_args() -> argparse.Namespace:
@@ -88,7 +89,7 @@ def _make_target_config(source_policy: SmolVLAPolicy, args: argparse.Namespace) 
             "n_action_steps": args.n_action_steps or args.motion_horizon,
             "motion_horizon": args.motion_horizon,
             "memory_stride": args.memory_stride,
-            "drop_n_last_frames": args.motion_horizon,
+            "drop_n_last_frames": 0,
             "vidtwin_checkpoint_path": str(args.vidtwin_checkpoint_path.expanduser().resolve()),
             "vidtwin_sample_posterior": False,
             "motion_camera_key": args.motion_camera_key,
@@ -145,10 +146,16 @@ def convert(args: argparse.Namespace) -> Path:
     _copy_compatible_weights(source_policy, target_policy)
     target_policy.save_pretrained(output_dir)
 
-    # SmolW deliberately retains the original SmolVLA processor contract.
+    # Retain the original normalization/tokenization state and insert SmolW's
+    # raw-space stationary episode-tail action handling.
     preprocessor, postprocessor = make_pre_post_processors(
         source_policy.config,
         pretrained_path=args.source,
+    )
+    preprocessor, postprocessor = reconcile_smolw_processors(
+        target_config,
+        preprocessor,
+        postprocessor,
     )
     preprocessor.save_pretrained(
         output_dir,

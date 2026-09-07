@@ -9,10 +9,21 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.smolw.configuration_smolw import SmolWConfig
 from lerobot.policies.smolw.modeling_smolw import SmolWFlowMatching, SmolWPolicy
+from lerobot.policies.smolw.processor_smolw import (
+    SmolWStationaryActionPaddingProcessorStep,
+    reconcile_smolw_processors,
+)
 from lerobot.policies.smolw.vidtwin_motion_encoder import (
     _BUNDLED_VIDTWIN_CONFIG,
     VidTwinMotionExtractor,
     _get_obj_from_str,
+)
+from lerobot.processor import (
+    IdentityProcessorStep,
+    NormalizerProcessorStep,
+    PolicyProcessorPipeline,
+    batch_to_transition,
+    transition_to_batch,
 )
 from lerobot.utils.constants import (
     ACTION,
@@ -53,7 +64,8 @@ def test_config_builds_past_and_future_lerobot_timestamps():
     assert config.past_motion_positions == list(range(HORIZON))
     assert config.future_motion_positions == list(range(HORIZON, 2 * HORIZON))
     assert config.current_observation_position == HORIZON - 1
-    assert config.drop_n_last_frames == HORIZON
+    assert config.drop_n_last_frames == 0
+    assert config.stationary_action_hold_dims == [-1]
     assert config.motion_token_dim == 112
     assert not config.train_expert_only
     assert not config.vidtwin_sample_posterior
@@ -108,7 +120,7 @@ def test_config_can_be_saved_and_loaded(tmp_path):
 
     assert isinstance(loaded_config, SmolWConfig)
     assert loaded_config.observation_delta_indices == list(range(-15, HORIZON + 1))
-    assert loaded_config.drop_n_last_frames == HORIZON
+    assert loaded_config.drop_n_last_frames == 0
     assert not hasattr(loaded_config, "train_mode")
 
 
@@ -261,6 +273,77 @@ def test_motion_clips_use_strided_past_and_contiguous_future():
 
     assert torch.equal(past.flatten(), torch.tensor([0.0, 1.0, 2.0, 3.0]))
     assert torch.equal(future.flatten(), torch.tensor([4.0, 5.0, 6.0, 7.0]))
+
+
+def test_motion_clips_accept_repeated_terminal_future_frames():
+    policy = _temporal_policy()
+    frames = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0]).reshape(1, 8, 1, 1, 1)
+    is_pad = torch.tensor([[False, False, False, False, False, True, True, True]])
+
+    _, future = policy.prepare_motion_clips({CAMERA: frames, f"{CAMERA}_is_pad": is_pad})
+
+    assert torch.equal(future.flatten(), torch.tensor([4.0, 4.0, 4.0, 4.0]))
+
+
+def test_stationary_action_padding_is_raw_space_noop_and_becomes_valid():
+    actions = torch.tensor(
+        [
+            [
+                [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, -1.0],
+                [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.0],
+                [9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 1.0],
+                [9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 1.0],
+            ],
+            [
+                [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6, -1.0],
+                [-0.7, -0.8, -0.9, -1.0, -1.1, -1.2, -1.0],
+                [-1.3, -1.4, -1.5, -1.6, -1.7, -1.8, -1.0],
+                [8.0, 8.0, 8.0, 8.0, 8.0, 8.0, -1.0],
+            ],
+        ]
+    )
+    action_is_pad = torch.tensor(
+        [
+            [False, False, True, True],
+            [False, False, False, True],
+        ]
+    )
+    step = SmolWStationaryActionPaddingProcessorStep(hold_dims=[-1])
+
+    processed = transition_to_batch(
+        step(batch_to_transition({ACTION: actions, "action_is_pad": action_is_pad}))
+    )
+
+    expected_noop = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    assert torch.equal(processed[ACTION][0, 0:2], actions[0, 0:2])
+    assert torch.equal(processed[ACTION][0, 2], expected_noop)
+    assert torch.equal(processed[ACTION][0, 3], expected_noop)
+    assert torch.equal(
+        processed[ACTION][1, 3],
+        torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]),
+    )
+    assert not processed["action_is_pad"].any()
+
+
+def test_reconcile_inserts_stationary_padding_before_normalization():
+    preprocessor = PolicyProcessorPipeline(
+        steps=[
+            IdentityProcessorStep(),
+            NormalizerProcessorStep(features={}, norm_map={}),
+        ]
+    )
+    postprocessor = PolicyProcessorPipeline(steps=[])
+    config = SmolWConfig(
+        chunk_size=HORIZON,
+        n_action_steps=HORIZON,
+        motion_horizon=HORIZON,
+        device="cpu",
+    )
+
+    preprocessor, _ = reconcile_smolw_processors(config, preprocessor, postprocessor)
+
+    assert isinstance(preprocessor.steps[1], SmolWStationaryActionPaddingProcessorStep)
+    assert isinstance(preprocessor.steps[2], NormalizerProcessorStep)
 
 
 def test_inference_history_repeats_episode_start_and_respects_stride():

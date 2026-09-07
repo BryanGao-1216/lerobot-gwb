@@ -16,7 +16,7 @@
 
 """Configuration for SmolW, a joint VidTwin-z/action flow policy."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from lerobot.configs import PreTrainedConfig
 
@@ -62,9 +62,15 @@ class SmolWConfig(SmolVLAConfig):
     motion_projector_hidden_dim: int = 1024
     z_loss_weight: float = 1.0
 
-    # Joint flow training needs a full future video ending at t+H for the GT z
-    # target. ``None`` drops exactly the final H episode frames in the sampler.
-    drop_n_last_frames: int | None = None
+    # Keep every episode frame as a training anchor. LeRobot clamps future
+    # observations to the final frame; SmolW turns padded LIBERO actions into
+    # stationary commands before normalization and supervises them as valid.
+    drop_n_last_frames: int = 0
+    # LIBERO actions use six relative pose deltas followed by an absolute
+    # gripper command. A stationary tail zeros every dimension except these
+    # hold dimensions, whose last in-episode value is retained. Negative
+    # indices follow normal Python indexing.
+    stationary_action_hold_dims: list[int] = field(default_factory=lambda: [-1])
 
     # TensorBoard logging is performed by lerobot-train on the main process.
     # Relative log directories are resolved below the training output dir.
@@ -135,19 +141,12 @@ class SmolWConfig(SmolVLAConfig):
                 f"tensorboard_histogram_freq must be positive, got {self.tensorboard_histogram_freq}."
             )
 
-        # H actions a_t...a_{t+H-1} end at observation o_{t+H}. Joint flow
-        # training needs H future observations for its GT VidTwin z target.
-        if self.drop_n_last_frames is not None and self.drop_n_last_frames < 0:
+        if self.drop_n_last_frames < 0:
             raise ValueError(f"drop_n_last_frames must be non-negative, got {self.drop_n_last_frames}.")
-        required_tail_drop = self.motion_horizon
-        if self.drop_n_last_frames is None:
-            self.drop_n_last_frames = required_tail_drop
-        elif self.drop_n_last_frames < required_tail_drop:
-            raise ValueError(
-                "SmolW future-z target extraction requires dropping at least motion_horizon "
-                f"episode-tail frames; got drop_n_last_frames={self.drop_n_last_frames}, "
-                f"required>={required_tail_drop}."
-            )
+        if any(not isinstance(index, int) for index in self.stationary_action_hold_dims):
+            raise ValueError("stationary_action_hold_dims must contain only integer action indices.")
+        if len(set(self.stationary_action_hold_dims)) != len(self.stationary_action_hold_dims):
+            raise ValueError("stationary_action_hold_dims must not contain duplicate indices.")
 
     @property
     def past_motion_delta_indices(self) -> list[int]:

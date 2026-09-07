@@ -95,8 +95,11 @@ HORIZON=16 MEMORY_STRIDE=1 \
 bash train_smolw_lr.sh
 ```
 
-训练脚本设置 `drop_n_last_frames=H`，确保未来 GT z 窗口不会跨过 episode 末尾。episode
-开头缺少的历史帧沿用 LeRobot 的边界补帧，推理时也会重复最早可用帧填满历史。
+训练脚本设置 `drop_n_last_frames=0`，因此每个 episode 的所有帧都可以作为训练起点。超出
+episode 末尾的未来图像沿用 LeRobot 的边界补帧并重复最后一帧，使未来 GT z 表示到达终态
+后保持静止。LIBERO 的合成尾部动作在归一化前构造为前 6 维相对位姿增量为 0、最后一维
+保持最后一个有效夹爪命令；这些动作会取消 `action_is_pad` 并参与 action flow loss。episode
+开头缺少的历史帧同样使用边界补帧，推理时也会重复最早可用帧填满历史。
 
 TensorBoard 默认每 10 step 写一次 scalar，日志目录为 `${OUTPUT_DIR}/tensorboard`：
 

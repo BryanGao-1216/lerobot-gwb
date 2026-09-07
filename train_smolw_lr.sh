@@ -28,7 +28,7 @@ accelerate launch \
   --policy.memory_stride="${MEMORY_STRIDE}" \
   --policy.chunk_size="${HORIZON}" \
   --policy.n_action_steps="${N_ACTION_STEPS}" \
-  --policy.drop_n_last_frames="${HORIZON}" \
+  --policy.drop_n_last_frames=0 \
   --policy.use_peft=false \
   --policy.freeze_vision_encoder=true \
   --policy.train_state_proj=true \

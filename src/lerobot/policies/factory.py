@@ -171,6 +171,11 @@ def make_pre_post_processors(
         ValueError: If no processor factory exists for the given policy configuration type.
     """
     if pretrained_path:
+        # SmolW processors may contain their policy-local registered tail-padding
+        # step. Import it before deserializing the saved pipeline.
+        if policy_cfg.type == "smolw":
+            from .smolw import processor_smolw as _smolw_processor  # noqa: F401
+
         if isinstance(policy_cfg, GrootConfig):
             from .groot.processor_groot import make_groot_pre_post_processors_from_pretrained
 
@@ -222,6 +227,14 @@ def make_pre_post_processors(
             from .pi05_actionmem.processor_pi05_actionmem import reconcile_pi05_actionmem_processors
 
             preprocessor, postprocessor = reconcile_pi05_actionmem_processors(
+                policy_cfg,
+                preprocessor,
+                postprocessor,
+            )
+        if policy_cfg.type == "smolw":
+            from .smolw.processor_smolw import reconcile_smolw_processors
+
+            preprocessor, postprocessor = reconcile_smolw_processors(
                 policy_cfg,
                 preprocessor,
                 postprocessor,
