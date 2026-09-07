@@ -10,7 +10,7 @@ MEMORY_STRIDE="${MEMORY_STRIDE:-1}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 
 POLICY_PATH="${POLICY_PATH:-/data1/gaowenbing/WorkSpace/models/smolw-base}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-union}"
 TENSORBOARD_LOG_DIR="${TENSORBOARD_LOG_DIR:-${OUTPUT_DIR}/tensorboard}"
 
 
