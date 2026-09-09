@@ -1,9 +1,9 @@
 
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=2
 
 lerobot-eval \
-  --output_dir="./outputs/eval/smolw_5w" \
-  --policy.path="/data1/gaowenbing/WorkSpace/models/smolw-union/checkpoints/050000/pretrained_model" \
+  --output_dir="./outputs/eval/smolw_3w" \
+  --policy.path="/data1/gaowenbing/WorkSpace/models/smolw-union/checkpoints/030000/pretrained_model" \
   --policy.use_peft=false \
   --env.camera_name_mapping='{"agentview_image":"image","robot0_eye_in_hand_image":"image2"}' \
   --env.type=libero \
