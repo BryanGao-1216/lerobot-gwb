@@ -1356,7 +1356,7 @@ def make_policy_rlds_dataset(cfg: Any) -> ActionMemRLDSDataset:
     policy_type = cfg.trainable_config.type
     if policy_type == "smolvla":
         return make_smolvla_rlds_dataset(cfg)
-    if policy_type in {"actionmem", "pi05_actionmem", "smol_actionmem"}:
+    if policy_type == "actionmem":
         return make_actionmem_rlds_dataset(cfg)
     raise ValueError(
         f"RLDS dataset construction supports SmolVLA and ActionMem-family policies, got {policy_type!r}."

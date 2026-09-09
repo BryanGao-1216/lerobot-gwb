@@ -489,12 +489,21 @@ class SmolWPolicy(SmolVLAPolicy):
         motion_extractor: VidTwinMotionExtractor | None = None,
         **kwargs,
     ) -> None:
+        if config.train_version == "A":
+            # Instantiate the original model, with no motion modules/extractor.
+            super().__init__(config, **kwargs)
+            return
         require_package("transformers", extra="smolvla")
         PreTrainedPolicy.__init__(self, config)
         config.validate_features()
         self.config = config
         self.init_rtc_processor()
-        self.model = SmolWFlowMatching(config, rtc_processor=self.rtc_processor)
+        if config.train_version is None:
+            self.model = SmolWFlowMatching(config, rtc_processor=self.rtc_processor)
+        else:
+            from .modeling_smolw_ablation import SmolWAblationFlowMatching
+
+            self.model = SmolWAblationFlowMatching(config, rtc_processor=self.rtc_processor)
 
         image_keys = list(config.image_features)
         if not image_keys:
@@ -561,6 +570,8 @@ class SmolWPolicy(SmolVLAPolicy):
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Apply the inherited Aloha state transform along the feature axis."""
+        if getattr(self.config, "train_version", None) == "A":
+            return super()._prepare_batch(batch)
         if not self.config.adapt_to_pi_aloha:
             return batch
         prepared = dict(batch)
@@ -572,9 +583,13 @@ class SmolWPolicy(SmolVLAPolicy):
         return prepared
 
     def prepare_images(self, batch):
+        if getattr(self.config, "train_version", None) == "A":
+            return super().prepare_images(batch)
         return super().prepare_images(self._current_batch(batch))
 
     def prepare_state(self, batch):
+        if getattr(self.config, "train_version", None) == "A":
+            return super().prepare_state(batch)
         state = self._current_batch(batch)[OBS_STATE]
         return pad_vector(state, self.config.max_state_dim)
 
@@ -647,6 +662,8 @@ class SmolWPolicy(SmolVLAPolicy):
         noise: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
+        if self.config.train_version == "A":
+            return super()._get_action_chunk(batch, noise, **kwargs)
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
         past_motion = self.motion_extractor.encode(self._history_motion_clip())
@@ -672,6 +689,8 @@ class SmolWPolicy(SmolVLAPolicy):
         noise: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
+        if self.config.train_version == "A":
+            return super().predict_action_chunk(batch, noise, **kwargs)
         self.eval()
         batch = self._prepare_batch(batch)
         self._append_current_motion_frame(batch)
@@ -685,6 +704,8 @@ class SmolWPolicy(SmolVLAPolicy):
         noise: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
+        if self.config.train_version == "A":
+            return super().select_action(batch, noise, **kwargs)
         if self._rtc_enabled():
             raise AssertionError("RTC is not supported for select_action; use predict_action_chunk.")
         self.eval()
@@ -708,6 +729,11 @@ class SmolWPolicy(SmolVLAPolicy):
     ) -> tuple[Tensor, dict[str, float | list[float]]]:
         if reduction not in {"mean", "none"}:
             raise ValueError(f"Unsupported reduction {reduction!r}; expected 'mean' or 'none'.")
+        if getattr(self.config, "train_version", None) == "A":
+            loss, metrics = super().forward(batch, noise=noise, time=time, reduction=reduction)
+            # Alias for comparing curves; the original loss and graph are unchanged.
+            metrics["action_flow_loss"] = metrics["loss"]
+            return loss, metrics
         batch = self._prepare_batch(batch)
         if self.config.adapt_to_pi_aloha:
             batch = dict(batch)
@@ -717,11 +743,15 @@ class SmolWPolicy(SmolVLAPolicy):
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch)
 
-        past_frames, future_frames = self.prepare_motion_clips(batch)
-        past_motion, future_motion = self.motion_extractor.encode_pair(
-            past_frames,
-            future_frames,
-        )
+        if getattr(self.config, "train_version", None) == "B":
+            past_motion = self.motion_extractor.encode(self.prepare_past_motion_clip(batch))
+            future_motion = None
+        else:
+            past_frames, future_frames = self.prepare_motion_clips(batch)
+            past_motion, future_motion = self.motion_extractor.encode_pair(
+                past_frames,
+                future_frames,
+            )
 
         output = self.model.forward(
             images,
@@ -756,7 +786,7 @@ class SmolWPolicy(SmolVLAPolicy):
             action_flow_loss = masked_flow.sum() / (valid_steps * action_dim)
             loss_per_dim = masked_flow.sum(dim=(0, 1)) / valid_steps
 
-        per_sample_z_flow = output["z_flow_losses"]
+        per_sample_z_flow = output.get("z_flow_losses", torch.zeros_like(per_sample_flow))
         z_flow_loss = per_sample_z_flow.mean()
         weighted_z_flow = self.config.z_loss_weight * z_flow_loss
         total_loss = action_flow_loss + weighted_z_flow
@@ -768,14 +798,19 @@ class SmolWPolicy(SmolVLAPolicy):
             "z_flow_loss": z_flow_loss.item(),
             "weighted_z_flow_loss": weighted_z_flow.item(),
             "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
-            "z_target_rms": output["z_target"].float().square().mean().sqrt().item(),
         }
+        if "z_target" in output:
+            metrics["z_target_rms"] = output["z_target"].float().square().mean().sqrt().item()
+        if getattr(self.config, "train_version", None) == "D":
+            metrics["motion_condition_gate"] = self.model.motion_condition_gate.weight.detach().tanh().item()
         if reduction == "none":
             return per_sample_total, metrics
         return total_loss, metrics
 
     def _get_default_peft_targets(self) -> dict[str, object]:
         defaults = super()._get_default_peft_targets()
+        if self.config.train_version == "A":
+            return defaults
         defaults["modules_to_save"] = [
             "mt_query_embedding",
             "past_motion_projector",
@@ -784,4 +819,9 @@ class SmolWPolicy(SmolVLAPolicy):
             "z_time_mlp_out",
             "z_token_out_proj",
         ]
+        defaults["modules_to_save"] = [
+            name for name in defaults["modules_to_save"] if hasattr(self.model, name)
+        ]
+        if self.config.train_version == "D":
+            defaults["modules_to_save"].extend(["motion_condition_attention", "motion_condition_gate"])
         return defaults

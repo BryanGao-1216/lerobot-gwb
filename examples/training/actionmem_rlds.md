@@ -78,7 +78,7 @@ lerobot-train \
   --dataset.rlds_target_control_hz=10 \
   --dataset.rlds_state_dim=32 \
   --dataset.rlds_camera_views='["primary","secondary","wrist"]' \
-  --policy.path=/path/to/smol-actionmem-base \
+  --policy.path=/path/to/actionmem-base \
   --policy.chunk_size=10 \
   --policy.n_action_steps=10 \
   --output_dir=/path/to/output \

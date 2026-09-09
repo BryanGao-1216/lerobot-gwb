@@ -33,6 +33,10 @@ class SmolWConfig(SmolVLAConfig):
     are consumed by the frozen VidTwin motion extractor.
     """
 
+    # None preserves checkpoints written before the controlled A/B/C/D ablations.
+    # Launch scripts must explicitly choose A, B, C, or D for new experiments.
+    train_version: str | None = None
+
     # Motion/action temporal contract. ``None`` keeps the motion horizon tied to
     # the SmolVLA action chunk size.
     motion_horizon: int | None = None
@@ -87,6 +91,8 @@ class SmolWConfig(SmolVLAConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
 
+        if self.train_version not in {None, "A", "B", "C", "D"}:
+            raise ValueError("train_version must be A, B, C, or D (None is reserved for legacy checkpoints).")
         if self.motion_horizon is None:
             self.motion_horizon = self.chunk_size
         if self.train_expert_only:
@@ -168,8 +174,20 @@ class SmolWConfig(SmolVLAConfig):
         return self.motion_latent_dim // self.vidtwin_num_frames
 
     @property
+    def uses_past_motion(self) -> bool:
+        return self.train_version != "A"
+
+    @property
+    def uses_future_motion(self) -> bool:
+        return self.train_version in {None, "C", "D"}
+
+    @property
     def observation_delta_indices(self) -> list[int]:
-        """Request history plus the future GT-z target window."""
+        """Load only the observations required by the selected experiment."""
+        if not self.uses_past_motion:
+            return super().observation_delta_indices
+        if not self.uses_future_motion:
+            return self.past_motion_delta_indices
         return sorted(set(self.past_motion_delta_indices + self.future_motion_delta_indices))
 
     @property
@@ -178,10 +196,14 @@ class SmolWConfig(SmolVLAConfig):
 
     @property
     def past_motion_positions(self) -> list[int]:
+        if not self.uses_past_motion:
+            return []
         deltas = self.observation_delta_indices
         return [deltas.index(delta) for delta in self.past_motion_delta_indices]
 
     @property
     def future_motion_positions(self) -> list[int]:
+        if not self.uses_future_motion:
+            return []
         deltas = self.observation_delta_indices
         return [deltas.index(delta) for delta in self.future_motion_delta_indices]

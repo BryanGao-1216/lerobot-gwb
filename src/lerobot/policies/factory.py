@@ -223,14 +223,6 @@ def make_pre_post_processors(
                 preprocessor,
                 postprocessor,
             )
-        if policy_cfg.type == "pi05_actionmem":
-            from .pi05_actionmem.processor_pi05_actionmem import reconcile_pi05_actionmem_processors
-
-            preprocessor, postprocessor = reconcile_pi05_actionmem_processors(
-                policy_cfg,
-                preprocessor,
-                postprocessor,
-            )
         if policy_cfg.type == "smolw":
             from .smolw.processor_smolw import reconcile_smolw_processors
 

@@ -26,7 +26,6 @@ DEFAULT_OBS_QUEUE_TIMEOUT = 2
 SUPPORTED_POLICIES = [
     "act",
     "smolvla",
-    "smol_actionmem",
     "diffusion",
     "tdmpc",
     "vqbet",

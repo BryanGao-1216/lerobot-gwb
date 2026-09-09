@@ -35,6 +35,7 @@ from lerobot.processor import (
 )
 from lerobot.types import EnvTransition, TransitionKey
 
+from ..smolvla.processor_smolvla import make_smolvla_pre_post_processors
 from .configuration_smolw import SmolWConfig
 
 
@@ -134,6 +135,8 @@ def make_smolw_pre_post_processors(
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """Build SmolVLA preprocessing plus raw-space stationary tail actions."""
+    if config.train_version is not None:
+        return make_smolvla_pre_post_processors(config, dataset_stats)
     steps = make_default_policy_processor_steps(config, dataset_stats)
     input_steps = [
         steps.rename_observations,
@@ -166,6 +169,13 @@ def reconcile_smolw_processors(
     """Add or refresh SmolW tail handling in copied SmolVLA processors."""
 
     steps = list(preprocessor.steps)
+    if config.train_version is not None:
+        # All four ablations retain the original action targets and padding mask.
+        # This also removes the legacy step from an existing converted SmolW base.
+        preprocessor.steps = [
+            step for step in steps if not isinstance(step, SmolWStationaryActionPaddingProcessorStep)
+        ]
+        return preprocessor, postprocessor
     replacement = SmolWStationaryActionPaddingProcessorStep(
         hold_dims=config.stationary_action_hold_dims,
     )

@@ -2,7 +2,7 @@
 export CUDA_VISIBLE_DEVICES=1
 
 lerobot-eval \
-  --output_dir="./outputs/eval/libero_smol_actionmem_rlds" \
+  --output_dir="./outputs/eval/libero_smolvla_rlds" \
   --env.gripper_action_convention=oxe \
   --policy.path="/data1/gaowenbing/WorkSpace/models/smolvla-libero-baseline-rlds/checkpoints/last/pretrained_model" \
   --policy.use_peft=false \

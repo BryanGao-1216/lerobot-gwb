@@ -272,9 +272,7 @@ class TrainPipelineConfig(HubMixin):
                 )
             if self.trainable_config.type not in {
                 "actionmem",
-                "pi05_actionmem",
                 "smolvla",
-                "smol_actionmem",
             }:
                 raise ValueError(
                     "dataset_type='rlds' currently supports SmolVLA and ActionMem-family policies, got "

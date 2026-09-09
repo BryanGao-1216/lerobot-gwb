@@ -336,7 +336,6 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
     ) -> ModelCard:
         base_model_mapping = {
             "smolvla": "lerobot/smolvla_base",
-            "smol_actionmem": "lerobot/smolvla_base",
             "pi0": "lerobot/pi0_base",
             "pi05": "lerobot/pi05_base",
             "pi0_fast": "lerobot/pi0fast-base",

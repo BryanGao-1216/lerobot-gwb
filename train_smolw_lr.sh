@@ -4,13 +4,20 @@ set -eu
 
 export CUDA_VISIBLE_DEVICES=4,5
 
+# A: SmolVLA; B: + history; C: + auxiliary z loss; D: + gated z conditioning.
+train_version="${train_version:-A}"
+case "${train_version}" in
+  A|B|C|D) ;;
+  *) echo "train_version must be A, B, C, or D" >&2; exit 1 ;;
+esac
+
 HORIZON="${HORIZON:-16}"
 N_ACTION_STEPS="${N_ACTION_STEPS:-10}"
 MEMORY_STRIDE="${MEMORY_STRIDE:-1}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 
 POLICY_PATH="${POLICY_PATH:-/data1/gaowenbing/WorkSpace/models/smolw-base}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-union}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data1/gaowenbing/WorkSpace/models/smolw-union-${train_version}}"
 TENSORBOARD_LOG_DIR="${TENSORBOARD_LOG_DIR:-${OUTPUT_DIR}/tensorboard}"
 
 
@@ -22,6 +29,7 @@ accelerate launch \
   --main_process_port=25901 \
   "$(which lerobot-train)" \
   --policy.path="${POLICY_PATH}" \
+  --policy.train_version="${train_version}" \
   --policy.vidtwin_checkpoint_path="/data1/gaowenbing/WorkSpace/models/vidtwin-libero/checkpoint-best.ckpt" \
   --policy.motion_camera_key="observation.images.image" \
   --policy.motion_horizon="${HORIZON}" \
