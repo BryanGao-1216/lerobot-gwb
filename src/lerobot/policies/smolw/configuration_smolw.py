@@ -42,7 +42,8 @@ class SmolWConfig(SmolVLAConfig):
     motion_horizon: int | None = None
     memory_stride: int = 1
 
-    # SmolW always trains the VLM condition path and action expert jointly.
+    # Keep the existing experiment default. A also accepts expert-only training
+    # when explicitly requested, just like SmolVLA (whose default is True).
     train_expert_only: bool = False
 
     # The frozen VidTwin extractor is external to the policy state dict. Its
@@ -95,6 +96,11 @@ class SmolWConfig(SmolVLAConfig):
             raise ValueError("train_version must be A, B, C, or D (None is reserved for legacy checkpoints).")
         if self.motion_horizon is None:
             self.motion_horizon = self.chunk_size
+        self._validate_logging_and_sampling()
+        if self.train_version == "A":
+            # A has no motion path. In particular, allow SmolVLA's expert-only
+            # and cache options without imposing VidTwin's temporal contract.
+            return
         if self.train_expert_only:
             raise ValueError("SmolW jointly trains the VLM condition path and action expert.")
         if self.motion_horizon <= 0:
@@ -136,6 +142,12 @@ class SmolWConfig(SmolVLAConfig):
                 "vidtwin_dtype must be one of 'float32', 'float16', or 'bfloat16', got "
                 f"{self.vidtwin_dtype!r}."
             )
+        if any(not isinstance(index, int) for index in self.stationary_action_hold_dims):
+            raise ValueError("stationary_action_hold_dims must contain only integer action indices.")
+        if len(set(self.stationary_action_hold_dims)) != len(self.stationary_action_hold_dims):
+            raise ValueError("stationary_action_hold_dims must not contain duplicate indices.")
+
+    def _validate_logging_and_sampling(self) -> None:
         if self.tensorboard_log_freq <= 0:
             raise ValueError(f"tensorboard_log_freq must be positive, got {self.tensorboard_log_freq}.")
         if self.tensorboard_flush_secs <= 0:
@@ -149,10 +161,6 @@ class SmolWConfig(SmolVLAConfig):
 
         if self.drop_n_last_frames < 0:
             raise ValueError(f"drop_n_last_frames must be non-negative, got {self.drop_n_last_frames}.")
-        if any(not isinstance(index, int) for index in self.stationary_action_hold_dims):
-            raise ValueError("stationary_action_hold_dims must contain only integer action indices.")
-        if len(set(self.stationary_action_hold_dims)) != len(self.stationary_action_hold_dims):
-            raise ValueError("stationary_action_hold_dims must not contain duplicate indices.")
 
     @property
     def past_motion_delta_indices(self) -> list[int]:

@@ -6,6 +6,9 @@ VLM future-motion regression head。
 
 ## A/B/C/D 增量实验
 
+A 的逐项对照、实际数值验证、保留差异和服务器 base 检查命令见
+[SmolVLA 基线审计](BASELINE_A_AUDIT.md)。
+
 | train_version | 历史 motion | 未来 z 监督 | 动作读取生成 z |
 | --- | --- | --- | --- |
 | A | 不使用 | 不使用 | 不使用 |

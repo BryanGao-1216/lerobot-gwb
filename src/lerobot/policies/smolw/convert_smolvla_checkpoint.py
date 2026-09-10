@@ -16,8 +16,8 @@
 
 """Convert an original SmolVLA artifact into a SmolW base artifact.
 
-Only shape-compatible original SmolVLA tensors are transferred. The M_t query
-and temporal z flow modules retain their SmolW initialization.
+Every original SmolVLA tensor must transfer successfully. The M_t query and
+temporal z flow modules retain their SmolW initialization.
 
 Example:
 
@@ -115,6 +115,11 @@ def _copy_compatible_weights(source_policy: SmolVLAPolicy, target_policy: SmolWP
         for key, source_value in source_state.items()
         if key in target_state and source_value.shape == target_state[key].shape
     }
+    incompatible = sorted(source_state.keys() - compatible_state.keys())
+    if incompatible:
+        raise RuntimeError(
+            f"Cannot preserve the complete SmolVLA baseline; incompatible keys: {incompatible}"
+        )
     missing_keys, unexpected_keys = target_policy.load_state_dict(compatible_state, strict=False)
     if unexpected_keys:
         raise RuntimeError(f"Unexpected converted checkpoint keys: {unexpected_keys}")
@@ -134,13 +139,13 @@ def _copy_compatible_weights(source_policy: SmolVLAPolicy, target_policy: SmolWP
         len(source_state),
     )
     if unmatched_missing:
-        logging.warning("Target tensors retaining their initialization: %s", unmatched_missing)
+        raise RuntimeError(f"Base SmolVLA tensors would retain random initialization: {unmatched_missing}")
 
 
 def convert(args: argparse.Namespace) -> Path:
     output_dir = _prepare_output_directory(args.output_dir, args.overwrite)
     logging.info("Loading original SmolVLA policy from %s", args.source)
-    source_policy = SmolVLAPolicy.from_pretrained(args.source)
+    source_policy = SmolVLAPolicy.from_pretrained(args.source, strict=True)
     target_config = _make_target_config(source_policy, args)
     target_policy = SmolWPolicy(target_config)
     _copy_compatible_weights(source_policy, target_policy)

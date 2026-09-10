@@ -23,9 +23,11 @@ from typing import Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+from safetensors.torch import load_model as load_model_as_safetensor
 from torch import Tensor, nn
 
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.device_utils import resolve_safetensors_device
 from lerobot.utils.import_utils import require_package
 
 from ..pretrained import PreTrainedPolicy
@@ -37,7 +39,7 @@ from ..smolvla.modeling_smolvla import (
     make_att_2d_masks,
     pad_vector,
 )
-from ..utils import populate_queues
+from ..utils import log_model_loading_keys, populate_queues
 from .configuration_smolw import SmolWConfig
 from .vidtwin_motion_encoder import VidTwinMotionExtractor
 
@@ -526,11 +528,30 @@ class SmolWPolicy(SmolVLAPolicy):
         )
         self.reset()
 
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file: str, map_location: str, strict: bool):
+        if model.config.train_version != "A":
+            return super()._load_as_safetensor(model, model_file, map_location, strict)
+        missing, unexpected = load_model_as_safetensor(
+            model, model_file, strict=strict, device=resolve_safetensors_device(map_location)
+        )
+        # A may ignore a converted base's extra motion tensors, but every
+        # original SmolVLA tensor must exist. Random fallback is not a baseline.
+        if missing:
+            raise RuntimeError(f"SmolW-A checkpoint is missing baseline SmolVLA weights: {sorted(missing)}")
+        log_model_loading_keys(missing, unexpected)
+        return model
+
     def get_optim_params(self):
+        # Preserve the parameter-group layout of existing SmolW-A checkpoints
+        # for optimizer resume. AdamW skips grad=None parameters, so omitting
+        # frozen parameters does not change updates versus SmolVLA.
         return (parameter for parameter in self.parameters() if parameter.requires_grad)
 
     def reset(self) -> None:
         super().reset()
+        if self.config.train_version == "A":
+            return
         history_span = (self.config.motion_horizon - 1) * self.config.memory_stride + 1
         self._motion_history: deque[Tensor] = deque(maxlen=history_span)
 

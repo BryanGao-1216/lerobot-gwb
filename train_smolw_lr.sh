@@ -38,6 +38,7 @@ accelerate launch \
   --policy.n_action_steps="${N_ACTION_STEPS}" \
   --policy.drop_n_last_frames=0 \
   --policy.use_peft=false \
+  --policy.train_expert_only=false \
   --policy.freeze_vision_encoder=true \
   --policy.train_state_proj=true \
   --policy.vidtwin_sample_posterior=false \
