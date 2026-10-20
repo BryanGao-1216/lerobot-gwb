@@ -27,6 +27,17 @@ class SmolVLALAPConfig(SmolVLAConfig):
     # Fresh LAP policies start from the original SmolVLM, never random VLM weights.
     load_vlm_weights: bool = True
 
+    # Reuse lerobot-train's main-process TensorBoard logger for both stages.
+    tensorboard_enable: bool = False
+    tensorboard_log_dir: str | None = None
+    tensorboard_log_freq: int = 10
+    tensorboard_flush_secs: int = 30
+    tensorboard_max_queue: int = 10
+    tensorboard_filename_suffix: str = ""
+    tensorboard_log_parameters: bool = False
+    tensorboard_log_gradients: bool = False
+    tensorboard_histogram_freq: int = 1_000
+
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.training_stage not in {"pre-training", "post-training"}:
@@ -39,6 +50,14 @@ class SmolVLALAPConfig(SmolVLAConfig):
             raise ValueError("The bundled UniVLA stage-2 model uses 4 tokens and a 16-entry codebook.")
         if self.n_obs_steps != 1:
             raise ValueError("SmolVLA LAP currently supports n_obs_steps=1.")
+        for name in (
+            "tensorboard_log_freq",
+            "tensorboard_flush_secs",
+            "tensorboard_max_queue",
+            "tensorboard_histogram_freq",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}.")
         if self.training_stage == "pre-training":
             if not self.lam_model_path:
                 raise ValueError("pre-training requires policy.lam_model_path (UniVLA stage-2 checkpoint).")

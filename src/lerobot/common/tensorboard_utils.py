@@ -27,7 +27,7 @@ from lerobot.configs.train import TrainPipelineConfig
 
 
 class TensorBoardLogger:
-    """Small SummaryWriter wrapper configured by an ActionMem policy."""
+    """Small SummaryWriter wrapper configured by policy TensorBoard settings."""
 
     def __init__(
         self,
@@ -56,7 +56,7 @@ class TensorBoardLogger:
             except ImportError as exc:
                 raise ImportError(
                     "TensorBoard logging requires the 'tensorboard' package. "
-                    "Install the training dependencies with `pip install 'lerobot[training]'`."
+                    "Install the training dependencies with `uv sync --locked --extra training`."
                 ) from exc
             writer_cls = SummaryWriter
 

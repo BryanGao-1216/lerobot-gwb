@@ -34,6 +34,8 @@ accelerate launch \
   --output_dir=/mnt/data27T/media/gwb/trained_model/smolvla-lap \
   --steps=60000 \
   --save_freq=10000 \
+  --policy.tensorboard_enable=true \
+  --policy.tensorboard_log_freq=10 \
   --batch_size=16 \
   --env_eval_freq=0 \
   --eval_steps=0 \
