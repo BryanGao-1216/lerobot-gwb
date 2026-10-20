@@ -175,6 +175,8 @@ def make_pre_post_processors(
         # step. Import it before deserializing the saved pipeline.
         if policy_cfg.type == "smolw":
             from .smolw import processor_smolw as _smolw_processor  # noqa: F401
+        if policy_cfg.type == "smolvla_lap":
+            from .smolvla_lap import processor_smolvla_lap as _lap_processor  # noqa: F401
 
         if isinstance(policy_cfg, GrootConfig):
             from .groot.processor_groot import make_groot_pre_post_processors_from_pretrained
@@ -215,6 +217,10 @@ def make_pre_post_processors(
             revision=pretrained_revision,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        if policy_cfg.type == "smolvla_lap":
+            from .smolvla_lap.processor_smolvla_lap import reconcile_smolvla_lap_processors
+
+            preprocessor, postprocessor = reconcile_smolvla_lap_processors(preprocessor, postprocessor)
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
 

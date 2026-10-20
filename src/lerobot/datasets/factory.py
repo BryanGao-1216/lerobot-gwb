@@ -66,6 +66,11 @@ def resolve_delta_timestamps(
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
+    if cfg.type == "smolvla_lap" and cfg.training_stage == "pre-training":
+        camera = cfg.resolve_lam_camera_key(ds_meta.features)
+        # Only this camera gets a future frame. State and all student views stay at t.
+        delta_timestamps[camera] = [0.0, cfg.lam_frame_gap / ds_meta.fps]
+
     if len(delta_timestamps) == 0:
         delta_timestamps = None
 
@@ -86,6 +91,9 @@ def make_dataset(
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
+    is_lap = cfg.policy is not None and cfg.policy.type == "smolvla_lap"
+    if is_lap and (cfg.dataset_type != "lerobot" or cfg.dataset.streaming):
+        raise ValueError("smolvla_lap currently requires a non-streaming LeRobot dataset.")
     if cfg.dataset_type == "rlds":
         from .rlds_dataset import make_policy_rlds_dataset
 
@@ -101,7 +109,8 @@ def make_dataset(
         )
         delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta)
         if not cfg.dataset.streaming:
-            dataset = LeRobotDataset(
+            dataset_class, dataset_kwargs = _policy_dataset_class(cfg)
+            dataset = dataset_class(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
@@ -112,6 +121,7 @@ def make_dataset(
                 return_uint8=True,
                 depth_output_unit=cfg.dataset.depth_output_unit,
                 tolerance_s=cfg.tolerance_s,
+                **dataset_kwargs,
             )
         else:
             dataset = StreamingLeRobotDataset(
@@ -147,6 +157,14 @@ def make_dataset(
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
     return dataset
+
+
+def _policy_dataset_class(cfg: TrainPipelineConfig):
+    if cfg.policy is not None and cfg.policy.type == "smolvla_lap":
+        from lerobot.policies.smolvla_lap.dataset import SmolVLALAPDataset
+
+        return SmolVLALAPDataset, {"policy_config": cfg.policy}
+    return LeRobotDataset, {}
 
 
 def make_train_eval_datasets(
@@ -197,7 +215,8 @@ def make_train_eval_datasets(
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
 
-    train_dataset = LeRobotDataset(
+    dataset_class, dataset_kwargs = _policy_dataset_class(cfg)
+    train_dataset = dataset_class(
         cfg.dataset.repo_id,
         root=cfg.dataset.root,
         episodes=train_episodes,
@@ -207,9 +226,10 @@ def make_train_eval_datasets(
         video_backend=cfg.dataset.video_backend,
         return_uint8=True,
         tolerance_s=cfg.tolerance_s,
+        **dataset_kwargs,
     )
 
-    eval_dataset = LeRobotDataset(
+    eval_dataset = dataset_class(
         cfg.dataset.repo_id,
         root=cfg.dataset.root,
         episodes=eval_episodes,
@@ -219,6 +239,7 @@ def make_train_eval_datasets(
         video_backend=cfg.dataset.video_backend,
         return_uint8=True,
         tolerance_s=cfg.tolerance_s,
+        **dataset_kwargs,
     )
 
     if cfg.dataset.use_imagenet_stats:
