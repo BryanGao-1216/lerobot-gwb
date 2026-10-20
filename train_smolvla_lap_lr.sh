@@ -16,7 +16,7 @@ accelerate launch \
   --policy.training_stage=pre-training \
   --policy.lam_type=univla \
   --policy.lam_model_path=/mnt/data27T/media/gwb/libero-simulation/仿真环境/model/UniVLA/lam-stage-2.ckpt \
-  --policy.lam_camera_key=front \
+  --policy.lam_camera_key=observation.images.image \
   --policy.lam_frame_gap=12 \
   --policy.lam_batch_size=8 \
   --policy.vlm_model_name=/mnt/data27T/media/gwb/base_models/smolVLM \
@@ -30,7 +30,7 @@ accelerate launch \
   --policy.n_action_steps=12 \
   --dataset_type=lerobot \
   --dataset.repo_id=libero_only \
-  --dataset.root=/data1/gaowenbing/WorkSpace/datasets/libero \
+  --dataset.root=/mnt/data27T/media/gwb/dataset/libero \
   --output_dir=/mnt/data27T/media/gwb/trained_model/smolvla-lap \
   --steps=60000 \
   --save_freq=10000 \
