@@ -58,11 +58,31 @@ class SmolVLALAPConfig(SmolVLAConfig):
         for key in candidates:
             if key in features:
                 feature = features[key]
-                if feature.get("dtype") in {"image", "video"} and feature.get("shape", [0])[0] == 3:
+                if feature.get("dtype") not in {"image", "video"}:
+                    continue
+                shape = feature.get("shape") or ()
+                if len(shape) != 3 or (feature.get("info") or {}).get("is_depth_map", False):
+                    continue
+                # Dataset metadata supports both HWC and CHW, even though the
+                # reader returns CHW tensors in either case. Prefer named axes
+                # so a height/width of 3 cannot disguise a non-RGB camera.
+                names = feature.get("names") or ()
+                if len(names) == 3 and names[2] in {"channel", "channels"}:
+                    is_rgb = shape[2] == 3
+                elif len(names) == 3 and names[0] in {"channel", "channels"}:
+                    is_rgb = shape[0] == 3
+                else:
+                    is_rgb = shape[0] == 3 or shape[2] == 3
+                if is_rgb:
                     return key
+        available = {
+            key: {"shape": value.get("shape"), "names": value.get("names")}
+            for key, value in features.items()
+            if value.get("dtype") in {"image", "video"}
+        }
         raise ValueError(
             f"LAM camera {name!r} is not an RGB camera in this dataset. "
-            f"Available image features: {[k for k, v in features.items() if v.get('dtype') in {'image', 'video'}]}"
+            f"Available image features (shape and axis names): {available}"
         )
 
     @property
