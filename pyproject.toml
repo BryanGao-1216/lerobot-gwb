@@ -390,6 +390,7 @@ lerobot = [
     "datasets/rlds/VQ_VLA_LICENSE",
     "policies/smolw/vidtwin/configs/*.yaml",
     "policies/smolvla_lap/lam/LICENSE-*",
+    "policies/smolvla_lap/lam/NOTICE-*",
     "policies/smolvla_lap/lam/THIRD_PARTY.md",
 ]
 
@@ -408,6 +409,11 @@ exclude = [
     "src/lerobot/policies/smolvla_lap/lam/dinov2/**/*.py",
     "src/lerobot/policies/smolvla_lap/lam/univla_blocks.py",
     "src/lerobot/policies/smolvla_lap/lam/univla_model.py",
+    "src/lerobot/policies/smolvla_lap/lam/lapa_model.py",
+    "src/lerobot/policies/smolvla_lap/lam/lapa_attention.py",
+    "src/lerobot/policies/smolvla_lap/lam/lapa_nsvq.py",
+    "src/lerobot/policies/smolvla_lap/lam/mvp_model.py",
+    "src/lerobot/policies/smolvla_lap/lam/mvp_blocks.py",
 ]
 
 [tool.ruff.lint]

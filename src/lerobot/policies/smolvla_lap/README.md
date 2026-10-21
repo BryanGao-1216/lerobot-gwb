@@ -4,10 +4,40 @@ Python 包及 CLI 策略类型为 `smolvla_lap`。原来的 `smolvla` 策略不�
 
 ## 两个阶段
 
-- `pre-training`：从原始 `HuggingFaceTB/SmolVLM2-500M-Video-Instruct` 初始化 VLM。输入与 SmolVLA 一致：当前所有相机图像、任务文本、当前机器人 state。冻结的 UniVLA stage-2 LAM 从指定单相机的 `(t, min(t+H, episode末帧))` 提取 4 个任务相关 token（每个 ID 为 0–15）。VLM 用 teacher forcing 自回归预测这 4 个 token，只计算 token 交叉熵。动作专家冻结；VLM、输出头、state projection 训练，视觉编码器由 `freeze_vision_encoder` 控制。
+- `pre-training`：从原始 `HuggingFaceTB/SmolVLM2-500M-Video-Instruct` 初始化 VLM。输入与 SmolVLA 一致：当前所有相机图像、任务文本、当前机器人 state。冻结的 LAM 从指定单相机的 `(t, min(t+H, episode末帧))` 提取 4 个离散动作 token，支持 UniVLA stage-2、LAPA 和 MVP-LAM。VLM 用 teacher forcing 自回归预测这 4 个 token，只计算 token 交叉熵。动作专家冻结；VLM、输出头、state projection 训练，视觉编码器由 `freeze_vision_encoder` 控制。
 - `post-training`：加载 LAP 预训练 checkpoint，保留 VLM 和 state projection，使用原来的 SmolVLA flow matching 训练连续动作专家。训练标签只有真实机器人动作；不运行 LAM，不预测或输入 latent token。
 
-固定 H 的单位是数据集帧数，默认 `12`，与动作专家的 `chunk_size` 无关。未来帧只提供给 LAM。LAM 输入采用原始 RGB 帧经 PIL bilinear 缩放至 224×224，范围 `[0,1]`，内部执行 ImageNet 归一化；伪标签不受 VLM 随机图像增强影响。末尾不足 H 时使用同 episode 最后一帧，包含末帧到自身的帧对。
+固定 H 的单位是数据集帧数，默认 `12`，与动作专家的 `chunk_size` 无关。未来帧只提供给 LAM。LAM 输入采用原始 RGB 帧经 PIL bilinear 缩放，尺寸和内部归一化按模型自动选择，像素范围为 `[0,1]`；伪标签不受 VLM 随机图像增强影响。末尾不足 H 时使用同 episode 最后一帧，包含末帧到自身的帧对。
+
+## 选择 Latent Action Model
+
+直接修改启动脚本里的 `--policy.lam_type` 和 `--policy.lam_model_path`。H=12、单相机采样、TensorBoard 和两个训练阶段共用同一套流程。
+
+| `lam_type` | 权重示例 | LAM 输入 | 每个帧对的标签 | 内部归一化 |
+| --- | --- | --- | --- | --- |
+| `univla` | `lam-stage-2.ckpt` | 224×224 | 4 个 token，ID 0–15 | ImageNet |
+| `lapa` | `laq_openx.pt` | 256×256 | 4 个 token，ID 0–7 | 不额外归一化 |
+| `mvp_lam` 或 `mvp-lam` | `mvp_lam.bin` | 224×224 | 4 个 token，ID 0–15 | ImageNet |
+
+例如切换 LAPA 时，直接将脚本中的两行改为：
+
+```bash
+  --policy.lam_type=lapa \
+  --policy.lam_model_path=/path/to/laq_openx.pt \
+```
+
+切换 MVP-LAM 则改为：
+
+```bash
+  --policy.lam_type=mvp_lam \
+  --policy.lam_model_path=/path/to/mvp_lam.bin \
+```
+
+`lam_num_tokens` 和 `lam_codebook_size` 会根据类型自动确定，并保存到 checkpoint。首次训练无需手动填写。LAPA 为原始 VLM 词表添加 8 个动作符号及 1 个起始符；UniVLA 和 MVP-LAM 添加 16 个动作符号及 1 个起始符。
+
+LAPA 接入采用官方 Open-X LAQ 架构：dim=1024、quant_dim=32、spatial_depth=8、temporal_depth=8、code_seq_len=4。UniVLA 使用 stage-2 任务相关的 `vq_action` 分支，MVP-LAM 使用它自身的 `vq` 分支。三者分别使用原始 `vq_encode()` 或 `inference(..., return_only_codebook_ids=True)` 输出，码本索引不重排。
+
+不同 LAM 的编号含义不同，比较模型时应分别从原始 SmolVLM 开始新的预训练，并使用不同输出目录。加载已有 LAP checkpoint 继续训练或切换后训练时，保持其中保存的 `lam_type` 及动作词表配置。
 
 后训练针对 7D 相对位姿 + 夹爪动作：episode 末尾越界的动作位置在归一化前替换成 `[0,0,0,0,0,0,last_gripper]`，作为有效静止命令参与监督。原有 episode 内动作不做修改；不自动把绝对动作转成相对动作。
 
@@ -19,7 +49,7 @@ Python 包及 CLI 策略类型为 `smolvla_lap`。原来的 `smolvla` 策略不�
 uv sync --locked --extra smolvla-lap --extra training
 ```
 
-UniVLA 和 DINOv2 必要推理源码已包含在 `lam/`，无需另行安装上游仓库、Lightning、T5 或 FlashAttention。只需提供 UniVLA **stage-2 LAM** 权重，例如 `lam-stage-2.ckpt`；stage-1 或完整 VLA policy 权重会明确报错。所有 LAM 参数严格加载，教师始终在当前进程的 CUDA 设备上用 FP32 推理，并保持冻结。`lam_batch_size` 控制教师推理的分块大小，不改变 VLM 训练 batch size。
+UniVLA、LAPA、MVP-LAM 和 DINOv2 必要推理源码已包含在 `lam/`，无需另行安装上游仓库、Lightning、T5、beartype、rotary-embedding-torch 或 FlashAttention。只需提供与类型匹配的 LAM 权重；UniVLA 必须是 **stage-2 LAM** 权重。所有模型参数（包括完整 DINOv2 和 decoder 参数）严格加载，教师始终在当前进程的 CUDA 设备上用 FP32 推理，并保持冻结。`lam_batch_size` 控制教师推理的分块大小，不改变 VLM 训练 batch size。
 
 启动脚本为仓库根目录的 `train_smolvla_lap_lr.sh`，与 `train_pi.sh` 一样，直接在 `accelerate launch` 命令中修改参数：
 
@@ -38,8 +68,8 @@ bash train_smolvla_lap_lr.sh
 | 参数 | 含义 | 默认值 |
 | --- | --- | --- |
 | `--policy.training_stage` | 训练阶段 | 脚本为 `pre-training`，策略配置为 `post-training` |
-| `--policy.lam_type` | LAM 类型 | `univla` |
-| `--policy.lam_model_path` | UniVLA stage-2 权重路径 | 预训练必填 |
+| `--policy.lam_type` | `univla` / `lapa` / `mvp_lam`（`mvp-lam`） | `univla` |
+| `--policy.lam_model_path` | 所选 LAM 的权重路径 | 预训练必填 |
 | `--policy.lam_camera_key` | 单个 RGB 相机字段 | 脚本为 `front`，策略配置中必填 |
 | `--policy.lam_frame_gap` | 两帧间隔 | `12` |
 | `--policy.lam_batch_size` | 教师推理分块大小 | `8` |
@@ -50,7 +80,7 @@ bash train_smolvla_lap_lr.sh
 
 恢复同一阶段的训练（恢复优化器、调度器和步数）应使用 LeRobot 的 `--resume=true --config_path=/path/to/train_config.json`；从预训练切换后训练使用 `--policy.path`，开始新的优化器及调度器。
 
-预训练日志包含 `loss`、`latent_token_accuracy`、`latent_sequence_accuracy`，后两项为 teacher-forced 准确率。`policy.generate_latent_actions(preprocessed_batch)` 可以仅凭当前输入贪心生成 4 个 LAM code ID，用于真正自回归检查，不依赖 LAM 权重或未来帧。
+预训练日志包含 `loss`、`latent_token_accuracy`、`latent_sequence_accuracy`，后两项为 teacher-forced 准确率。`policy.generate_latent_actions(preprocessed_batch)` 可以仅凭当前输入贪心生成 4 个所选 LAM 的 code ID，用于真正自回归检查，不依赖 LAM 权重或未来帧。
 
 ## TensorBoard
 

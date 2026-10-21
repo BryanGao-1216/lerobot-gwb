@@ -1,0 +1,12 @@
+MVP-LAM: Learning Action-Centric Latent Action via Cross-Viewpoint Reconstruction
+Author attribution from the upstream pyproject.toml: Qingwen Bu.
+
+The bundled mvp_model.py and mvp_blocks.py are inference-only adaptations of
+latent_action_model/genie/modules/lam.py and blocks.py in the local vendor/mvp_lam
+checkout used by LAM_test/test_target/mvp_lam. See THIRD_PARTY.md for modifications.
+
+The supplied upstream checkout references a root LICENSE file, but that file is
+absent. Its README displays an Apache-2.0 badge; its pyproject.toml also contains
+an MIT classifier. This notice records those source facts without assigning a
+new license to the upstream files. Other bundled components retain their own
+license files and copyright notices.

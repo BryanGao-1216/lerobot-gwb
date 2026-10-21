@@ -6,6 +6,8 @@ from typing import Any
 from lerobot.configs import PreTrainedConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 
+from .lam.specs import get_lam_spec
+
 
 @PreTrainedConfig.register_subclass("smolvla_lap")
 @dataclass
@@ -17,8 +19,10 @@ class SmolVLALAPConfig(SmolVLAConfig):
     lam_camera_key: str | None = None
     lam_frame_gap: int = 12
     lam_batch_size: int = 8
-    lam_num_tokens: int = 4
-    lam_codebook_size: int = 16
+    # None selects the official specification of lam_type. Resolved values are
+    # saved in checkpoints so that vocabulary dimensions remain stable on reload.
+    lam_num_tokens: int | None = None
+    lam_codebook_size: int | None = None
 
     # Persist the vocabulary mapping alongside the policy, including across stages.
     latent_action_token_ids: list[int] = field(default_factory=list)
@@ -42,12 +46,21 @@ class SmolVLALAPConfig(SmolVLAConfig):
         super().__post_init__()
         if self.training_stage not in {"pre-training", "post-training"}:
             raise ValueError("training_stage must be 'pre-training' or 'post-training'.")
-        if self.lam_type != "univla":
-            raise ValueError(f"Unsupported lam_type={self.lam_type!r}; currently only 'univla' is supported.")
+        spec = get_lam_spec(self.lam_type)
+        self.lam_type = spec.name
         if self.lam_frame_gap < 1 or self.lam_batch_size < 1:
             raise ValueError("lam_frame_gap and lam_batch_size must be positive.")
-        if self.lam_num_tokens != 4 or self.lam_codebook_size != 16:
-            raise ValueError("The bundled UniVLA stage-2 model uses 4 tokens and a 16-entry codebook.")
+        if self.lam_num_tokens is None:
+            self.lam_num_tokens = spec.num_tokens
+        if self.lam_codebook_size is None:
+            self.lam_codebook_size = spec.codebook_size
+        if self.lam_num_tokens != spec.num_tokens or self.lam_codebook_size != spec.codebook_size:
+            raise ValueError(
+                f"{spec.name} uses {spec.num_tokens} tokens and a {spec.codebook_size}-entry codebook. "
+                "Use a matching checkpoint/config or leave the token specification unset for a fresh run."
+            )
+        if self.latent_action_token_ids and len(self.latent_action_token_ids) != spec.codebook_size:
+            raise ValueError("Checkpoint action vocabulary size does not match the selected LAM.")
         if self.n_obs_steps != 1:
             raise ValueError("SmolVLA LAP currently supports n_obs_steps=1.")
         for name in (
@@ -60,7 +73,9 @@ class SmolVLALAPConfig(SmolVLAConfig):
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}.")
         if self.training_stage == "pre-training":
             if not self.lam_model_path:
-                raise ValueError("pre-training requires policy.lam_model_path (UniVLA stage-2 checkpoint).")
+                raise ValueError(
+                    "pre-training requires policy.lam_model_path (checkpoint for the selected LAM)."
+                )
             if not isinstance(self.lam_camera_key, str) or not self.lam_camera_key.strip():
                 raise ValueError("pre-training requires exactly one policy.lam_camera_key.")
             if not self.load_vlm_weights and not self.pretrained_path:

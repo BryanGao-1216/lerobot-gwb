@@ -3,6 +3,8 @@
 export CUDA_VISIBLE_DEVICES=0
 
 # 预训练：修改 LAM 权重路径、单个相机名和数据集路径。
+# --policy.lam_type 支持 univla、lapa、mvp_lam（也接受 mvp-lam）；切换时同步修改权重路径。
+# 图像尺寸和码本大小自动选择，无需手动填写 lam_num_tokens / lam_codebook_size。
 # 后训练：将 --policy.type 替换为 --policy.path=<预训练checkpoint的pretrained_model目录>，
 # 将 --policy.training_stage 改为 post-training，并修改 --output_dir。
 
