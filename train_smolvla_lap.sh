@@ -30,7 +30,6 @@ accelerate launch \
   --policy.output_features=null \
   --policy.chunk_size=12 \
   --policy.n_action_steps=12 \
-  --dataset_type=lerobot \
   --dataset.repo_id=libero_only \
   --dataset.root=/home/gaowenbin/workspace/datasets/libero \
   --output_dir=/home/gaowenbin/workspace/trained_models/smolvla-lap-mvplam \

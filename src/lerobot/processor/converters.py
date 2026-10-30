@@ -26,10 +26,6 @@ import torch
 from lerobot.types import EnvTransition, PolicyAction, RobotAction, RobotObservation, TransitionKey
 from lerobot.utils.constants import (
     ACTION,
-    ACTION_TOKEN,
-    ACTION_TOKEN_DISTANCES,
-    ACTION_TOKENIZER_EFFECT,
-    ACTION_TOKENIZER_INPUT,
     DONE,
     INFO,
     OBS_PREFIX,
@@ -170,10 +166,6 @@ _COMPLEMENTARY_KEYS = (
     "task_index",
     "episode_index",
     "timestamp",
-    ACTION_TOKEN,
-    ACTION_TOKEN_DISTANCES,
-    ACTION_TOKENIZER_EFFECT,
-    ACTION_TOKENIZER_INPUT,
     "language_persistent",
     "language_events",
     "messages",

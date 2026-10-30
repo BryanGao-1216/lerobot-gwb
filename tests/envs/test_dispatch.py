@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 
 import gymnasium as gym
 import pytest
@@ -88,60 +87,6 @@ def test_libero_processor_flattens_state_to_raw_8_dim():
     state = step.observation(observation)[OBS_STATE]
     assert state.shape == (1, 8)
     assert torch.allclose(state, torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 4.0, 5.0]]))
-
-
-def test_libero_processor_uses_loaded_policy_normalizer_state_dim():
-    cfg = LiberoEnv()
-    policy_cfg = SimpleNamespace(type="smolvla", max_state_dim=32)
-    policy_preprocessor = SimpleNamespace(
-        steps=[
-            SimpleNamespace(
-                _tensor_stats={
-                    OBS_STATE: {
-                        "mean": torch.zeros(32),
-                        "std": torch.ones(32),
-                    }
-                }
-            )
-        ]
-    )
-
-    pre, _ = make_env_pre_post_processors(
-        cfg,
-        policy_cfg=policy_cfg,
-        policy_preprocessor=policy_preprocessor,
-    )
-
-    step = pre.steps[0]
-    assert isinstance(step, LiberoProcessorStep)
-    assert step.state_dim == 32
-
-
-def test_libero_processor_keeps_raw_state_for_8d_checkpoint_normalizer():
-    cfg = LiberoEnv()
-    policy_cfg = SimpleNamespace(type="smolvla", max_state_dim=32)
-    policy_preprocessor = SimpleNamespace(
-        steps=[
-            SimpleNamespace(
-                _tensor_stats={
-                    OBS_STATE: {
-                        "mean": torch.zeros(8),
-                        "std": torch.ones(8),
-                    }
-                }
-            )
-        ]
-    )
-
-    pre, _ = make_env_pre_post_processors(
-        cfg,
-        policy_cfg=policy_cfg,
-        policy_preprocessor=policy_preprocessor,
-    )
-
-    step = pre.steps[0]
-    assert isinstance(step, LiberoProcessorStep)
-    assert step.state_dim is None
 
 
 def test_base_create_envs():

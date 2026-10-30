@@ -13,12 +13,9 @@ accelerate launch \
   --policy.output_features=null \
   --policy.chunk_size=20 \
   --policy.n_action_steps=20 \
-  --dataset_type=rlds \
   --dataset.repo_id=libero_only \
-  --dataset.root=/data1/gaowenbing/WorkSpace/datasets/OpenX \
-  --dataset.rlds_storage_format=hybrid \
-  --dataset.rlds_target_control_hz=20 \
-  --output_dir=/data1/gaowenbing/WorkSpace/models/smolvla-libero-baseline-rlds \
+  --dataset.root=/data1/gaowenbing/WorkSpace/datasets/libero \
+  --output_dir=/data1/gaowenbing/WorkSpace/models/smolvla-libero-baseline \
   --steps=60000 \
   --save_freq=10000 \
   --batch_size=128 \

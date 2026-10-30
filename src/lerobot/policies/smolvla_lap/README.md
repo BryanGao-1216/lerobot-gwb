@@ -51,10 +51,10 @@ uv sync --locked --extra smolvla-lap --extra training
 
 UniVLA、LAPA、MVP-LAM 和 DINOv2 必要推理源码已包含在 `lam/`，无需另行安装上游仓库、Lightning、T5、beartype、rotary-embedding-torch 或 FlashAttention。只需提供与类型匹配的 LAM 权重；UniVLA 必须是 **stage-2 LAM** 权重。所有模型参数（包括完整 DINOv2 和 decoder 参数）严格加载，教师始终在当前进程的 CUDA 设备上用 FP32 推理，并保持冻结。`lam_batch_size` 控制教师推理的分块大小，不改变 VLM 训练 batch size。
 
-启动脚本为仓库根目录的 `train_smolvla_lap_lr.sh`，与 `train_pi.sh` 一样，直接在 `accelerate launch` 命令中修改参数：
+启动脚本为仓库根目录的 `train_smolvla_lap.sh`，直接在 `accelerate launch` 命令中修改参数：
 
 ```bash
-bash train_smolvla_lap_lr.sh
+bash train_smolvla_lap.sh
 ```
 
 脚本默认预训练；先修改 `--policy.lam_model_path`、`--policy.lam_camera_key`、数据集路径及输出目录。相机参数只传一个名字，也接受 `observation.images.front` 这样的完整字段。
@@ -102,6 +102,6 @@ ssh -N -L 6006:127.0.0.1:6006 user@server
 
 `--policy.tensorboard_log_dir` 可以指定其他日志目录，相对路径以 `output_dir` 为起点。写入频率通过 `--policy.tensorboard_log_freq` 修改，刷新磁盘间隔默认为 30 秒。参数和梯度直方图默认关闭；需要时添加 `--policy.tensorboard_log_parameters=true`、`--policy.tensorboard_log_gradients=true`，通过 `--policy.tensorboard_histogram_freq` 控制频率（默认 1000 步）。
 
-两阶段的 checkpoint 都保留完整 LAP 策略结构和 special-token 映射。冻结教师不写入 checkpoint；恢复预训练时仍需提供有效的 `lam_model_path`。后训练和连续动作推理不需要 LAM 权重。当前接入支持非 streaming 的 LeRobot 数据集，不包含 RLDS。
+两阶段的 checkpoint 都保留完整 LAP 策略结构和 special-token 映射。冻结教师不写入 checkpoint；恢复预训练时仍需提供有效的 `lam_model_path`。后训练和连续动作推理不需要 LAM 权重。当前接入支持非 streaming 的 LeRobot 数据集。
 
 策略训练部分未执行 CUDA 训练或训练测试；需要在服务器验证实际显存、吞吐和收敛表现。

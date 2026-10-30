@@ -415,58 +415,43 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
-
-        Only cameras that are present and valid for at least one batch item are emitted.
-        Their relative order follows ``config.image_features``. Missing cameras and RLDS
-        placeholder cameras whose padding mask is false for the whole batch do not create
-        image-token groups in the VLM prefix.
         """
-        image_keys = list(self.config.image_features)
-        present_img_keys = [key for key in image_keys if key in batch]
-        if not present_img_keys:
+        images = []
+        img_masks = []
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        missing_img_keys = [key for key in self.config.image_features if key not in batch]
+
+        if len(present_img_keys) == 0:
             raise ValueError(
                 f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
-
-        def preprocess_image(key):
-            raw_img = batch[key]
-            is_temporal = raw_img.ndim == 5
-            img = raw_img[:, -1, :, :, :] if is_temporal else raw_img
+        # Preprocess image features present in the batch
+        for key in present_img_keys:
+            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
-            # Normalize from range [0,1] to [-1,1] as expected by SigLIP.
+            # Normalize from range [0,1] to [-1,1] as expacted by siglip
             img = img * 2.0 - 1.0
 
             bsize = img.shape[0]
-            mask_key = f"{key}_padding_mask"
-            if mask_key in batch:
-                mask = batch[mask_key]
-                if mask.ndim == 0:
-                    mask = mask.expand(bsize)
-                elif is_temporal and mask.ndim >= 2:
-                    mask = mask[:, -1]
-                if mask.ndim != 1 or mask.shape[0] != bsize:
-                    raise ValueError(
-                        f"Expected {mask_key} to resolve to shape ({bsize},), got {tuple(mask.shape)}."
-                    )
-                mask = mask.to(device=img.device, dtype=torch.bool)
+            device = img.device
+            if f"{key}_padding_mask" in batch:
+                mask = batch[f"{key}_padding_mask"].bool()
             else:
-                mask = torch.ones(bsize, dtype=torch.bool, device=img.device)
-            return img, mask
-
-        images = []
-        img_masks = []
-        for key in present_img_keys:
-            img, mask = preprocess_image(key)
-            if not torch.any(mask).item():
-                continue
+                mask = torch.ones(bsize, dtype=torch.bool, device=device)
             images.append(img)
             img_masks.append(mask)
-        if not images:
-            raise ValueError(
-                "All image features in the batch are padding. At least one valid camera is required."
-            )
+
+        # Create image features not present in the batch
+        # as fully 0 padded images.
+        for num_empty_cameras in range(len(missing_img_keys)):
+            if num_empty_cameras >= self.config.empty_cameras:
+                break
+            img = torch.ones_like(img) * -1
+            mask = torch.zeros_like(mask)
+            images.append(img)
+            img_masks.append(mask)
         return images, img_masks
 
     def _pi_aloha_decode_state(self, state):

@@ -47,45 +47,6 @@ class DatasetConfig:
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
 
-    # RLDS/Open-X settings. These fields are ignored unless the top-level
-    # TrainPipelineConfig.dataset_type is set to "rlds". ``repo_id`` remains
-    # required for backwards compatibility and is used as the RLDS data-mix
-    # name when ``rlds_data_mix`` is not provided.
-    rlds_data_mix: str | None = None
-    rlds_mixture_path: str | None = None
-    rlds_shuffle_buffer_size: int = 100_000
-    rlds_balance_weights: bool = True
-    rlds_camera_views: tuple[str, ...] = ("primary", "secondary", "wrist")
-    rlds_resize_size: tuple[int, int] = (256, 256)
-    rlds_skip_unlabeled: bool = True
-    rlds_num_parallel_calls: int = 16
-    # Align every standardized OXE trajectory to one physical control rate
-    # before flow statistics, global normalization and action chunking. The
-    # effect-tokenizer branch preserves its native-rate normalization contract;
-    # zero disables model-side resampling.
-    rlds_target_control_hz: float = 10.0
-    # ``auto`` and ``hybrid`` select local OpenX WebDataset tar shards per
-    # source when they exist under ``root/<dataset_name>/*.tar`` and otherwise
-    # use prepared TFDS/RLDS. A mixed-format mixture is sampled as one stream.
-    # WebDataset shards are streamed in place and are never extracted.
-    rlds_storage_format: str = "auto"
-    # Keep the action convention produced by VQ-VLA's per-dataset OXE
-    # standardizers. ``identity`` is retained as a backwards-compatible alias
-    # for ``oxe``; neither value bypasses the OXE standardizer itself.
-    rlds_action_transform: str = "oxe"
-    rlds_effect_tokenizer_checkpoint_path: str | None = None
-    # Debug-only mode: cache this many fixed RLDS samples, then reshuffle and
-    # repeat only that cache forever. None keeps the normal infinite stream.
-    rlds_overfit_num_samples: int | None = None
-    # Action-code encoding runs inside the main-process collate function. CPU
-    # saves GPU memory; CUDA is faster when memory permits.
-    rlds_action_tokenizer_device: str = "cpu"
-    # If unset, the smallest width that accommodates every selected source is
-    # inferred from their statistics. RLDS proprio vectors are padded only to
-    # that common width for collation; the policy pads to max_state_dim after
-    # normalization, matching the native LeRobot data path.
-    rlds_state_dim: int | None = None
-
     def __post_init__(self) -> None:
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
             raise ValueError(
@@ -93,50 +54,6 @@ class DatasetConfig:
             )
         if not (0.0 <= self.eval_split < 1.0):
             raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
-        if self.rlds_shuffle_buffer_size <= 0:
-            raise ValueError(
-                f"rlds_shuffle_buffer_size must be positive, got {self.rlds_shuffle_buffer_size}"
-            )
-        if len(self.rlds_resize_size) != 2 or any(size <= 0 for size in self.rlds_resize_size):
-            raise ValueError(
-                f"rlds_resize_size must contain two positive values, got {self.rlds_resize_size}"
-            )
-        if self.rlds_num_parallel_calls <= 0:
-            raise ValueError(f"rlds_num_parallel_calls must be positive, got {self.rlds_num_parallel_calls}")
-        if self.rlds_target_control_hz < 0:
-            raise ValueError(
-                "rlds_target_control_hz must be non-negative (zero disables resampling), got "
-                f"{self.rlds_target_control_hz}"
-            )
-        if self.rlds_storage_format not in {"auto", "tfds", "webdataset", "hybrid"}:
-            raise ValueError(
-                "rlds_storage_format must be 'auto', 'tfds', 'webdataset', or 'hybrid', got "
-                f"{self.rlds_storage_format!r}"
-            )
-        if self.rlds_action_transform not in {"oxe", "identity"}:
-            raise ValueError(
-                "rlds_action_transform must be either 'oxe' or its legacy alias 'identity', got "
-                f"{self.rlds_action_transform!r}"
-            )
-        if self.rlds_action_tokenizer_device != "cpu" and not self.rlds_action_tokenizer_device.startswith(
-            "cuda"
-        ):
-            raise ValueError(
-                "rlds_action_tokenizer_device must be 'cpu' or a CUDA device, got "
-                f"{self.rlds_action_tokenizer_device!r}"
-            )
-        if self.rlds_state_dim is not None and self.rlds_state_dim <= 0:
-            raise ValueError(f"rlds_state_dim must be positive when set, got {self.rlds_state_dim}")
-        if self.rlds_overfit_num_samples is not None and self.rlds_overfit_num_samples <= 0:
-            raise ValueError(
-                "rlds_overfit_num_samples must be positive when set, got "
-                f"{self.rlds_overfit_num_samples}"
-            )
-        unknown_camera_views = set(self.rlds_camera_views) - {"primary", "secondary", "wrist"}
-        if unknown_camera_views:
-            raise ValueError(
-                f"rlds_camera_views only supports primary/secondary/wrist, got {sorted(unknown_camera_views)}"
-            )
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):
                 raise ValueError(

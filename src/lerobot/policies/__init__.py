@@ -15,7 +15,6 @@
 from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterpolator
 
 from .act.configuration_act import ACTConfig as ACTConfig
-from .actionmem.configuration_actionmem import ActionMemConfig as ActionMemConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config as EO1Config
 from .evo1.configuration_evo1 import Evo1Config as Evo1Config
@@ -32,7 +31,6 @@ from .pi05.configuration_pi05 import PI05Config as PI05Config
 from .pretrained import PreTrainedPolicy as PreTrainedPolicy
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .smolvla_lap.configuration_smolvla_lap import SmolVLALAPConfig as SmolVLALAPConfig
-from .smolw.configuration_smolw import SmolWConfig as SmolWConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .utils import make_robot_action, prepare_observation_for_inference
 from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig as VLAJEPAConfig
@@ -61,13 +59,11 @@ __all__ = [
     "PI05Config",
     "SmolVLAConfig",
     "SmolVLALAPConfig",
-    "SmolWConfig",
     "TDMPCConfig",
     "VLAJEPAConfig",
     "VQBeTConfig",
     "WallXConfig",
     "XVLAConfig",
-    "ActionMemConfig",
     # Base class
     "PreTrainedPolicy",
     # RTC utilities

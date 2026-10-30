@@ -77,10 +77,6 @@ def _migrate_legacy_rabc_fields(config: dict[str, Any]) -> dict[str, Any] | None
 @dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
-    # Selects the dataset backend used by lerobot-train. The default preserves
-    # the existing LeRobotDataset path; "rlds" enables the optional multi-RLDS
-    # backend shared by SmolVLA and ActionMem policies.
-    dataset_type: str = "lerobot"
     env: envs.EnvConfig | None = None
     policy: PreTrainedConfig | None = None
     reward_model: RewardModelConfig | None = None
@@ -218,10 +214,6 @@ class TrainPipelineConfig(HubMixin):
     def validate(self) -> None:
         self._resolve_pretrained_from_cli()
 
-        self.dataset_type = self.dataset_type.lower()
-        if self.dataset_type not in {"lerobot", "rlds"}:
-            raise ValueError(f"dataset_type must be either 'lerobot' or 'rlds', got {self.dataset_type!r}.")
-
         if self.policy is None and self.reward_model is None:
             raise ValueError(
                 "Neither policy nor reward_model is configured. "
@@ -251,38 +243,8 @@ class TrainPipelineConfig(HubMixin):
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/train") / train_dir
 
-        if self.dataset_type == "lerobot" and isinstance(self.dataset.repo_id, list):
+        if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
-
-        if self.dataset_type == "rlds":
-            if self.dataset.root is None:
-                raise ValueError("dataset.root is required when dataset_type='rlds'.")
-            if self.dataset.episodes is not None:
-                raise ValueError("dataset.episodes is not supported when dataset_type='rlds'.")
-            if self.dataset.eval_split != 0.0 or self.eval_steps > 0:
-                raise ValueError(
-                    "RLDS held-out evaluation is not implemented yet; use dataset.eval_split=0 and eval_steps=0."
-                )
-            if self.is_reward_model_training:
-                raise ValueError("dataset_type='rlds' currently supports policy training only.")
-            if self.sample_weighting is not None:
-                raise ValueError(
-                    "sample_weighting is not supported with dataset_type='rlds'; configure source weights in "
-                    "dataset.rlds_mixture_path instead."
-                )
-            if self.trainable_config.type not in {
-                "actionmem",
-                "smolvla",
-            }:
-                raise ValueError(
-                    "dataset_type='rlds' currently supports SmolVLA and ActionMem-family policies, got "
-                    f"{self.trainable_config.type!r}."
-                )
-            if getattr(self.trainable_config, "use_relative_actions", False):
-                raise ValueError(
-                    "The VQ-VLA OXE standardizers already emit relative EEF actions; set "
-                    "policy.use_relative_actions=false to avoid applying a second delta transform."
-                )
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")

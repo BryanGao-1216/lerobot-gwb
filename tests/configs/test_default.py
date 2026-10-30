@@ -14,7 +14,6 @@
 import pytest
 
 from lerobot.configs.default import DatasetConfig
-from lerobot.configs.parser import normalize_cli_aliases
 
 
 def test_dataset_config_valid():
@@ -37,56 +36,3 @@ def test_dataset_config_none_episodes_ok():
 
 def test_dataset_config_empty_episodes_ok():
     DatasetConfig(repo_id="user/repo", episodes=[])
-
-
-def test_dataset_config_rlds_defaults_are_valid():
-    config = DatasetConfig(repo_id="actionmem_mix")
-
-    assert config.rlds_data_mix is None
-    assert config.rlds_camera_views == ("primary", "secondary", "wrist")
-    assert config.rlds_storage_format == "auto"
-    assert config.rlds_action_transform == "oxe"
-    assert config.rlds_target_control_hz == 10.0
-    assert not hasattr(config, "rlds_backend_path")
-
-
-def test_dataset_config_accepts_hybrid_rlds_storage():
-    config = DatasetConfig(repo_id="actionmem_mix", rlds_storage_format="hybrid")
-
-    assert config.rlds_storage_format == "hybrid"
-
-
-def test_rlds_storage_format_cli_alias_matches_mystudy():
-    assert normalize_cli_aliases(["--rlds-storage-format=hybrid"]) == [
-        "--dataset.rlds_storage_format=hybrid"
-    ]
-
-
-def test_target_control_hz_cli_alias_matches_mystudy():
-    assert normalize_cli_aliases(["--target-control-hz=10"]) == [
-        "--dataset.rlds_target_control_hz=10"
-    ]
-
-
-def test_rlds_overfit_num_samples_cli_alias():
-    assert normalize_cli_aliases(["--rlds-overfit-num-samples=100"]) == [
-        "--dataset.rlds_overfit_num_samples=100"
-    ]
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    [
-        ({"rlds_shuffle_buffer_size": 0}, "shuffle_buffer_size"),
-        ({"rlds_resize_size": (256, 0)}, "resize_size"),
-        ({"rlds_action_transform": "unknown"}, "action_transform"),
-        ({"rlds_storage_format": "pickle"}, "storage_format"),
-        ({"rlds_action_tokenizer_device": "mps"}, "action_tokenizer_device"),
-        ({"rlds_target_control_hz": -1}, "target_control_hz"),
-        ({"rlds_overfit_num_samples": 0}, "overfit_num_samples"),
-        ({"rlds_camera_views": ("primary", "overhead")}, "camera_views"),
-    ],
-)
-def test_dataset_config_rejects_invalid_rlds_settings(kwargs, message):
-    with pytest.raises(ValueError, match=message):
-        DatasetConfig(repo_id="actionmem_mix", **kwargs)

@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 import math
 from pprint import pformat
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -32,9 +31,6 @@ from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .streaming_dataset import StreamingLeRobotDataset
-
-if TYPE_CHECKING:
-    from .rlds_dataset import ActionMemRLDSDataset
 
 
 def resolve_delta_timestamps(
@@ -79,7 +75,7 @@ def resolve_delta_timestamps(
 
 def make_dataset(
     cfg: TrainPipelineConfig,
-) -> LeRobotDataset | MultiLeRobotDataset | ActionMemRLDSDataset:
+) -> LeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
@@ -92,12 +88,8 @@ def make_dataset(
         LeRobotDataset | MultiLeRobotDataset
     """
     is_lap = cfg.policy is not None and cfg.policy.type == "smolvla_lap"
-    if is_lap and (cfg.dataset_type != "lerobot" or cfg.dataset.streaming):
+    if is_lap and cfg.dataset.streaming:
         raise ValueError("smolvla_lap currently requires a non-streaming LeRobot dataset.")
-    if cfg.dataset_type == "rlds":
-        from .rlds_dataset import make_policy_rlds_dataset
-
-        return make_policy_rlds_dataset(cfg)
 
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
@@ -169,16 +161,13 @@ def _policy_dataset_class(cfg: TrainPipelineConfig):
 
 def make_train_eval_datasets(
     cfg: TrainPipelineConfig,
-) -> tuple[LeRobotDataset | MultiLeRobotDataset | ActionMemRLDSDataset, LeRobotDataset | None]:
+) -> tuple[LeRobotDataset | MultiLeRobotDataset, LeRobotDataset | None]:
     """Create train and optional eval datasets by splitting episodes based on eval_split.
 
     The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
     If eval_split == 0.0, returns (full_dataset, None).
     """
     full_dataset = make_dataset(cfg)
-
-    if cfg.dataset_type == "rlds":
-        return full_dataset, None
 
     if cfg.dataset.eval_split == 0.0:
         return full_dataset, None

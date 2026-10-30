@@ -171,10 +171,6 @@ def make_pre_post_processors(
         ValueError: If no processor factory exists for the given policy configuration type.
     """
     if pretrained_path:
-        # SmolW processors may contain their policy-local registered tail-padding
-        # step. Import it before deserializing the saved pipeline.
-        if policy_cfg.type == "smolw":
-            from .smolw import processor_smolw as _smolw_processor  # noqa: F401
         if policy_cfg.type == "smolvla_lap":
             from .smolvla_lap import processor_smolvla_lap as _lap_processor  # noqa: F401
 
@@ -225,14 +221,6 @@ def make_pre_post_processors(
             from .evo1.processor_evo1 import reconcile_evo1_processors
 
             preprocessor, postprocessor = reconcile_evo1_processors(
-                policy_cfg,
-                preprocessor,
-                postprocessor,
-            )
-        if policy_cfg.type == "smolw":
-            from .smolw.processor_smolw import reconcile_smolw_processors
-
-            preprocessor, postprocessor = reconcile_smolw_processors(
                 policy_cfg,
                 preprocessor,
                 postprocessor,

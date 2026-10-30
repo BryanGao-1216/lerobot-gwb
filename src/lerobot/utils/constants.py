@@ -32,18 +32,8 @@ OBS_LANGUAGE_SUBTASK_ATTENTION_MASK = OBS_LANGUAGE_SUBTASK + ".attention_mask"
 
 ACTION = "action"
 ACTION_PREFIX = ACTION + "."
-ACTION_TOKEN = "action_token"
 ACTION_TOKENS = ACTION + ".tokens"
 ACTION_TOKEN_MASK = ACTION + ".token_mask"
-ACTION_TOKEN_DISTANCES = ACTION + ".token_distances"
-# Target-rate per-source BOUNDS_Q99 chunk retained for OXE filters and
-# diagnostics. Code labels use ``ACTION_TOKENIZER_EFFECT`` below, which is
-# computed before target-rate resampling.
-ACTION_TOKENIZER_INPUT = ACTION + ".tokenizer_input"
-# Seven-dimensional endpoint effect computed from a native-rate, per-source
-# q01/q99-normalized action window. This is the exact MLP input used by the
-# physical-time effect tokenizer.
-ACTION_TOKENIZER_EFFECT = ACTION + ".tokenizer_effect"
 REWARD = "next.reward"
 TRUNCATED = "next.truncated"
 DONE = "next.done"

@@ -37,14 +37,13 @@ def make_env_config(env_type: str, **kwargs) -> EnvConfig:
 def make_env_pre_post_processors(
     env_cfg: EnvConfig,
     policy_cfg: Any,
-    policy_preprocessor: Any | None = None,
 ) -> tuple[Any, Any]:
     """
     Create preprocessor and postprocessor pipelines for environment observations.
 
     Returns a tuple of (preprocessor, postprocessor). By default, delegates to
-    ``env_cfg.get_env_processors()``. Policy-specific adaptations stay here
-    when they depend on the policy config rather than the environment config.
+    ``env_cfg.get_env_processors()``.  The XVLAConfig policy-specific override
+    stays here because it depends on the *policy* config, not the env config.
     """
     from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 
@@ -53,38 +52,7 @@ def make_env_pre_post_processors(
 
         return make_xvla_libero_pre_post_processors()
 
-    preprocessor, postprocessor = env_cfg.get_env_processors()
-
-    # LIBERO itself always emits the canonical 8-D state. A mixed RLDS policy may
-    # nevertheless normalize a wider shared proprio schema because other sources
-    # in the mixture require more dimensions. Infer that exact width from the
-    # loaded preprocessor; never pad merely because the model internally supports
-    # max_state_dim=32.
-    normalizer_state_dim = None
-    if policy_preprocessor is not None:
-        for policy_step in policy_preprocessor.steps:
-            state_stats = getattr(policy_step, "_tensor_stats", {}).get("observation.state", {})
-            for stat_name in ("mean", "std", "min", "max", "q01", "q99"):
-                stat = state_stats.get(stat_name)
-                if stat is not None and getattr(stat, "ndim", 0) > 0:
-                    normalizer_state_dim = int(stat.numel())
-                    break
-            if normalizer_state_dim is not None:
-                break
-
-    if normalizer_state_dim is not None:
-        from lerobot.processor import LiberoProcessorStep
-
-        for step in preprocessor.steps:
-            if isinstance(step, LiberoProcessorStep):
-                if normalizer_state_dim < 8:
-                    raise ValueError(
-                        "A LIBERO policy normalizer cannot expect fewer than the raw 8 state dimensions, "
-                        f"got {normalizer_state_dim}."
-                    )
-                step.state_dim = normalizer_state_dim if normalizer_state_dim > 8 else None
-
-    return preprocessor, postprocessor
+    return env_cfg.get_env_processors()
 
 
 def make_env(

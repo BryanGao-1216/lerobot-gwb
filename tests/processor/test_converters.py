@@ -27,10 +27,6 @@ from lerobot.processor.converters import (
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import (
     ACTION,
-    ACTION_TOKEN,
-    ACTION_TOKEN_DISTANCES,
-    ACTION_TOKENIZER_EFFECT,
-    ACTION_TOKENIZER_INPUT,
     DONE,
     OBS_STATE,
     OBS_STR,
@@ -251,29 +247,6 @@ def test_batch_to_transition_with_index_fields():
     assert torch.equal(comp_data["index"], batch["index"])
     assert torch.equal(comp_data["task_index"], batch["task_index"])
     assert comp_data["task"] == batch["task"]
-
-
-def test_batch_to_transition_preserves_action_token():
-    batch = {
-        OBS_STATE: torch.randn(2, 7),
-        ACTION: torch.randn(2, 4),
-        "task": ["pick_cube", "place_cube"],
-        ACTION_TOKEN: torch.tensor([[0], [255]], dtype=torch.int64),
-        ACTION_TOKEN_DISTANCES: torch.randn(2, 256),
-        ACTION_TOKENIZER_INPUT: torch.randn(2, 16, 7),
-        ACTION_TOKENIZER_EFFECT: torch.randn(2, 7),
-    }
-
-    transition = batch_to_transition(batch)
-    comp_data = transition[TransitionKey.COMPLEMENTARY_DATA]
-
-    assert torch.equal(comp_data[ACTION_TOKEN], batch[ACTION_TOKEN])
-    assert torch.equal(
-        comp_data[ACTION_TOKEN_DISTANCES],
-        batch[ACTION_TOKEN_DISTANCES],
-    )
-    assert torch.equal(comp_data[ACTION_TOKENIZER_INPUT], batch[ACTION_TOKENIZER_INPUT])
-    assert torch.equal(comp_data[ACTION_TOKENIZER_EFFECT], batch[ACTION_TOKENIZER_EFFECT])
 
 
 def testtransition_to_batch_with_index_fields():

@@ -44,19 +44,7 @@ class LiberoProcessorStep(ObservationProcessorStep):
     **Image Processing:**
     -   Rotates images by 180 degrees by flipping both height and width dimensions.
     -   This accounts for the HuggingFaceVLA/libero camera orientation convention.
-
-    Args:
-        state_dim: Optional output width for ``observation.state``. The raw LIBERO
-            state has 8 values. A larger width is used only when a mixed-dataset
-            policy preprocessor explicitly contains wider shared state statistics;
-            ``None`` preserves the canonical 8-D LIBERO interface.
     """
-
-    state_dim: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.state_dim is not None and self.state_dim < 8:
-            raise ValueError(f"LiberoProcessorStep state_dim must be at least 8, got {self.state_dim}.")
 
     def _process_observation(self, observation):
         """
@@ -90,8 +78,6 @@ class LiberoProcessorStep(ObservationProcessorStep):
             state = state.float()
             if state.dim() == 1:
                 state = state.unsqueeze(0)
-            if self.state_dim is not None and state.shape[-1] < self.state_dim:
-                state = torch.nn.functional.pad(state, (0, self.state_dim - state.shape[-1]))
 
             processed_obs[OBS_STATE] = state
         return processed_obs
@@ -115,7 +101,7 @@ class LiberoProcessorStep(ObservationProcessorStep):
         # add our new flattened state
         state_feats[OBS_STATE] = PolicyFeature(
             type=FeatureType.STATE,
-            shape=(self.state_dim or 8,),  # [eef_pos(3), axis_angle(3), gripper(2), optional padding]
+            shape=(8,),  # [eef_pos(3), axis_angle(3), gripper(2)]
         )
 
         new_features[FeatureType.STATE] = state_feats

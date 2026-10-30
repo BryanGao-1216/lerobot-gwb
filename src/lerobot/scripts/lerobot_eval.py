@@ -769,7 +769,6 @@ def eval_main(cfg: EvalPipelineConfig):
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(
         env_cfg=cfg.env,
         policy_cfg=cfg.policy,
-        policy_preprocessor=preprocessor,
     )
 
     recording_dir = Path(cfg.output_dir) / "recordings" if cfg.eval.recording else None
