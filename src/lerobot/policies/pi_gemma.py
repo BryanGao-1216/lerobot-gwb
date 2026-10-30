@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from inspect import signature
 from typing import TYPE_CHECKING
 
 import torch
@@ -261,14 +262,24 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
+        if attention_mask is not None and attention_mask.ndim == 4:
+            # PI policies already supply a complete additive mask, including
+            # bidirectional observation prefixes and causal latent suffixes.
+            # Preserve it exactly instead of rebuilding it through HF's API.
+            causal_mask = attention_mask
+        else:
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            # Transformers releases differ on whether this argument exists.
+            # Modern helpers infer cache offsets from past_key_values.
+            if "cache_position" in signature(create_causal_mask).parameters:
+                mask_kwargs["cache_position"] = cache_position
+            causal_mask = create_causal_mask(**mask_kwargs)
 
         # embed positions
         hidden_states = inputs_embeds

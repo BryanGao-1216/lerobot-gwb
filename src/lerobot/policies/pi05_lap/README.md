@@ -58,6 +58,10 @@ checkpoint 同时保存 `latent_tokenizer/` 和 `latent_action_tokens.json`，�
 原始 checkpoint 的 `config.json` 保持 `type: pi05`，processor 中的 Google tokenizer 名称也无需手工改写；
 启动参数 `policy.type=pi05_lap`、`policy.tokenizer_path=...` 会负责配置转换和 tokenizer 覆盖。
 
+共享 `pi_gemma.py` 对策略已构造的四维注意力 mask 直接使用，保留 prefix 和 latent suffix 的
+注意力关系；需要自动构造 causal mask 时，按 Transformers 实际接口决定是否传入
+`cache_position`，兼容不再接收此参数的版本。
+
 ## 动作微调
 
 将启动脚本中的 `policy.path` 改为预训练输出的 `pretrained_model` 目录，

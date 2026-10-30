@@ -26,6 +26,7 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.dataset_reader import DatasetReader
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.policies import pi_gemma
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
@@ -232,7 +233,11 @@ def batch():
     }
 
 
-def test_actual_decoder_has_no_future_label_leak(tiny_policy):
+def test_actual_decoder_has_no_future_label_leak(tiny_policy, monkeypatch):
+    def reject_mask_rebuild(**kwargs):
+        raise AssertionError("The explicitly constructed 4D prefix/causal mask must be used unchanged.")
+
+    monkeypatch.setattr(pi_gemma, "create_causal_mask", reject_mask_rebuild)
     policy = tiny_policy()
     policy.eval()
     data = batch()
@@ -245,6 +250,55 @@ def test_actual_decoder_has_no_future_label_leak(tiny_policy):
     second = policy.model.latent_action_logits(*args, changed)
     torch.testing.assert_close(first[:, :-1], second[:, :-1], rtol=0, atol=0)
     assert not torch.equal(first[:, -1], second[:, -1])
+
+
+@pytest.mark.parametrize("mask_api", ["with_cache_position", "without_cache_position"])
+def test_implicit_causal_mask_works_across_transformers_apis(tiny_policy, monkeypatch, mask_api):
+    policy = tiny_policy()
+    language_model = policy.model.paligemma_with_expert.paligemma.model.language_model
+    language_model.config._attn_implementation = "eager"
+    original = pi_gemma.create_causal_mask
+    positions = []
+
+    def legacy(*, config, inputs_embeds, attention_mask, past_key_values, position_ids, cache_position):
+        torch.testing.assert_close(cache_position, position_ids[0])
+        positions.append(cache_position.tolist())
+        return original(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+
+    def modern(*, config, inputs_embeds, attention_mask, past_key_values, position_ids):
+        positions.append(position_ids[0].tolist())
+        return original(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+
+    monkeypatch.setattr(
+        pi_gemma, "create_causal_mask", legacy if mask_api == "with_cache_position" else modern
+    )
+    tokens = torch.tensor([[1, 2, 3]])
+    prefix = language_model(input_ids=tokens, attention_mask=torch.ones_like(tokens), use_cache=True)
+    step = language_model(
+        input_ids=torch.tensor([[4]]),
+        attention_mask=torch.ones(1, 4),
+        past_key_values=prefix.past_key_values,
+        use_cache=True,
+    )
+    assert positions == [[0, 1, 2], [3]]
+    full = language_model(input_ids=torch.tensor([[1, 2, 3, 4]]), use_cache=False)
+    torch.testing.assert_close(
+        step.last_hidden_state[:, -1], full.last_hidden_state[:, -1], atol=1e-6, rtol=1e-5
+    )
+    full.last_hidden_state.square().mean().backward()
+    assert language_model.get_input_embeddings().weight.grad is not None
 
 
 @pytest.mark.parametrize("gradient_checkpointing", [False, True])
