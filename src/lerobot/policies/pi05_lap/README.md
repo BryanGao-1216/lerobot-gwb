@@ -80,4 +80,8 @@ checkpoint 同时保存 `latent_tokenizer/` 和 `latent_action_tokens.json`，�
 sh train_pi05_lap.sh
 ```
 
+启动脚本显式使用 `--dataset.video_backend=pyav`。如果 TorchCodec 报
+`Could not load libtorchcodec`，并提示缺少 `libavutil.so.*`，可使用这一现有后端
+读取视频；该设置只影响数据解码，PI05 和 UniVLA 仍在 CUDA 上运行。
+
 服务器 CUDA 训练和实际 checkpoint 的效果需在目标服务器验证。

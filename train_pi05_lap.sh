@@ -6,6 +6,7 @@ export CUDA_VISIBLE_DEVICES=0
 # 后训练：policy.path 改为预训练输出的 pretrained_model 目录，
 # training_stage 改为 post-training，同时修改 output_dir；无需 LAM 权重。
 # H = chunk_size。lam_camera_key 只能填一个；省略则自动选择主视角。
+# 使用 PyAV 解码视频，避免 TorchCodec 依赖的系统 FFmpeg 动态库缺失。
 
 accelerate launch \
   --num_processes=1 \
@@ -30,6 +31,7 @@ accelerate launch \
   --policy.n_action_steps=12 \
   --dataset.repo_id=libero_only \
   --dataset.root=/gaowenbin/datasets/libero \
+  --dataset.video_backend=pyav \
   --output_dir=/gaowenbin/models/trained_models/PI05-lap-pretrain \
   --steps=100000 \
   --save_freq=10000 \
