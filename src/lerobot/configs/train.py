@@ -166,7 +166,12 @@ class TrainPipelineConfig(HubMixin):
             self.reward_model.pretrained_path = str(Path(reward_model_path))
         elif policy_path:
             overrides = parser.get_yaml_overrides("policy") + (parser.get_cli_overrides("policy") or [])
-            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=overrides)
+            if parser.get_type_arg("policy") == "pi05_lap":
+                from lerobot.policies.pi05_lap.configuration_pi05_lap import PI05LAPConfig
+
+                self.policy = PI05LAPConfig.from_pretrained(policy_path, cli_overrides=overrides)
+            else:
+                self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=overrides)
             self.policy.pretrained_path = Path(policy_path)
         elif self.resume:
             self._resolve_resume_checkpoint()
@@ -221,6 +226,13 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if active_cfg.type == "pi05_lap" and active_cfg.training_stage == "pre-training":
+            if active_cfg.pretrained_path is None:
+                raise ValueError("PI05 LAP pre-training must start from --policy.path=<PI05 checkpoint>.")
+            if not active_cfg.lam_model_path:
+                raise ValueError(
+                    "PI05 LAP pre-training requires --policy.lam_model_path=<UniVLA stage-2 ckpt>."
+                )
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "

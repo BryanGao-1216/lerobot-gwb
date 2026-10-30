@@ -216,7 +216,7 @@ wallx = [
 pi = ["lerobot[transformers-dep]", "lerobot[scipy-dep]"]
 molmoact2 = ["lerobot[transformers-dep]", "lerobot[peft-dep]", "lerobot[scipy-dep]"]
 smolvla = ["lerobot[transformers-dep]", "num2words>=0.5.14,<0.6.0", "lerobot[accelerate-dep]"]
-smolvla-lap = ["lerobot[smolvla]"]
+pi05-lap = ["lerobot[pi]"]
 multi_task_dit = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]"]
 groot = [
     "lerobot[transformers-dep]",
@@ -317,7 +317,7 @@ all = [
     "lerobot[pi]",
     "lerobot[molmoact2]",
     "lerobot[smolvla]",
-    "lerobot[smolvla-lap]",
+    "lerobot[pi05-lap]",
     "lerobot[fastwam]",
     "lerobot[groot]",
     "lerobot[xvla]",
@@ -380,9 +380,8 @@ torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 lerobot = [
     "envs/*.json",
     "annotations/steerable_pipeline/prompts/*.txt",
-    "policies/smolvla_lap/lam/LICENSE-*",
-    "policies/smolvla_lap/lam/NOTICE-*",
-    "policies/smolvla_lap/lam/THIRD_PARTY.md",
+    "policies/pi05_lap/lam/LICENSE-*",
+    "policies/pi05_lap/lam/THIRD_PARTY.md",
 ]
 
 [tool.setuptools.packages.find]
@@ -396,14 +395,9 @@ exclude = [
     "*_pb2.py",
     "*_pb2_grpc.py",
     # Keep vendored inference mathematics close to upstream; syntax checked separately.
-    "src/lerobot/policies/smolvla_lap/lam/dinov2/**/*.py",
-    "src/lerobot/policies/smolvla_lap/lam/univla_blocks.py",
-    "src/lerobot/policies/smolvla_lap/lam/univla_model.py",
-    "src/lerobot/policies/smolvla_lap/lam/lapa_model.py",
-    "src/lerobot/policies/smolvla_lap/lam/lapa_attention.py",
-    "src/lerobot/policies/smolvla_lap/lam/lapa_nsvq.py",
-    "src/lerobot/policies/smolvla_lap/lam/mvp_model.py",
-    "src/lerobot/policies/smolvla_lap/lam/mvp_blocks.py",
+    "src/lerobot/policies/pi05_lap/lam/dinov2/**/*.py",
+    "src/lerobot/policies/pi05_lap/lam/univla_blocks.py",
+    "src/lerobot/policies/pi05_lap/lam/univla_model.py",
 ]
 
 [tool.ruff.lint]

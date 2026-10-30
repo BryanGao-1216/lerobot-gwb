@@ -62,10 +62,10 @@ def resolve_delta_timestamps(
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
-    if cfg.type == "smolvla_lap" and cfg.training_stage == "pre-training":
+    if cfg.type == "pi05_lap" and cfg.training_stage == "pre-training":
         camera = cfg.resolve_lam_camera_key(ds_meta.features)
         # Only this camera gets a future frame. State and all student views stay at t.
-        delta_timestamps[camera] = [0.0, cfg.lam_frame_gap / ds_meta.fps]
+        delta_timestamps[camera] = [0.0, cfg.chunk_size / ds_meta.fps]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
@@ -87,9 +87,13 @@ def make_dataset(
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
-    is_lap = cfg.policy is not None and cfg.policy.type == "smolvla_lap"
+    is_lap = (
+        cfg.policy is not None
+        and cfg.policy.type == "pi05_lap"
+        and cfg.policy.training_stage == "pre-training"
+    )
     if is_lap and cfg.dataset.streaming:
-        raise ValueError("smolvla_lap currently requires a non-streaming LeRobot dataset.")
+        raise ValueError("pi05_lap pre-training requires a non-streaming LeRobot dataset.")
 
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
@@ -152,10 +156,14 @@ def make_dataset(
 
 
 def _policy_dataset_class(cfg: TrainPipelineConfig):
-    if cfg.policy is not None and cfg.policy.type == "smolvla_lap":
-        from lerobot.policies.smolvla_lap.dataset import SmolVLALAPDataset
+    if (
+        cfg.policy is not None
+        and cfg.policy.type == "pi05_lap"
+        and cfg.policy.training_stage == "pre-training"
+    ):
+        from lerobot.policies.pi05_lap.dataset import PI05LAPDataset
 
-        return SmolVLALAPDataset, {"policy_config": cfg.policy}
+        return PI05LAPDataset, {"policy_config": cfg.policy}
     return LeRobotDataset, {}
 
 

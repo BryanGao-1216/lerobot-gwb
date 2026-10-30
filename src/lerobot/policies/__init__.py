@@ -28,9 +28,9 @@ from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as M
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
+from .pi05_lap.configuration_pi05_lap import PI05LAPConfig as PI05LAPConfig
 from .pretrained import PreTrainedPolicy as PreTrainedPolicy
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
-from .smolvla_lap.configuration_smolvla_lap import SmolVLALAPConfig as SmolVLALAPConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .utils import make_robot_action, prepare_observation_for_inference
 from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig as VLAJEPAConfig
@@ -57,8 +57,8 @@ __all__ = [
     "PI0Config",
     "PI0FastConfig",
     "PI05Config",
+    "PI05LAPConfig",
     "SmolVLAConfig",
-    "SmolVLALAPConfig",
     "TDMPCConfig",
     "VLAJEPAConfig",
     "VQBeTConfig",

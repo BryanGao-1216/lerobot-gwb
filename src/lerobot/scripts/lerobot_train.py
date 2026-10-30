@@ -332,10 +332,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             peft_cli_overrides = dataclasses.asdict(cfg.peft)
             policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
-    configure_training_stage = getattr(policy, "configure_training_stage", None)
-    if callable(configure_training_stage):
-        configure_training_stage()
-
     # Wait for all processes to finish model creation before continuing
     accelerator.wait_for_everyone()
 

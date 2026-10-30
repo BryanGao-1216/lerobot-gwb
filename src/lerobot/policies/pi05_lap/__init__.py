@@ -1,4 +1,6 @@
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+#!/usr/bin/env python
+
+# Copyright 2025 Physical Intelligence and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configuration_smolvla_lap import SmolVLALAPConfig
+from .configuration_pi05_lap import PI05LAPConfig
 
-__all__ = ["SmolVLALAPConfig"]
+__all__ = ["PI05LAPConfig"]

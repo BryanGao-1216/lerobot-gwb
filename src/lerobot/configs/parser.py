@@ -215,7 +215,10 @@ def filter_path_args(fields_to_filter: str | list[str], args: Sequence[str] | No
 
     for field in fields_to_filter:
         if get_path_arg(field, args):
-            if get_type_arg(field, args):
+            # PI05 LAP explicitly converts an original PI05 checkpoint's config
+            # into its new policy type in TrainPipelineConfig.
+            is_pi05_lap_conversion = field == "policy" and get_type_arg(field, args) == "pi05_lap"
+            if get_type_arg(field, args) and not is_pi05_lap_conversion:
                 raise ArgumentError(
                     argument=None,
                     message=f"Cannot specify both --{field}.{PATH_KEY} and --{field}.{draccus.CHOICE_TYPE_KEY}",

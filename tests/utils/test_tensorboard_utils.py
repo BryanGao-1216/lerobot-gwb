@@ -40,12 +40,12 @@ def _make_cfg(tmp_path):
         tensorboard_log_gradients=True,
         tensorboard_max_queue=7,
         tensorboard_flush_secs=11,
-        tensorboard_filename_suffix=".smolvla_lap",
+        tensorboard_filename_suffix=".pi05_lap",
     )
     return SimpleNamespace(
         policy=policy,
         output_dir=tmp_path,
-        to_dict=lambda: {"policy": {"type": "smolvla_lap"}},
+        to_dict=lambda: {"policy": {"type": "pi05_lap"}},
     )
 
 
