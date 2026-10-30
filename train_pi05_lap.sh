@@ -35,7 +35,12 @@ accelerate launch \
   --output_dir=/gaowenbin/models/trained_models/PI05-lap-pretrain \
   --steps=100000 \
   --save_freq=10000 \
-  --batch_size=4 \
+  --batch_size=16 \
   --env_eval_freq=0 \
   --eval_steps=0 \
-  --policy.push_to_hub=false
+  --policy.push_to_hub=false \
+  --wandb.enable=true \
+  --wandb.project=pi05-lap \
+  --wandb.disable_artifact=true \
+  --job_name=pi05-lap-pretrain \
+  --log_freq=10 \
