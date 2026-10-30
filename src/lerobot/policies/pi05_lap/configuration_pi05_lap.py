@@ -39,6 +39,7 @@ class PI05LAPConfig(PreTrainedConfig):
     lam_model_path: str | None = None
     # None selects the primary RGB view from dataset metadata; accepts one short or full key.
     lam_camera_key: str | None = None
+    tokenizer_path: str = "google/paligemma-3b-pt-224"
 
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
@@ -118,6 +119,8 @@ class PI05LAPConfig(PreTrainedConfig):
 
         if self.training_stage not in {"pre-training", "post-training"}:
             raise ValueError("training_stage must be 'pre-training' or 'post-training'.")
+        if not self.tokenizer_path.strip():
+            raise ValueError("tokenizer_path must be a tokenizer directory or Hugging Face model ID.")
         if self.chunk_size < 1:
             raise ValueError("chunk_size must be positive.")
         if self.lam_camera_key is not None and (

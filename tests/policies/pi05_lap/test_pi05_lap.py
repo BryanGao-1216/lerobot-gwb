@@ -5,6 +5,7 @@ training run, or production checkpoints are needed.
 """
 
 import json
+import shutil
 import sys
 from dataclasses import replace
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.dataset_reader import DatasetReader
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 from lerobot.policies.pi05_lap import modeling_pi05_lap as lap
@@ -32,6 +34,7 @@ from lerobot.policies.pi05_lap.checkpoint import EMBEDDING_KEY, HEAD_KEY, load_s
 from lerobot.policies.pi05_lap.configuration_pi05_lap import LAM_IMAGE_PAIR, PI05LAPConfig
 from lerobot.policies.pi05_lap.dataset import PI05LAPDataset
 from lerobot.policies.pi05_lap.lam.univla import load_lam_state
+from lerobot.policies.pi05_lap.processor_pi05_lap import make_pi05_lap_pre_post_processors
 from lerobot.policies.pi05_lap.vocabulary import (
     LATENT_CODES,
     LATENT_START,
@@ -39,6 +42,7 @@ from lerobot.policies.pi05_lap.vocabulary import (
     LatentActionVocabulary,
     extend_vlm_vocabulary,
 )
+from lerobot.processor import TokenizerProcessorStep
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
 CAMERA = "observation.images.image"
@@ -127,6 +131,7 @@ def test_native_config_cli_conversion(tmp_path, monkeypatch):
             "--policy.lam_model_path=/tmp/lam.ckpt",
             "--policy.chunk_size=12",
             "--policy.lam_camera_key=image2",
+            "--policy.tokenizer_path=/tmp/local-tokenizer",
         ],
     )
     cfg = SimpleNamespace(resume=False)
@@ -137,6 +142,7 @@ def test_native_config_cli_conversion(tmp_path, monkeypatch):
     assert cfg.policy.chunk_size == 12
     assert cfg.policy.max_state_dim == 18
     assert cfg.policy.pretrained_path == tmp_path
+    assert cfg.policy.tokenizer_path == "/tmp/local-tokenizer"
 
 
 @pytest.fixture
@@ -330,3 +336,59 @@ def test_native_checkpoint_expands_only_new_rows(tiny_policy, tmp_path):
     for key in (EMBEDDING_KEY, HEAD_KEY):
         torch.testing.assert_close(restored[key][:257152], state[key], rtol=0, atol=0)
         torch.testing.assert_close(restored[key][257152:], new_rows[key], rtol=0, atol=0)
+
+
+def test_local_tokenizer_used_for_initialization_and_saved_processor(tiny_policy, tmp_path):
+    directory = tmp_path / "local-tokenizer"
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(models.WordLevel({"<unk>": 0, "Task": 1}, unk_token="<unk>")),
+        unk_token="<unk>",
+        pad_token="<unk>",
+    )
+    tokenizer.save_pretrained(directory)
+    original_file = (directory / "tokenizer.json").read_bytes()
+    vocabulary = LatentActionVocabulary.create(str(directory), local_files_only=True)
+    assert len(vocabulary.tokenizer) == len(tokenizer) + 17
+    assert vocabulary.tokenizer.convert_tokens_to_ids("Task") == 1
+    assert (directory / "tokenizer.json").read_bytes() == original_file
+
+    config = replace(tiny_policy().config, tokenizer_path=str(directory))
+    pre, post = make_pi05_lap_pre_post_processors(config)
+    step = next(s for s in pre.steps if isinstance(s, TokenizerProcessorStep))
+    assert len(step.input_tokenizer) == len(tokenizer)
+
+    source = tmp_path / "native-pi05"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"type": "pi05"}))
+    pre.save_pretrained(source, config_filename="policy_preprocessor.json")
+    post.save_pretrained(source, config_filename="policy_postprocessor.json")
+    saved = json.loads((source / "policy_preprocessor.json").read_text())
+    for entry in saved["steps"]:
+        if entry.get("registry_name") == "tokenizer_processor":
+            entry["config"]["tokenizer_name"] = "/unavailable/original-tokenizer"
+    (source / "policy_preprocessor.json").write_text(json.dumps(saved))
+    loaded, _ = make_pre_post_processors(
+        config,
+        pretrained_path=str(source),
+        preprocessor_overrides={"tokenizer_processor": {"max_length": 40}},
+    )
+    step = next(s for s in loaded.steps if isinstance(s, TokenizerProcessorStep))
+    assert step.tokenizer_name == str(directory)
+    assert step.max_length == 40
+    assert step.input_tokenizer.convert_tokens_to_ids("Task") == 1
+
+    # A relocated LAP checkpoint also supplies the processor's tokenizer, even
+    # when its original local tokenizer directory has been removed.
+    target = tmp_path / "lap"
+    target.mkdir()
+    (target / "config.json").write_text(json.dumps({"type": "pi05_lap"}))
+    vocabulary.save_pretrained(target)
+    pre.save_pretrained(target, config_filename="policy_preprocessor.json")
+    post.save_pretrained(target, config_filename="policy_postprocessor.json")
+    shutil.rmtree(directory)
+    for _ in range(2):
+        loaded, output = make_pre_post_processors(config, pretrained_path=str(target))
+        step = next(s for s in loaded.steps if isinstance(s, TokenizerProcessorStep))
+        assert step.input_tokenizer.convert_tokens_to_ids(list(LATENT_CODES)) == list(vocabulary.code_ids)
+        loaded.save_pretrained(target, config_filename="policy_preprocessor.json")
+        output.save_pretrained(target, config_filename="policy_postprocessor.json")

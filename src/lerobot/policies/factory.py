@@ -171,11 +171,20 @@ def make_pre_post_processors(
         ValueError: If no processor factory exists for the given policy configuration type.
     """
     if pretrained_path:
+        preprocessor_overrides = kwargs.get("preprocessor_overrides", {})
         if policy_cfg.type == "pi05_lap":
             # Native PI05 checkpoints and LAP checkpoints use different registered
             # state-to-prompt step names, with identical preprocessing behavior.
             from .pi05 import processor_pi05 as _pi05_processor  # noqa: F401
-            from .pi05_lap import processor_pi05_lap as _lap_processor  # noqa: F401
+            from .pi05_lap.processor_pi05_lap import pi05_lap_tokenizer_override
+
+            preprocessor_overrides = {
+                **(preprocessor_overrides or {}),
+                "tokenizer_processor": {
+                    **(preprocessor_overrides or {}).get("tokenizer_processor", {}),
+                    **pi05_lap_tokenizer_override(policy_cfg, pretrained_path, pretrained_revision),
+                },
+            }
 
         if isinstance(policy_cfg, GrootConfig):
             from .groot.processor_groot import make_groot_pre_post_processors_from_pretrained
@@ -200,7 +209,7 @@ def make_pre_post_processors(
             config_filename=kwargs.get(
                 "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
             ),
-            overrides=kwargs.get("preprocessor_overrides", {}),
+            overrides=preprocessor_overrides,
             to_transition=batch_to_transition,
             to_output=transition_to_batch,
             revision=pretrained_revision,

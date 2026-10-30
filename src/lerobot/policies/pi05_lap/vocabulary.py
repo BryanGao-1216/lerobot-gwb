@@ -26,10 +26,10 @@ class LatentActionVocabulary:
         self.code_ids = tuple(ids[1:])
 
     @classmethod
-    def create(cls):
+    def create(cls, tokenizer_path: str, **hub_args):
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **hub_args)
         tokenizer.add_special_tokens({"additional_special_tokens": [LATENT_START, *LATENT_CODES]})
         return cls(tokenizer)
 

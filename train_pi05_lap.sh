@@ -14,9 +14,10 @@ accelerate launch \
   --main_process_port=29501 \
   -m lerobot.scripts.lerobot_train \
   --policy.type=pi05_lap \
-  --policy.path=/home/gaowenbin/workspace/base_models/pi05 \
+  --policy.path=/tmp/g-models/PI05-base \
   --policy.training_stage=pre-training \
-  --policy.lam_model_path=/home/gaowenbin/workspace/base_models/UniVLA/lam-stage-2.ckpt \
+  --policy.lam_model_path=/gaowenbin/models/base_models/LAM/UniVLA/lam-stage-2.ckpt \
+  --policy.tokenizer_path=/gaowenbin/models/tokenizers/paligemma-tokenizer \
   --policy.lam_camera_key=observation.images.image \
   --policy.device=cuda \
   --policy.dtype=bfloat16 \
@@ -28,11 +29,11 @@ accelerate launch \
   --policy.chunk_size=12 \
   --policy.n_action_steps=12 \
   --dataset.repo_id=libero_only \
-  --dataset.root=/home/gaowenbin/workspace/datasets/libero \
-  --output_dir=/home/gaowenbin/workspace/trained_models/pi05-lap-pretrain \
-  --steps=60000 \
+  --dataset.root=/gaowenbin/datasets/libero \
+  --output_dir=/gaowenbin/models/trained_models/PI05-lap-pretrain \
+  --steps=100000 \
   --save_freq=10000 \
-  --batch_size=16 \
+  --batch_size=4 \
   --env_eval_freq=0 \
   --eval_steps=0 \
   --policy.push_to_hub=false

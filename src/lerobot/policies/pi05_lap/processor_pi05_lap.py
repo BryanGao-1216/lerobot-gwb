@@ -39,6 +39,19 @@ from lerobot.utils.constants import OBS_STATE
 from .configuration_pi05_lap import PI05LAPConfig
 
 
+def pi05_lap_tokenizer_override(config: PI05LAPConfig, pretrained_path: str, revision: str | None) -> dict:
+    """Resolve the prompt tokenizer before loading a saved processor's original Hub path."""
+    from .checkpoint import checkpoint_type
+    from .vocabulary import LatentActionVocabulary
+
+    if checkpoint_type(pretrained_path, revision=revision) == "pi05_lap":
+        # A moved checkpoint is self-contained: no dependency on the original
+        # tokenizer directory, and no reassignment of learned latent token IDs.
+        vocabulary = LatentActionVocabulary.from_pretrained(pretrained_path, revision=revision)
+        return {"tokenizer_name": None, "tokenizer": vocabulary.tokenizer}
+    return {"tokenizer_name": config.tokenizer_path, "tokenizer": None}
+
+
 @ProcessorStepRegistry.register(name="pi05_lap_prepare_state_tokenizer_processor_step")
 @dataclass
 class Pi05LAPPrepareStateTokenizerProcessorStep(ProcessorStep):
@@ -138,7 +151,7 @@ def make_pi05_lap_pre_post_processors(
         steps.normalize,
         Pi05LAPPrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
         TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
+            tokenizer_name=config.tokenizer_path,
             max_length=config.tokenizer_max_length,
             padding_side="right",
             padding="max_length",

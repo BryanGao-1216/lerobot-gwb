@@ -767,7 +767,9 @@ class PI05LAPPolicy(PreTrainedPolicy):
         # Initialize the core PI05LAP model
         self.init_rtc_processor()
         self.model = PI05LAPPytorch(config, rtc_processor=self.rtc_processor)
-        self.latent_vocabulary = kwargs.pop("_latent_vocabulary", None) or LatentActionVocabulary.create()
+        self.latent_vocabulary = kwargs.pop("_latent_vocabulary", None) or LatentActionVocabulary.create(
+            config.tokenizer_path
+        )
         extend_vlm_vocabulary(
             self.model.paligemma_with_expert.paligemma, len(self.latent_vocabulary.tokenizer)
         )
@@ -824,7 +826,7 @@ class PI05LAPPolicy(PreTrainedPolicy):
         vocabulary = (
             LatentActionVocabulary.from_pretrained(pretrained_name_or_path, **hub_args)
             if source_type == "pi05_lap"
-            else LatentActionVocabulary.create()
+            else LatentActionVocabulary.create(config.tokenizer_path, **hub_args)
         )
         model = cls(config, _latent_vocabulary=vocabulary, _defer_device=True, **kwargs)
         load_student_state(model, pretrained_name_or_path, source_type=source_type, **hub_args)

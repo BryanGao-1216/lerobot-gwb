@@ -5,17 +5,25 @@
 
 ## 配置
 
-仅新增三个配置字段：
+阶段、LAM 与 tokenizer 的配置字段：
 
 | 参数 | 默认值 | 用途 |
 | --- | --- | --- |
 | `policy.training_stage` | `post-training` | `pre-training` 或 `post-training` |
 | `policy.lam_model_path` | `null` | UniVLA stage-2 LAM 的本地 `.ckpt` 文件，仅预训练需要 |
 | `policy.lam_camera_key` | `null` | 单个 RGB 相机全名或短名，省略时自动选主视角 |
+| `policy.tokenizer_path` | `google/paligemma-3b-pt-224` | 初始化时使用的 PaliGemma tokenizer 目录或 Hub ID |
 
 自动选择相机时依次优先 `image`、`base_0_rgb`、`primary`、`front`、
 `agentview_image`、`image_primary`，否则使用 metadata 中的第一个 RGB 相机。
 不接受相机列表；显式填写的相机不存在或不是 RGB 时直接报错。
+
+本地 tokenizer 传目录，例如 `--policy.tokenizer_path=/mnt/models/paligemma-tokenizer`，
+目录内应有 `tokenizer.json`、`tokenizer_config.json` 等 tokenizer 文件。
+必须使用与 PI05 权重匹配的 PaliGemma tokenizer；该路径同时用于文本 processor 和
+latent 词表初始化，并覆盖原 PI05 processor 配置中保存的 Hub ID。
+从 LAP checkpoint 继续训练或做动作微调时，自动使用其中保存的 `latent_tokenizer/` 和 ID 映射，
+无需再提供原始 tokenizer 路径。
 
 ## 预训练
 
