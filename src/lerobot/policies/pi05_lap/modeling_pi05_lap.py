@@ -883,11 +883,6 @@ class PI05LAPPolicy(PreTrainedPolicy):
                 logging.warning(f"Skipping state_proj key in pi05_lap mode: {key}")
                 continue
 
-            # Handle vision tower embedding layer potential differences
-            if "patch_embedding" in key:
-                # Some checkpoints might have this, but current model expects different structure
-                logging.warning(f"Vision embedding key might need handling: {key}")
-
             if (
                 key == "model.paligemma_with_expert.paligemma.lm_head.weight"
                 or key == "paligemma_with_expert.paligemma.lm_head.weight"

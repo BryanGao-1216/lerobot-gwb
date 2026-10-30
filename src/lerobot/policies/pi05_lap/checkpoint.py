@@ -1,12 +1,46 @@
 """Strict native PI05 -> LAP and LAP -> LAP checkpoint loading."""
 
 import json
+import logging
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
 
 EMBEDDING_KEY = "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
 HEAD_KEY = "model.paligemma_with_expert.paligemma.lm_head.weight"
+VISION_PREFIX = "model.paligemma_with_expert.paligemma.model.vision_tower."
+
+logger = logging.getLogger(__name__)
+
+
+def _remap_vision_tower_keys(state: dict, expected: dict) -> dict:
+    """Remove a legacy SigLIP wrapper only where the current model expects its contents.
+
+    Some PI05 checkpoints saved SiglipVisionModel's `vision_model` submodule,
+    while the current PaliGemma registers that submodule directly as vision_tower.
+    Match actual destination keys instead of applying a global string replacement.
+    """
+    legacy_prefix = VISION_PREFIX + "vision_model."
+    remapped = {}
+    sources = {}
+    count = 0
+    for key, value in state.items():
+        target = key
+        if key.startswith(legacy_prefix) and key not in expected:
+            candidate = VISION_PREFIX + key.removeprefix(legacy_prefix)
+            if candidate in expected:
+                target = candidate
+                count += 1
+        if target in remapped:
+            raise ValueError(
+                f"Checkpoint keys {sources[target]!r} and {key!r} both map to {target!r}; "
+                "refusing to overwrite a weight."
+            )
+        remapped[target] = value
+        sources[target] = key
+    if count:
+        logger.info("Mapped %d legacy PI05 vision_tower.vision_model keys to vision_tower.", count)
+    return remapped
 
 
 def checkpoint_file(source, filename: str, **hub_args) -> Path:
@@ -34,6 +68,7 @@ def load_student_state(policy, source, *, source_type: str, **hub_args):
         state = policy._fix_pytorch_state_dict_keys(state, policy.config)
     state = {k if k.startswith("model.") else f"model.{k}": v for k, v in state.items()}
     expected = policy.state_dict()
+    state = _remap_vision_tower_keys(state, expected)
     # safetensors omits one copy of a tied input/output tensor. Only this known alias
     # may be absent; all other missing or unexpected tensors are fatal.
     vlm = policy.model.paligemma_with_expert.paligemma

@@ -53,6 +53,10 @@ LAM 在每个 CUDA 进程上以冻结 FP32 模式在线生成 codebook 索引 `0
 checkpoint 同时保存 `latent_tokenizer/` 和 `latent_action_tokens.json`，后者记录准确的 ID 映射。
 加载 LAP checkpoint 时验证两者一致，严格恢复已训练 embedding、LM head 和其他权重。
 原始 PI05 权重加载时仅初始化新增词表行；加载失败直接报错。
+加载器兼容旧 checkpoint 中 `vision_tower.vision_model.*` 到当前 `vision_tower.*` 的名称变化，
+仅映射当前模型中确实存在的目标 key，并继续严格检查缺失项、额外项和 tensor shape。
+原始 checkpoint 的 `config.json` 保持 `type: pi05`，processor 中的 Google tokenizer 名称也无需手工改写；
+启动参数 `policy.type=pi05_lap`、`policy.tokenizer_path=...` 会负责配置转换和 tokenizer 覆盖。
 
 ## 动作微调
 

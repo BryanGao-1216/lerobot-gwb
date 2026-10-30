@@ -30,7 +30,7 @@ from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 from lerobot.policies.pi05_lap import modeling_pi05_lap as lap
-from lerobot.policies.pi05_lap.checkpoint import EMBEDDING_KEY, HEAD_KEY, load_student_state
+from lerobot.policies.pi05_lap.checkpoint import EMBEDDING_KEY, HEAD_KEY, VISION_PREFIX, load_student_state
 from lerobot.policies.pi05_lap.configuration_pi05_lap import LAM_IMAGE_PAIR, PI05LAPConfig
 from lerobot.policies.pi05_lap.dataset import PI05LAPDataset
 from lerobot.policies.pi05_lap.lam.univla import load_lam_state
@@ -336,6 +336,54 @@ def test_native_checkpoint_expands_only_new_rows(tiny_policy, tmp_path):
     for key in (EMBEDDING_KEY, HEAD_KEY):
         torch.testing.assert_close(restored[key][:257152], state[key], rtol=0, atol=0)
         torch.testing.assert_close(restored[key][257152:], new_rows[key], rtol=0, atol=0)
+
+
+def _flatten_vision_wrapper(policy):
+    # Reproduce the server's expected ...vision_tower.embeddings.* structure,
+    # regardless of whether the local transformers build retains the wrapper.
+    paligemma = policy.model.paligemma_with_expert.paligemma
+    if hasattr(paligemma.model.vision_tower, "vision_model"):
+        paligemma.model.vision_tower = paligemma.model.vision_tower.vision_model
+    return policy
+
+
+@pytest.mark.parametrize("source_type", ["pi05", "pi05_lap"])
+@pytest.mark.parametrize("outer_prefix", [True, False])
+def test_legacy_vision_wrapper_loads_all_weights(tiny_policy, tmp_path, source_type, outer_prefix):
+    source = _flatten_vision_wrapper(tiny_policy())
+    expected = {key: value.clone() for key, value in source.state_dict().items()}
+    state = {}
+    for key, value in expected.items():
+        legacy = (
+            VISION_PREFIX + "vision_model." + key.removeprefix(VISION_PREFIX)
+            if key.startswith(VISION_PREFIX)
+            else key
+        )
+        state[legacy if outer_prefix else legacy.removeprefix("model.")] = value
+    save_file(state, tmp_path / "model.safetensors")
+    restored = _flatten_vision_wrapper(tiny_policy())
+    load_student_state(restored, tmp_path, source_type=source_type)
+    for key, value in restored.state_dict().items():
+        torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid", ["missing", "unknown", "shape", "collision"])
+def test_vision_compatibility_keeps_strict_validation(tiny_policy, tmp_path, invalid):
+    policy = _flatten_vision_wrapper(tiny_policy())
+    state = {key: value.clone() for key, value in policy.state_dict().items()}
+    current = VISION_PREFIX + "embeddings.patch_embedding.weight"
+    legacy = VISION_PREFIX + "vision_model.embeddings.patch_embedding.weight"
+    if invalid == "missing":
+        del state[current]
+    elif invalid == "unknown":
+        state[VISION_PREFIX + "vision_model.unknown.weight"] = torch.ones(1)
+    elif invalid == "shape":
+        state[legacy] = state.pop(current)[:1]
+    else:
+        state[legacy] = state[current].clone()
+    save_file(state, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError if invalid == "collision" else RuntimeError):
+        load_student_state(policy, tmp_path, source_type="pi05")
 
 
 def test_local_tokenizer_used_for_initialization_and_saved_processor(tiny_policy, tmp_path):
