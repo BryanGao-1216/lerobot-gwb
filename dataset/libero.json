@@ -17,52 +17,6 @@
         "observation.images.image2": "observation.images.image2"
       },
       "lam_camera_key": "observation.images.image"
-    },
-    "aloha_boil": {
-      "repo_id": "boil",
-      "root": "/gaowenbin/datasets/solid/boil/boil_0613",
-      "weight": 1.0,
-      "action_fields": [
-        {
-          "key": "action",
-          "indices": [7, 8, 9, 10, 11, 12, 13, 0, 1, 2, 3, 4, 5, 6]
-        }
-      ],
-      "state_fields": [
-        {
-          "key": "observation.state",
-          "indices": [7, 8, 9, 10, 11, 12, 13, 0, 1, 2, 3, 4, 5, 6]
-        }
-      ],
-      "camera_fields": {
-        "observation.images.image": "observation.images.cam_high",
-        "observation.images.image2": "observation.images.cam_right_wrist",
-        "observation.images.image3": "observation.images.cam_left_wrist"
-      },
-      "lam_camera_key": "observation.images.cam_high"
-    },
-    "aloha_solid": {
-      "repo_id": "solid",
-      "root": "/gaowenbin/datasets/solid/solid/measure_solid_0703_3",
-      "weight": 1.0,
-      "action_fields": [
-        {
-          "key": "action",
-          "indices": [7, 8, 9, 10, 11, 12, 13, 0, 1, 2, 3, 4, 5, 6]
-        }
-      ],
-      "state_fields": [
-        {
-          "key": "observation.state",
-          "indices": [7, 8, 9, 10, 11, 12, 13, 0, 1, 2, 3, 4, 5, 6]
-        }
-      ],
-      "camera_fields": {
-        "observation.images.image": "observation.images.cam_high",
-        "observation.images.image2": "observation.images.cam_right_wrist",
-        "observation.images.image3": "observation.images.cam_left_wrist"
-      },
-      "lam_camera_key": "observation.images.cam_high"
     }
   }
 }

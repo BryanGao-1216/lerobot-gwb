@@ -14,11 +14,15 @@ export CUDA_VISIBLE_DEVICES=0
 # 运行前在当前环境安装依赖并登录：pip install -e '.[training,pi05-lap]'; swanlab login
 
 args=(
+  --policy.type=pi05_lap
   --policy.path=/tmp/g-models/PI05-base
   --policy.training_stage=post-training
-  --eval_steps=1000
+  --policy.tokenizer_path=/gaowenbin/models/tokenizers/paligemma-tokenizer
+  --policy.push_to_hub=false
   --resume=false
-  --steps=300000
+  --output_dir=/gaowenbin/models/trained_models/PI05-lap-baseline
+  --eval_steps=2000
+  --steps=500000
   --save_freq=10000
   --batch_size=4
   --policy.gradient_accumulation=8
