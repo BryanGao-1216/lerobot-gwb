@@ -14,18 +14,19 @@ export CUDA_VISIBLE_DEVICES=0
 # 运行前在当前环境安装依赖并登录：pip install -e '.[training,pi05-lap]'; swanlab login
 
 args=(
-  --config_path=/gaowenbin/models/trained_models/PI05-lap-pretrain/checkpoints/last/pretrained_model/train_config.json
-  --resume=true
-  --steps=500000
+  --policy.path=/tmp/g-models/PI05-base
+  --policy.training_stage=post-training
+  --resume=false
+  --steps=300000
   --save_freq=10000
-  --batch_size=8
-  --policy.gradient_accumulation=1
+  --batch_size=4
+  --policy.gradient_accumulation=8
   --dataset.config_path=dataset/libero.json
   --wandb.enable=false
   --swanlab.enable=true
   --swanlab.project=pi05-lap
   --swanlab.mode=online
-  --job_name=pi05-lap-pretrain
+  --job_name=pi05-lap-pretrain-baseline
   --log_freq=10
 )
 
