@@ -8,16 +8,12 @@ export CUDA_VISIBLE_DEVICES=0
 # H = chunk_size。lam_camera_key 只能填一个；省略则自动选择主视角。
 # 使用 PyAV 解码视频，避免 TorchCodec 依赖的系统 FFmpeg 动态库缺失。
 
-accelerate launch \
-  --num_processes=1 \
-  --num_machines=1 \
-  --mixed_precision=bf16 \
-  --main_process_port=29501 \
-  -m lerobot.scripts.lerobot_train \
+args=(
   --policy.type=pi05_lap \
   --policy.path=/tmp/g-models/PI05-base \
   --policy.training_stage=pre-training \
-  --policy.lam_model_path=/gaowenbin/models/base_models/LAM/UniVLA/lam-stage-2.ckpt \
+  # --policy.lam_model_path=/gaowenbin/models/base_models/LAM/UniVLA/lam-stage-2.ckpt \
+  --config.path=/gaowenbin/models/trained_models/PI05-lap-pretrain/checkpoints/last/train_config.json \
   --policy.tokenizer_path=/gaowenbin/models/tokenizers/paligemma-tokenizer \
   --policy.lam_camera_key=observation.images.image \
   --policy.device=cuda \
@@ -33,9 +29,9 @@ accelerate launch \
   --dataset.root=/gaowenbin/datasets/libero \
   --dataset.video_backend=pyav \
   --output_dir=/gaowenbin/models/trained_models/PI05-lap-pretrain \
-  --steps=100000 \
+  --steps=500000 \
   --save_freq=10000 \
-  --batch_size=16 \
+  --batch_size=8 \
   --env_eval_freq=0 \
   --eval_steps=0 \
   --policy.push_to_hub=false \
@@ -44,3 +40,13 @@ accelerate launch \
   --wandb.disable_artifact=true \
   --job_name=pi05-lap-pretrain \
   --log_freq=10 \
+)
+
+
+accelerate launch \
+  --num_processes=1 \
+  --num_machines=1 \
+  --mixed_precision=bf16 \
+  --main_process_port=29501 \
+  -m lerobot.scripts.lerobot_train \
+  "${args[@]}"
