@@ -78,6 +78,23 @@ class WandBConfig:
 
 
 @dataclass
+class SwanLabConfig:
+    enable: bool = False
+    project: str = "lerobot"
+    # None selects the logged-in user's personal workspace.
+    workspace: str | None = None
+    # Saved in train_config.json so subsequent checkpoint resumes reuse the experiment.
+    run_id: str | None = None
+    mode: str = "online"
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"online", "offline", "disabled"}:
+            raise ValueError("swanlab.mode must be 'online', 'offline' or 'disabled'.")
+        if self.enable and not self.project.strip():
+            raise ValueError("swanlab.project must not be empty when SwanLab is enabled.")
+
+
+@dataclass
 class EvalConfig:
     n_episodes: int = 50
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.

@@ -116,6 +116,7 @@ dataset = [
 training = [
     "lerobot[dataset]",
     "tensorboard>=2.20.0,<3.0.0",
+    "swanlab>=0.10.3,<0.11.0",
     "wandb>=0.24.0,<0.28.0",
     "lerobot[accelerate-dep]",
 ]

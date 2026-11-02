@@ -158,6 +158,8 @@ sbatch*.sh
 ### Miscellaneous ###
 # W&B
 wandb/
+swanlog/
+.swanlab/
 
 # Dev scripts
 .dev/

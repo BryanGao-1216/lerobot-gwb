@@ -15,7 +15,7 @@
 # limitations under the License.
 """Train a policy.
 
-Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wandb extras)
+Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + SwanLab)
 """
 
 import dataclasses
@@ -34,6 +34,7 @@ from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
+from lerobot.common.swanlab_utils import make_experiment_logger
 from lerobot.common.tensorboard_utils import TensorBoardLogger
 from lerobot.common.train_utils import (
     gather_fsdp_state_dicts,
@@ -47,7 +48,6 @@ from lerobot.common.train_utils import (
     save_checkpoint,
     update_last_checkpoint,
 )
-from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
@@ -255,13 +255,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if is_main_process:
         logging.info(pformat(cfg.to_dict()))
 
-    # Initialize wandb only on main process
-    if cfg.wandb.enable and cfg.wandb.project and is_main_process:
-        wandb_logger = WandBLogger(cfg)
-    else:
-        wandb_logger = None
-        if is_main_process:
-            logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
+    # Only the main process initializes the SDK and sends experiment logs.
+    experiment_logger = make_experiment_logger(cfg) if is_main_process else None
+    if experiment_logger is None and is_main_process:
+        logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
     if cfg.seed is not None:
         set_seed(cfg.seed, accelerator=accelerator)
@@ -666,16 +663,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if step_time > 0:
                     train_tracker.samples_per_s = effective_batch_size / step_time
                 logging.info(train_tracker)
-                if wandb_logger:
+                if experiment_logger:
                     # Policy sub-losses (latent_loss, action_loss, ...) are aggregated into the
                     # tracker by update_policy, so to_dict() already carries their windowed,
                     # rank-reduced averages — no per-step output_dict passthrough needed.
-                    wandb_log_dict = train_tracker.to_dict()
+                    log_dict = train_tracker.to_dict()
                     # Log sample weighting statistics if enabled
                     if sample_weighter is not None:
                         weighter_stats = sample_weighter.get_stats()
-                        wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
-                    wandb_logger.log_dict(wandb_log_dict, step)
+                        log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
+                    experiment_logger.log_dict(log_dict, step)
             train_tracker.reset_averages()
 
         if is_eval_step:
@@ -698,8 +695,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
             if is_main_process:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
-                if wandb_logger:
-                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                if experiment_logger:
+                    experiment_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
                 if tensorboard_logger:
                     tensorboard_logger.log_scalars({"loss": eval_loss}, step=step, mode="eval")
 
@@ -736,8 +733,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         cfg.policy.repo_id,
                         private=cfg.policy.private,
                     )
-                if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
+                if experiment_logger:
+                    experiment_logger.log_policy(checkpoint_dir)
 
             accelerator.wait_for_everyone()
 
@@ -783,10 +780,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 eval_tracker.eval_s = aggregated.pop("eval_s")
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
-                if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                if experiment_logger:
+                    log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    experiment_logger.log_dict(log_dict, step, mode="eval")
+                    experiment_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
                 if tensorboard_logger:
                     tensorboard_logger.log_scalars(eval_tracker.to_dict(), step, mode="eval")
 
@@ -816,6 +813,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 unwrapped_model.push_model_to_hub(cfg, state_dict=model_state_dict, dataset_meta=dataset.meta)
             preprocessor.push_to_hub(active_cfg.repo_id)
             postprocessor.push_to_hub(active_cfg.repo_id)
+
+        if experiment_logger:
+            experiment_logger.finish()
 
     # Properly clean up the distributed process group
     accelerator.wait_for_everyone()

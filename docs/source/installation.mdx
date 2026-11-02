@@ -176,7 +176,7 @@ LeRobot provides **feature-scoped extras** that map to common workflows. If you 
 | Extra      | What it adds                                | Typical use case                    |
 | ---------- | ------------------------------------------- | ----------------------------------- |
 | `dataset`  | `datasets`, `av`, `torchcodec`, `jsonlines` | Loading & creating datasets         |
-| `training` | `dataset` + `accelerate`, `wandb`           | Training policies                   |
+| `training` | `dataset` + `accelerate`, `swanlab`, `wandb`, `tensorboard` | Training policies                   |
 | `hardware` | `pynput`, `pyserial`, `deepdiff`            | Connecting to real robots           |
 | `viz`      | `rerun-sdk`                                 | Visualization during recording/eval |
 
@@ -291,10 +291,17 @@ pip install -e ".[feetech]" # or "[dynamixel]" for example
 
 ### Experiment Tracking
 
-Weights and Biases is included in the `training` extra. To use [Weights and Biases](https://docs.wandb.ai/quickstart) for experiment tracking, log in with:
+SwanLab is included in the `training` extra. To use [SwanLab](https://docs.swanlab.cn/) for experiment tracking, log in with:
 
 ```bash
-wandb login
+swanlab login
 ```
+
+Add `--swanlab.enable=true --swanlab.project=lerobot --wandb.enable=false` to your training command.
+The experiment name follows `--job_name`. Metrics are recorded every `--log_freq` steps, and local logs
+are stored under `<output_dir>/swanlog/`. Use `--swanlab.mode=offline` without login for local-only logs.
+Checkpoint resumes preserve the SwanLab experiment ID. Switching from an existing W&B checkpoint
+starts a new SwanLab experiment at the resumed training step; historical W&B charts are not imported.
+SwanLab takes precedence if both backends are enabled. W&B remains available for legacy configurations.
 
 You can now assemble your robot if it's not ready yet, look for your robot type on the left. Then follow the link below to use Lerobot with your robot.

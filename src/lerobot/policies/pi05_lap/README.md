@@ -77,8 +77,9 @@ checkpoint 同时保存 `latent_tokenizer/` 和 `latent_action_tokens.json`，�
 ## 启动
 
 安装依赖：`uv sync --extra training --extra pi05-lap`。
-仓库根目录的 `train_pi05_lap.sh` 为直接填写路径的单命令模板，默认 `H=12`。
-修改原 PI05、LAM、数据集和输出目录后运行：
+仓库根目录的 `train_pi05_lap.sh` 为单命令续训模板：从 `checkpoints/last` 恢复，
+保留 checkpoint 中的预训练、LAM、相机、H 和优化器配置，训练到累计 50 万步。
+修改其中 `config_path` 后运行：
 
 ```bash
 sh train_pi05_lap.sh
@@ -89,3 +90,40 @@ sh train_pi05_lap.sh
 读取视频；该设置只影响数据解码，PI05 和 UniVLA 仍在 CUDA 上运行。
 
 服务器 CUDA 训练和实际 checkpoint 的效果需在目标服务器验证。
+
+## SwanLab 日志
+
+训练依赖已包含 SwanLab。在服务器当前训练环境中安装并登录：
+
+```bash
+pip install -e '.[training,pi05-lap]'
+swanlab login
+sh train_pi05_lap.sh
+```
+
+使用 uv 管理环境时可运行 `uv sync --extra training --extra pi05-lap`，
+然后用 `uv run swanlab login` 和 `uv run sh train_pi05_lap.sh`。
+
+新训练或其他策略使用同一组参数即可：
+
+```bash
+--swanlab.enable=true \
+--swanlab.project=pi05-lap \
+--swanlab.mode=online \
+--wandb.enable=false
+```
+
+实验名沿用 `job_name`，每 `log_freq` 步记录训练 loss、latent token accuracy、
+梯度范数、学习率、吞吐和显存等现有指标，也记录评估指标。
+仅主进程写日志。启动时打印实验链接；本地日志写入 `output_dir/swanlog/`。
+`swanlab.workspace` 可选填组织空间名，省略时使用当前账号的个人空间。
+
+从旧 W&B checkpoint 切换时无需修改旧 JSON，优先启用 SwanLab 并关闭 W&B。
+模型、优化器和全局 step 按原流程恢复；SwanLab 创建新实验，从恢复的 step 开始记录，
+不会自动迁移旧 W&B 曲线。新的 `train_config.json` 会保存 `swanlab.run_id`，
+以后从这些 checkpoint 续训会复用相同实验；也可用 `--swanlab.run_id=<ID>` 显式指定。
+
+无外网时使用 `--swanlab.mode=offline`，无需登录；训练后可以用
+`swanlab sync <output_dir>/swanlog/<run目录>` 上传本地实验。
+SwanLab 公有云不支持 checkpoint 文件上传，完整 checkpoint 继续保存在本地。
+环境评估产生的 MP4 会转换为 GIF 上传到 SwanLab，原 MP4 保留。
