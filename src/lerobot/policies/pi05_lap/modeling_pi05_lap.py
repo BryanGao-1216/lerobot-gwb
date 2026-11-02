@@ -50,6 +50,7 @@ from lerobot.utils.constants import (
 )
 
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
+from ..common.masked_loss import reduce_action_loss
 from ..common.vla_utils import (
     clone_past_key_values,
     create_sinusoidal_pos_embedding,
@@ -979,6 +980,10 @@ class PI05LAPPolicy(PreTrainedPolicy):
         images = []
         img_masks = []
 
+        # A configuration with no camera slots deliberately uses only the text/state prefix.
+        if not self.config.image_features:
+            return images, img_masks
+
         # Get device from model parameters
         device = next(self.parameters()).device
 
@@ -1025,6 +1030,8 @@ class PI05LAPPolicy(PreTrainedPolicy):
             # Create mask (all ones for real images)
             bsize = img.shape[0]
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
+            if f"{key}_is_pad" in batch:
+                mask = ~batch[f"{key}_is_pad"].to(device=device, dtype=torch.bool).reshape(bsize)
             img_masks.append(mask)
 
         # Create image features not present in the batch as fully 0 padded images
@@ -1081,7 +1088,14 @@ class PI05LAPPolicy(PreTrainedPolicy):
 
         return actions
 
-    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        reduction: str = "mean",
+        *,
+        action_inference: bool = False,
+        noise: Tensor | None = None,
+    ) -> tuple[Tensor, dict] | Tensor:
         """Run the batch through the model and compute the loss for training.
 
         Args:
@@ -1089,7 +1103,13 @@ class PI05LAPPolicy(PreTrainedPolicy):
             reduction: How to reduce the loss. Options:
                 - "mean": Return scalar mean loss (default, backward compatible)
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
+            action_inference: Run predict_action_chunk instead of the training loss (post-training only).
+            noise: Optional initial action noise for reproducible full inference.
         """
+        if action_inference:
+            # predict_action_chunk also enforces the post-training stage.
+            return self.predict_action_chunk(batch, noise=noise)
+
         if self.config.training_stage == "pre-training":
             return self._forward_latent_actions(batch, reduction)
 
@@ -1108,6 +1128,9 @@ class PI05LAPPolicy(PreTrainedPolicy):
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
+
+        if "action_dim_is_pad" in batch:
+            return reduce_action_loss(losses, batch["action_dim_is_pad"], reduction)
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),

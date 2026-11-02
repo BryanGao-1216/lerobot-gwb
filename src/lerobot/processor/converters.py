@@ -161,6 +161,7 @@ def from_tensor_to_numpy(x: torch.Tensor | Any) -> np.ndarray | float | int | An
 
 
 _COMPLEMENTARY_KEYS = (
+    "dataset_index",
     "task",
     "index",
     "task_index",

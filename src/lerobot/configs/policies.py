@@ -64,6 +64,9 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     # automatic gradient scaling is used.
     use_amp: bool = False
 
+    # Number of per-device micro-batches contributing to one optimizer update.
+    gradient_accumulation: int = 1
+
     # Whether the policy employed PEFT for training.
     use_peft: bool = False
 
@@ -83,6 +86,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     pretrained_revision: str | None = None
 
     def __post_init__(self) -> None:
+        if type(self.gradient_accumulation) is not int or self.gradient_accumulation < 1:
+            raise ValueError("policy.gradient_accumulation must be a positive integer.")
         if not self.device or not is_torch_device_available(self.device):
             auto_device = auto_select_torch_device()
             logger.warning(f"Device '{self.device}' is not available. Switching to '{auto_device}'.")

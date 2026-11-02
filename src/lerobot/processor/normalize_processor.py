@@ -96,6 +96,9 @@ class _NormalizationMixin:
     dtype: torch.dtype | None = None
     eps: float = 1e-8
     normalize_observation_keys: set[str] | None = None
+    # Select source statistics for deployment of a mixed-dataset checkpoint.
+    # During training the batch supplies dataset_index for every sample.
+    dataset_index: int | None = None
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
     _stats_explicitly_provided: bool = field(default=False, init=False, repr=False)
@@ -143,10 +146,11 @@ class _NormalizationMixin:
         (already ``(C, 1, 1)``). Needed by RL training, which can start without
         a dataset and supplies stats manually via JSON config.
         """
-        for key, feature in self.features.items():
-            if feature.type != FeatureType.VISUAL:
+        for key in self._tensor_stats:
+            feature = self.features.get(key.split("/", 1)[-1])
+            if feature is None:
                 continue
-            if key not in self._tensor_stats:
+            if feature.type != FeatureType.VISUAL:
                 continue
             for stat_name, stat_tensor in self._tensor_stats[key].items():
                 if not isinstance(stat_tensor, Tensor) or stat_tensor.ndim != 1:
@@ -261,7 +265,66 @@ class _NormalizationMixin:
         }
         if self.normalize_observation_keys is not None:
             config["normalize_observation_keys"] = sorted(self.normalize_observation_keys)
+        if self.dataset_index is not None:
+            config["dataset_index"] = self.dataset_index
         return config
+
+    def _normalize_by_dataset(self, transition: EnvTransition, *, inverse: bool) -> EnvTransition:
+        """Use each row's own source statistics, without mixing incompatible vector dimensions."""
+        source_ids = {
+            int(key.split("/", 1)[0].removeprefix("dataset_"))
+            for key in self._tensor_stats
+            if key.startswith("dataset_") and "/" in key
+        }
+        ids = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get("dataset_index")
+        if ids is None:
+            if self.dataset_index is not None:
+                ids = self.dataset_index
+            elif len(source_ids) == 1:
+                ids = next(iter(source_ids))
+            else:
+                raise ValueError(
+                    "This checkpoint has per-dataset normalization. Supply dataset_index in the batch, "
+                    "or set dataset_index on the normalizer AND unnormalizer for the deployment dataset."
+                )
+        ids = torch.as_tensor(ids, dtype=torch.long).flatten()
+        unique_ids = ids.unique().tolist()
+        unknown = set(unique_ids) - source_ids
+        if unknown:
+            raise ValueError(f"Unknown dataset_index {sorted(unknown)}; expected {sorted(source_ids)}.")
+
+        def transform(tensor, key, feature_type):
+            tensor = torch.as_tensor(tensor)
+            if self.norm_map.get(feature_type, NormalizationMode.IDENTITY) == NormalizationMode.IDENTITY:
+                return tensor
+            if ids.numel() not in (1, tensor.shape[0]):
+                raise ValueError("dataset_index length must match the batch size.")
+            batch_ids = ids.to(tensor.device).expand(tensor.shape[0])
+            result = tensor.clone()
+            for source_id in unique_ids:
+                selected = batch_ids == source_id
+                result[selected] = self._apply_transform(
+                    tensor[selected], f"dataset_{source_id}/{key}", feature_type, inverse=inverse
+                )
+            return result
+
+        result = transition.copy()
+        observation = result.get(TransitionKey.OBSERVATION)
+        if observation is not None:
+            observation = dict(observation)
+            for key, feature in self.features.items():
+                if feature.type == FeatureType.ACTION or key not in observation:
+                    continue
+                if self.normalize_observation_keys is not None and key not in self.normalize_observation_keys:
+                    continue
+                observation[key] = transform(observation[key], key, feature.type)
+            result[TransitionKey.OBSERVATION] = observation
+        if result.get(TransitionKey.ACTION) is not None:
+            result[TransitionKey.ACTION] = transform(result[TransitionKey.ACTION], ACTION, FeatureType.ACTION)
+        return result
+
+    def _has_dataset_stats(self) -> bool:
+        return any(key.startswith("dataset_") and "/" in key for key in self._tensor_stats)
 
     def _normalize_observation(self, observation: RobotObservation, inverse: bool) -> dict[str, Tensor]:
         """
@@ -467,6 +530,8 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
         )
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
+        if self._has_dataset_stats():
+            return self._normalize_by_dataset(transition, inverse=False)
         new_transition = transition.copy()
 
         # Handle observation normalization.
@@ -531,6 +596,8 @@ class UnnormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
         return cls(features=features, norm_map=norm_map, stats=dataset.meta.stats, device=device)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
+        if self._has_dataset_stats():
+            return self._normalize_by_dataset(transition, inverse=True)
         new_transition = transition.copy()
 
         # Handle observation unnormalization.

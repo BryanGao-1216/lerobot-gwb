@@ -1,0 +1,372 @@
+"""Map heterogeneous LeRobot sources to a shared PI05 training schema.
+
+Each child owns its episode-clamped temporal queries. The outer dataset only
+maps fields, pads dimensions/views and exposes a deterministic weighted sampler.
+"""
+
+import logging
+import math
+from bisect import bisect_right
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F  # noqa: N812
+
+from lerobot.configs.dataset_mixture import DatasetSourceConfig, VectorFieldConfig
+from lerobot.configs.types import FeatureType, NormalizationMode
+from lerobot.policies.common.vla_utils import resize_with_pad_torch
+from lerobot.transforms import ImageTransforms
+from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_STATE
+
+from .dataset_metadata import LeRobotDatasetMetadata
+from .lerobot_dataset import LeRobotDataset
+from .sampler import EpisodeAwareSampler, WeightedDatasetSampler
+
+
+def _vector_indices(fields: list[VectorFieldConfig], features: dict) -> list[tuple[str, list[int]]]:
+    result = []
+    for spec in fields:
+        if spec.key not in features:
+            raise ValueError(f"Missing vector field {spec.key!r}. Available: {list(features)}")
+        shape = features[spec.key]["shape"]
+        if len(shape) != 1 or features[spec.key]["dtype"] in {"image", "video", "string"}:
+            raise ValueError(f"{spec.key} must be a numeric vector, got {features[spec.key]}.")
+        indices = spec.indices if spec.indices is not None else list(range(shape[0]))
+        if not indices or max(indices) >= shape[0]:
+            raise ValueError(f"{spec.key}: selected indices exceed vector shape {shape}.")
+        result.append((spec.key, indices))
+    return result
+
+
+def _vector_stats(meta, fields, size: int, mode: NormalizationMode) -> dict:
+    required = {
+        NormalizationMode.IDENTITY: (),
+        NormalizationMode.MEAN_STD: ("mean", "std"),
+        NormalizationMode.MIN_MAX: ("min", "max"),
+        NormalizationMode.QUANTILES: ("q01", "q99"),
+        NormalizationMode.QUANTILE10: ("q10", "q90"),
+    }[mode]
+    # Neutral statistics keep padded zero components exactly zero after normalization.
+    neutral = {"mean": 0, "std": 1, "min": -1, "max": 1, "q01": -1, "q99": 1, "q10": -1, "q90": 1}
+    result = {"count": torch.tensor([meta.total_frames])}
+    for stat in required:
+        values = []
+        for key, indices in fields:
+            if stat not in (meta.stats or {}).get(key, {}):
+                raise ValueError(f"{meta.repo_id}: missing {key}.{stat} normalization statistics.")
+            vector = torch.as_tensor(meta.stats[key][stat], dtype=torch.float32).flatten()
+            if vector.numel() != meta.features[key]["shape"][0]:
+                raise ValueError(f"{meta.repo_id}: {key}.{stat} shape differs from the feature shape.")
+            values.append(vector[indices])
+        combined = torch.cat(values)
+        if not torch.isfinite(combined).all():
+            raise ValueError(f"{meta.repo_id}: non-finite {stat} normalization statistics.")
+        result[stat] = F.pad(combined, (0, size - len(combined)), value=neutral[stat])
+    return result
+
+
+def _split_episodes(meta, source: DatasetSourceConfig, default_split: float):
+    episodes = source.episodes if source.episodes is not None else list(range(meta.total_episodes))
+    if any(ep >= meta.total_episodes for ep in episodes):
+        raise ValueError(f"{source.repo_id}: episode selection is out of range.")
+    split = source.eval_split if source.eval_split is not None else default_split
+    if split == 0:
+        return sorted(episodes), []
+    by_task = {}
+    for ep in sorted(episodes):
+        tasks = meta.episodes[ep]["tasks"]
+        by_task.setdefault(tasks[0] if tasks else "", []).append(ep)
+    train, evaluation = [], []
+    for group in by_task.values():
+        n = math.ceil(len(group) * split)
+        train.extend(group[:-n])
+        evaluation.extend(group[-n:])
+    if not train:
+        raise ValueError(f"{source.repo_id}: eval_split={split} leaves no training episodes.")
+    return sorted(train), sorted(evaluation)
+
+
+def _validate_rgb_camera(meta, key: str, source_name: str) -> None:
+    feature = meta.features.get(key, {})
+    shape = feature.get("shape", ())
+    names = feature.get("names") or []
+    axis = names.index("channels") if "channels" in names else None
+    rgb = len(shape) == 3 and (shape[axis] == 3 if axis is not None else 3 in (shape[0], shape[-1]))
+    if key not in meta.camera_keys or key in meta.depth_keys or not rgb:
+        raise ValueError(f"{source_name}: camera {key!r} must be an RGB image/video field.")
+
+
+class ConfiguredDataset(torch.utils.data.Dataset):
+    def __init__(self, children, sources, schema, *, image_transforms=None, is_lap=False):
+        self.children = children
+        self.sources = sources
+        self.schema = schema
+        self.image_transforms = image_transforms
+        self.is_lap = is_lap
+        self._lengths = [len(index) for _, _, index in children]
+        self._ends = np.cumsum(self._lengths).tolist()
+        self.num_frames = sum(self._lengths)
+        self.num_episodes = sum(len(index._starts) for _, _, index in children)
+        self.episodes = None
+        self.absolute_to_relative_idx = None
+        self.meta = SimpleNamespace(
+            features=schema.features,
+            stats=schema.stats,
+            camera_keys=schema.camera_keys,
+            depth_keys=[],
+            has_language_columns=False,
+            total_frames=self.num_frames,
+            total_episodes=self.num_episodes,
+            repo_id=[source.repo_id for source in sources.values()],
+            robot_type="mixed",
+            fps=schema.fps,
+            tasks=schema.tasks,
+            is_mixture=True,
+        )
+
+    def __len__(self):
+        return self.num_frames
+
+    def make_sampler(self, seed: int, batch_multiple: int = 1):
+        return WeightedDatasetSampler(
+            self._lengths,
+            [self.sources[name].weight for name, _, _ in self.children],
+            seed=seed,
+            batch_multiple=batch_multiple,
+        )
+
+    def eval_indices(self, max_samples: int) -> list[int]:
+        """Cap offline evaluation across tasks using episode metadata, without decoding frames."""
+        by_task = {}
+        offset = 0
+        for _, child, index in self.children:
+            previous = 0
+            for start, end in zip(index._starts, index._cum_lengths, strict=True):
+                # Locate the original episode containing this interval.
+                episode = bisect_right(child.meta.episodes["dataset_from_index"], int(start)) - 1
+                tasks = child.meta.episodes[episode]["tasks"]
+                task = tasks[0] if tasks else ""
+                by_task.setdefault(task, []).append(range(offset + previous, offset + int(end)))
+                previous = int(end)
+            offset += len(index)
+        quota, remainder = divmod(max_samples, len(by_task))
+        selected = []
+        for i, ranges in enumerate(by_task.values()):
+            remaining = quota + (i < remainder)
+            for interval in ranges:
+                take = min(remaining, len(interval))
+                selected.extend(interval[:take])
+                remaining -= take
+                if remaining == 0:
+                    break
+        return selected
+
+    def __getitem__(self, idx):
+        if idx < 0:
+            idx += len(self)
+        if not 0 <= idx < len(self):
+            raise IndexError(idx)
+        child_index = bisect_right(self._ends, idx)
+        name, dataset, frame_index = self.children[child_index]
+        source = self.sources[name]
+        position = idx - (self._ends[child_index - 1] if child_index else 0)
+        raw = dataset[frame_index._frame_index(position)]
+        source_index = self.schema.source_indices[name]
+        item = {
+            "dataset_index": torch.tensor(source_index),
+            "index": torch.tensor(idx),
+            "episode_index": raw["episode_index"] + self.schema.episode_offsets[name],
+            "frame_index": raw["frame_index"],
+            "timestamp": raw["timestamp"],
+            "task": raw["task"],
+            "task_index": torch.tensor(self.schema.task_indices[raw["task"]]),
+        }
+        for target, fields, size in (
+            (ACTION, self.schema.action_fields[name], self.schema.action_dim),
+            (OBS_STATE, self.schema.state_fields[name], self.schema.state_dim),
+        ):
+            values = []
+            for key, indices in fields:
+                value = raw[key].float()
+                if tuple(dataset.meta.features[key]["shape"]) == (1,):
+                    # HF scalarizes one-component numeric features on disk.
+                    expected_ndim = 2 if key in dataset.reader.delta_indices else 1
+                    if value.ndim < expected_ndim:
+                        value = value.unsqueeze(-1)
+                # A field used both as state and action was queried as a chunk; state stays at t.
+                if target == OBS_STATE and value.ndim == 2:
+                    value = value[0]
+                values.append(value[..., indices])
+            value = torch.cat(values, dim=-1)
+            item[target] = F.pad(value, (0, size - value.shape[-1]))
+            item[f"{target}_dim_is_pad"] = torch.arange(size) >= value.shape[-1]
+        item["action_is_pad"] = torch.stack(
+            [raw[f"{key}_is_pad"] for key, _ in self.schema.action_fields[name]]
+        ).any(dim=0)
+
+        lam_camera = self.schema.lam_camera_keys.get(name)
+        if self.is_lap:
+            from lerobot.policies.pi05_lap.configuration_pi05_lap import LAM_IMAGE_PAIR
+            from lerobot.policies.pi05_lap.lam.preprocessing import preprocess_lam_pair
+
+            # Take the selected student's camera pair before resizing/augmentation.
+            item[LAM_IMAGE_PAIR] = preprocess_lam_pair(raw[lam_camera], 224)
+        for camera in self.schema.camera_keys:
+            source_key = source.camera_fields.get(camera)
+            if source_key is None:
+                item[camera] = torch.zeros(
+                    3,
+                    *self.schema.image_resolution,
+                    dtype=torch.uint8 if self.schema.return_uint8 else torch.float32,
+                )
+                item[f"{camera}_is_pad"] = torch.tensor(True)
+                continue
+            image = raw[source_key]
+            if self.is_lap and source_key == lam_camera:
+                image = image[0]
+            # Image columns are decoded as float32; videos may be uint8. Do not
+            # let default_collate promote byte pixels to unscaled floats in mixed batches.
+            if self.schema.return_uint8 and image.dtype != torch.uint8:
+                image = (image * 255).round().clamp(0, 255).to(torch.uint8)
+            elif not self.schema.return_uint8 and image.dtype == torch.uint8:
+                image = image.float().div(255)
+            # Resize before collating so different source resolutions can share a batch.
+            image = resize_with_pad_torch(image.permute(1, 2, 0).unsqueeze(0), *self.schema.image_resolution)[
+                0
+            ].permute(2, 0, 1)
+            if self.image_transforms is not None:
+                image = self.image_transforms(image)
+            item[camera] = image
+            item[f"{camera}_is_pad"] = torch.tensor(False)
+        return item
+
+
+def make_configured_datasets(cfg):
+    policy = cfg.policy
+    settings = cfg.dataset
+    sources = settings.datasets
+    is_lap = policy.type == "pi05_lap" and policy.training_stage == "pre-training"
+    metadata = {
+        name: LeRobotDatasetMetadata(source.repo_id, root=source.root, revision=source.revision)
+        for name, source in sources.items()
+    }
+    action_fields, state_fields, cameras, stats = {}, {}, [], {}
+    lam_camera_keys = {}
+    action_dim, state_dim = 0, 0
+    episode_offsets, episode_offset = {}, 0
+    task_names = []
+    for name, source in sources.items():
+        meta = metadata[name]
+        action_fields[name] = _vector_indices(source.action_fields, meta.features)
+        state_fields[name] = _vector_indices(source.state_fields, meta.features)
+        action_dim = max(action_dim, sum(len(i) for _, i in action_fields[name]))
+        state_dim = max(state_dim, sum(len(i) for _, i in state_fields[name]))
+        episode_offsets[name], episode_offset = episode_offset, episode_offset + meta.total_episodes
+        task_names.extend(str(task) for task in meta.tasks.index if str(task) not in task_names)
+        for target, key in source.camera_fields.items():
+            if key is not None:
+                _validate_rgb_camera(meta, key, name)
+            if target not in cameras:
+                cameras.append(target)
+        if is_lap:
+            lam_camera_keys[name] = source.resolve_lam_camera_key()
+            _validate_rgb_camera(meta, lam_camera_keys[name], name)
+    if action_dim > policy.max_action_dim or state_dim > policy.max_state_dim:
+        raise ValueError(
+            f"Mapped action/state dimensions ({action_dim}, {state_dim}) exceed policy capacity "
+            f"({policy.max_action_dim}, {policy.max_state_dim}). Select indices explicitly; no truncation is applied."
+        )
+    features = {
+        ACTION: {"dtype": "float32", "shape": (action_dim,), "names": None},
+        OBS_STATE: {"dtype": "float32", "shape": (state_dim,), "names": None},
+        **{
+            key: {
+                "dtype": "image",
+                "shape": (3, *policy.image_resolution),
+                "names": ["channels", "height", "width"],
+            }
+            for key in cameras
+        },
+    }
+    for source_index, (name, source) in enumerate(sources.items()):
+        meta = metadata[name]
+        for key, fields, size, feature_type in (
+            (ACTION, action_fields[name], action_dim, FeatureType.ACTION),
+            (OBS_STATE, state_fields[name], state_dim, FeatureType.STATE),
+        ):
+            mode = NormalizationMode(policy.normalization_mapping.get(feature_type.value, "IDENTITY"))
+            # Prefixes are understood by the regular normalizer and saved in its safetensors.
+            stats[f"dataset_{source_index}/{key}"] = _vector_stats(meta, fields, size, mode)
+        for camera, key in source.camera_fields.items():
+            if key is None:
+                continue
+            stats[f"dataset_{source_index}/{camera}"] = (
+                IMAGENET_STATS if settings.use_imagenet_stats else (meta.stats or {}).get(key, {})
+            )
+    fps_values = {meta.fps for meta in metadata.values()}
+    schema = SimpleNamespace(
+        features=features,
+        stats=stats,
+        camera_keys=cameras,
+        action_dim=action_dim,
+        state_dim=state_dim,
+        action_fields=action_fields,
+        state_fields=state_fields,
+        lam_camera_keys=lam_camera_keys,
+        image_resolution=policy.image_resolution,
+        source_indices={name: i for i, name in enumerate(sources)},
+        episode_offsets=episode_offsets,
+        fps=next(iter(fps_values)) if len(fps_values) == 1 else None,
+        tasks=pd.DataFrame({"task_index": range(len(task_names))}, index=task_names),
+        task_indices={name: i for i, name in enumerate(task_names)},
+        return_uint8=settings.return_uint8,
+    )
+    train_children, eval_children = [], []
+    for name, source in sources.items():
+        meta = metadata[name]
+        train_episodes, eval_episodes = _split_episodes(meta, source, settings.eval_split)
+        deltas = {key: [i / meta.fps for i in policy.action_delta_indices] for key, _ in action_fields[name]}
+        loaded_cameras = [key for key in source.camera_fields.values() if key is not None]
+        if is_lap:
+            camera = lam_camera_keys[name]
+            deltas[camera] = [0, policy.chunk_size / meta.fps]
+        for episodes, children in ((train_episodes, train_children), (eval_episodes, eval_children)):
+            if not episodes:
+                continue
+            child = LeRobotDataset(
+                source.repo_id,
+                root=source.root,
+                # Avoid an O(num_frames) absolute->relative dict when selecting the whole source.
+                episodes=None if len(episodes) == meta.total_episodes else episodes,
+                revision=source.revision,
+                delta_timestamps=deltas,
+                image_transforms=None,
+                video_backend=source.video_backend or settings.video_backend,
+                return_uint8=settings.return_uint8,
+                depth_output_unit=settings.depth_output_unit,
+                tolerance_s=source.tolerance_s or settings.tolerance_s or cfg.tolerance_s,
+                camera_keys=loaded_cameras,
+            )
+            index = EpisodeAwareSampler(
+                meta.episodes["dataset_from_index"],
+                meta.episodes["dataset_to_index"],
+                episode_indices_to_use=episodes,
+                drop_n_last_frames=getattr(policy, "drop_n_last_frames", 0),
+                absolute_to_relative_idx=child.absolute_to_relative_idx,
+            )
+            children.append((name, child, index))
+        logging.info(
+            "Dataset %s: weight=%s action_dim=%d state_dim=%d train_episodes=%d eval_episodes=%d",
+            name,
+            source.weight,
+            sum(len(i) for _, i in action_fields[name]),
+            sum(len(i) for _, i in state_fields[name]),
+            len(train_episodes),
+            len(eval_episodes),
+        )
+    transforms = ImageTransforms(settings.image_transforms) if settings.image_transforms.enable else None
+    train = ConfiguredDataset(train_children, sources, schema, image_transforms=transforms, is_lap=is_lap)
+    evaluation = ConfiguredDataset(eval_children, sources, schema, is_lap=is_lap) if eval_children else None
+    return train, evaluation

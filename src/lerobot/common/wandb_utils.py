@@ -50,7 +50,10 @@ def cfg_to_group(
         f"seed:{cfg.seed}",
     ]
     if cfg.dataset is not None:
-        lst.append(f"dataset:{cfg.dataset.repo_id}")
+        if getattr(cfg.dataset, "datasets", None):
+            lst.extend(f"dataset:{source.repo_id}" for source in cfg.dataset.datasets.values())
+        else:
+            lst.append(f"dataset:{cfg.dataset.repo_id}")
     if cfg.env is not None:
         lst.append(f"env:{cfg.env.type}")
     if truncate_tags:

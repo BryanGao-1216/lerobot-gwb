@@ -59,6 +59,7 @@ class DatasetReader:
         image_transforms: Callable | None,
         return_uint8: bool = False,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        camera_keys: list[str] | None = None,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -80,6 +81,8 @@ class DatasetReader:
                 instead of normalized float32.
             depth_output_unit: Physical unit depth maps are dequantized to
                 (``"m"`` or ``"mm"``). Defaults to ``"mm"``.
+            camera_keys: Source camera keys to read. None reads all cameras;
+                an empty list disables visual loading. Metadata is kept intact.
         """
         self._meta = meta
         self.root = root
@@ -91,6 +94,16 @@ class DatasetReader:
         self._image_transforms = image_transforms
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
+        self._selected_camera_keys = list(camera_keys) if camera_keys is not None else None
+        if camera_keys is not None and (
+            isinstance(camera_keys, str)
+            or len(set(camera_keys)) != len(camera_keys)
+            or set(camera_keys) - set(meta.camera_keys)
+        ):
+            raise ValueError(f"camera_keys must be distinct camera keys from {meta.camera_keys}.")
+        excluded_cameras = set(meta.camera_keys) - set(self.camera_keys)
+        if excluded_cameras.intersection(delta_timestamps or {}):
+            raise ValueError("delta_timestamps contains cameras excluded by camera_keys.")
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
@@ -104,14 +117,23 @@ class DatasetReader:
         self._depth_encoder_configs: dict[str, DepthEncoderConfig] = {
             vid_key: DepthEncoderConfig.from_video_info(self._meta.features[vid_key].get("info"))
             for vid_key in self._meta.depth_keys
+            if vid_key in self.camera_keys
         }
 
         # Get the input unit of each depth feature stored as raw images.
         self._image_depth_units: dict[str, str | None] = {
             key: (self._meta.features[key].get("info") or {}).get("depth_unit")
             for key in self._meta.depth_keys
-            if key in self._meta.image_keys
+            if key in self._meta.image_keys and key in self.camera_keys
         }
+
+    @property
+    def camera_keys(self) -> list[str]:
+        return self._meta.camera_keys if self._selected_camera_keys is None else self._selected_camera_keys
+
+    @property
+    def video_keys(self) -> list[str]:
+        return [key for key in self.camera_keys if key in self._meta.video_keys]
 
     def set_image_transforms(self, image_transforms: Callable | None) -> None:
         """Replace the transform applied to visual observations."""
@@ -162,8 +184,16 @@ class DatasetReader:
 
     def _load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
-        features = get_hf_features_from_features(self._meta.features)
-        hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
+        excluded_cameras = set(self._meta.camera_keys) - set(self.camera_keys)
+        features = get_hf_features_from_features(
+            {key: feature for key, feature in self._meta.features.items() if key not in excluded_cameras}
+        )
+        hf_dataset = load_nested_dataset(
+            self.root / "data",
+            features=features,
+            episodes=self.episodes,
+            columns=list(features) if self._selected_camera_keys is not None else None,
+        )
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 
@@ -185,9 +215,9 @@ class DatasetReader:
         if not requested_episodes.issubset(available_episodes):
             return False
 
-        if len(self._meta.video_keys) > 0:
+        if self.video_keys:
             for ep_idx in requested_episodes:
-                for vid_key in self._meta.video_keys:
+                for vid_key in self.video_keys:
                     video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
                     if not video_path.exists():
                         return False
@@ -201,10 +231,10 @@ class DatasetReader:
         """
         episodes = self.episodes if self.episodes is not None else list(range(self._meta.total_episodes))
         fpaths = [str(self._meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
-        if len(self._meta.video_keys) > 0:
+        if self.video_keys:
             video_files = [
                 str(self._meta.get_video_file_path(ep_idx, vid_key))
-                for vid_key in self._meta.video_keys
+                for vid_key in self.video_keys
                 for ep_idx in episodes
             ]
             fpaths += video_files
@@ -237,7 +267,7 @@ class DatasetReader:
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self._meta.video_keys:
+        for key in self.video_keys:
             if query_indices is not None and key in query_indices:
                 if self._absolute_to_relative_idx is not None:
                     relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
@@ -328,14 +358,14 @@ class DatasetReader:
             for key, val in query_result.items():
                 item[key] = val
 
-        if len(self._meta.video_keys) > 0:
+        if self.video_keys:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
         if self._image_transforms is not None:
-            for cam in self._meta.camera_keys:
+            for cam in self.camera_keys:
                 if cam in self._meta.depth_keys:
                     continue
                 item[cam] = self._image_transforms(item[cam])

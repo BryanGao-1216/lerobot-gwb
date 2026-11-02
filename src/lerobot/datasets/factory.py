@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
-from pprint import pformat
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -29,8 +29,10 @@ from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
-from .multi_dataset import MultiLeRobotDataset
 from .streaming_dataset import StreamingLeRobotDataset
+
+if TYPE_CHECKING:
+    from .configured_dataset import ConfiguredDataset
 
 
 def resolve_delta_timestamps(
@@ -75,18 +77,20 @@ def resolve_delta_timestamps(
 
 def make_dataset(
     cfg: TrainPipelineConfig,
-) -> LeRobotDataset | MultiLeRobotDataset:
+) -> LeRobotDataset | StreamingLeRobotDataset | ConfiguredDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
         cfg (TrainPipelineConfig): A TrainPipelineConfig config which contains a DatasetConfig and a PreTrainedConfig.
 
-    Raises:
-        NotImplementedError: The MultiLeRobotDataset is currently deactivated.
-
     Returns:
-        LeRobotDataset | MultiLeRobotDataset
+        A native LeRobot dataset or a configured mixture of mapped sources.
     """
+    cfg.dataset = cfg.dataset.resolve_file()
+    if cfg.dataset.datasets:
+        from .configured_dataset import make_configured_datasets
+
+        return make_configured_datasets(cfg)[0]
     is_lap = (
         cfg.policy is not None
         and cfg.policy.type == "pi05_lap"
@@ -132,17 +136,8 @@ def make_dataset(
                 return_uint8=True,
             )
     else:
-        raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
-        dataset = MultiLeRobotDataset(
-            cfg.dataset.repo_id,
-            # TODO(aliberts): add proper support for multi dataset
-            # delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            video_backend=cfg.dataset.video_backend,
-        )
-        logging.info(
-            "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
-            f"{pformat(dataset.repo_id_to_index, indent=2)}"
+        raise ValueError(
+            "Provide dataset.repo_id for one dataset, or dataset.config_path for a JSON mixture."
         )
 
     if cfg.dataset.use_imagenet_stats:
@@ -169,12 +164,19 @@ def _policy_dataset_class(cfg: TrainPipelineConfig):
 
 def make_train_eval_datasets(
     cfg: TrainPipelineConfig,
-) -> tuple[LeRobotDataset | MultiLeRobotDataset, LeRobotDataset | None]:
+) -> tuple[
+    LeRobotDataset | StreamingLeRobotDataset | ConfiguredDataset, LeRobotDataset | ConfiguredDataset | None
+]:
     """Create train and optional eval datasets by splitting episodes based on eval_split.
 
     The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
     If eval_split == 0.0, returns (full_dataset, None).
     """
+    cfg.dataset = cfg.dataset.resolve_file()
+    if cfg.dataset.datasets:
+        from .configured_dataset import make_configured_datasets
+
+        return make_configured_datasets(cfg)
     full_dataset = make_dataset(cfg)
 
     if cfg.dataset.eval_split == 0.0:

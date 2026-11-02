@@ -22,6 +22,7 @@ import dataclasses
 import logging
 import sys
 import time
+from collections.abc import Iterator
 from contextlib import nullcontext
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
@@ -34,14 +35,15 @@ from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
-from lerobot.common.swanlab_utils import make_experiment_logger
-from lerobot.common.tensorboard_utils import TensorBoardLogger
+from lerobot.common.action_chunk_eval import evaluate_action_chunks, full_horizon_indices
+from lerobot.common.swanlab_utils import experiment_logging
 from lerobot.common.train_utils import (
     gather_fsdp_state_dicts,
     get_step_checkpoint_dir,
     get_step_identifier,
     load_fsdp_optimizer_state,
     load_training_batch_size,
+    load_training_data_batches_seen,
     load_training_num_processes,
     load_training_state,
     push_checkpoint_to_hub,
@@ -82,101 +84,92 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
-    tensorboard_logger: TensorBoardLogger | None = None,
-    step: int | None = None,
 ) -> tuple[MetricsTracker, dict | None]:
+    """Perform one optimizer update from a batch or a lazy iterator of N micro-batches.
+
+    N is accelerator.gradient_accumulation_steps. Only the final micro-batch
+    synchronizes, clips and updates weights. Logged losses are sample-weighted
+    window means, including when the dataloader ends with a smaller batch.
     """
-    Performs a single training step to update the policy's weights.
+    from accelerate.utils import find_batch_size
 
-    This function executes the forward and backward passes, clips gradients, and steps the optimizer and
-    learning rate scheduler. Accelerator handles mixed-precision training automatically.
-
-    Args:
-        train_metrics: A MetricsTracker instance to record training statistics.
-        policy: The policy model to be trained.
-        batch: A batch of training data.
-        optimizer: The optimizer used to update the policy's parameters.
-        grad_clip_norm: The maximum norm for gradient clipping.
-        accelerator: The Accelerator instance for distributed training and mixed precision.
-        lr_scheduler: An optional learning rate scheduler.
-        lock: An optional lock for thread-safe optimizer updates.
-        sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
-        tensorboard_logger: Optional logger used for parameter/gradient histograms.
-        step: The completed optimizer-step number used for TensorBoard histograms.
-
-    Returns:
-        A tuple containing:
-        - The updated MetricsTracker with new statistics for this step.
-        - A dictionary of outputs from the policy's forward pass, for logging purposes.
-    """
-    start_time = time.perf_counter()
+    accumulation = accelerator.gradient_accumulation_steps
+    if accumulation > 1 and not isinstance(batch, Iterator):
+        raise ValueError("Gradient accumulation requires a lazy iterator of micro-batches.")
+    batches = batch if isinstance(batch, Iterator) else iter([batch])
+    update_s, loss_sum, sample_count = 0.0, 0.0, 0
+    scalar_sums, output_dict = {}, {}
+    reference_batch_size = None
     policy.train()
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    # Compute sample weights if a weighter is provided
-    sample_weights = None
-    weight_stats = None
-    if sample_weighter is not None:
-        sample_weights, weight_stats = sample_weighter.compute_batch_weights(batch)
-
-    # Let accelerator handle mixed precision
-    with accelerator.autocast():
-        if sample_weights is not None:
-            # Use per-sample loss for weighted training
-            # Note: Policies supporting sample weighting must implement forward(batch, reduction="none")
-            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
-
-            # Weighted loss: each sample's contribution is scaled by its weight.
-            # We divide by weight sum (not batch size) so that if some weights are zero,
-            # the remaining samples contribute proportionally more, preserving gradient scale.
-            # Weights are pre-normalized to sum to batch_size for stable training dynamics.
-            epsilon = 1e-6
-            loss = (per_sample_loss * sample_weights).sum() / (sample_weights.sum() + epsilon)
-
-            # Log weighting statistics
-            if output_dict is None:
-                output_dict = {}
-            for key, value in weight_stats.items():
-                output_dict[f"sample_weight_{key}"] = value
-        else:
-            loss, output_dict = policy.forward(batch)
-
-        # TODO(rcadene): policy.unnormalize_outputs(out_dict)
-
-    # Use accelerator's backward method
-    accelerator.backward(loss)
-
-    # Clip gradients if specified
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
+    for micro_step in range(accumulation):
+        try:
+            micro_batch = next(batches)
+        except StopIteration as exc:
+            raise ValueError(f"Expected {accumulation} micro-batches for one optimizer update.") from exc
+        # Exclude lazy data loading/preprocessing from the optimizer timing.
+        start_time = time.perf_counter()
+        tensor_batch = (
+            [value for value in micro_batch.values() if isinstance(value, torch.Tensor) and value.ndim > 0]
+            if isinstance(micro_batch, dict)
+            else micro_batch
         )
+        batch_size = find_batch_size(tensor_batch)
+        reference_batch_size = reference_batch_size or batch_size
+        sample_count += batch_size
+        with accelerator.accumulate(policy):
+            sample_weights, weight_stats = None, {}
+            if sample_weighter is not None:
+                sample_weights, weight_stats = sample_weighter.compute_batch_weights(micro_batch)
+            with accelerator.autocast():
+                if sample_weights is not None:
+                    per_sample_loss, micro_output = policy(micro_batch, reduction="none")
+                    loss = (per_sample_loss * sample_weights).sum() / (sample_weights.sum() + 1e-6)
+                else:
+                    loss, micro_output = policy(micro_batch)
+            micro_output = dict(micro_output or {})
+            micro_output.update({f"sample_weight_{key}": value for key, value in weight_stats.items()})
+            # backward() divides by N. Correct unequal batch sizes before clipping.
+            accelerator.backward(loss * (batch_size / reference_batch_size))
+            if accelerator.sync_gradients:
+                if micro_step != accumulation - 1:
+                    raise RuntimeError(
+                        "Gradient synchronization occurred before the accumulation window ended."
+                    )
+                correction = accumulation * reference_batch_size / sample_count
+                if correction != 1:
+                    for parameter in policy.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.mul_(correction)
+                grad_norm = accelerator.clip_grad_norm_(
+                    policy.parameters(), grad_clip_norm if grad_clip_norm > 0 else float("inf")
+                )
+                with lock if lock is not None else nullcontext():
+                    optimizer.step()
+                optimizer.zero_grad()
+                if not accelerator.optimizer_step_was_skipped:
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
+                    unwrapped = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+                    if has_method(unwrapped, "update"):
+                        unwrapped.update()
+            elif micro_step == accumulation - 1:
+                raise RuntimeError("The final micro-batch did not synchronize gradients.")
+        loss_sum += loss.detach().item() * batch_size
+        output_dict.update(micro_output)
+        for key, value in micro_output.items():
+            if not isinstance(value, bool) and isinstance(value, (int, float)):
+                scalar_sums[key] = scalar_sums.get(key, 0.0) + value * batch_size
+        update_s += time.perf_counter() - start_time
 
-    if tensorboard_logger is not None and step is not None:
-        tensorboard_logger.log_model_histograms(policy, step)
-
-    # Optimizer step
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
-
-    optimizer.zero_grad()
-
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
-
-    # Update internal buffers if policy has update method
-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
-        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
-
-    train_metrics.loss = loss.item()
+    output_dict.update({key: value / sample_count for key, value in scalar_sums.items()})
+    train_metrics.loss = loss_sum / sample_count
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
-    train_metrics.update_s = time.perf_counter() - start_time
+    train_metrics.update_s = update_s
     if torch.cuda.is_available():
         train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
     # Aggregate the policy's scalar outputs for logging and rank-reduction across the log window.
@@ -185,14 +178,14 @@ def update_policy(
     return train_metrics, output_dict
 
 
-def _reduce_scalar_metrics(metrics: dict[str, float], accelerator: "Accelerator") -> dict[str, float]:
-    """Mean-reduce a same-key scalar dictionary across training processes."""
-    if accelerator.num_processes <= 1 or not metrics:
-        return metrics
-    names = sorted(metrics)
-    values = torch.tensor([metrics[name] for name in names], dtype=torch.float32, device=accelerator.device)
-    reduced = accelerator.reduce(values, reduction="mean")
-    return dict(zip(names, reduced.tolist(), strict=True))
+def _training_batches(iterator, count: int, preprocessor, camera_keys: list[str]):
+    """Load and process micro-batches lazily, releasing each graph before loading the next."""
+    for _ in range(count):
+        batch = next(iterator)
+        for key in camera_keys:
+            if key in batch and batch[key].dtype == torch.uint8:
+                batch[key] = batch[key].float().div(255)
+        yield preprocessor(batch)
 
 
 @parser.wrap()
@@ -219,9 +212,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     require_package("accelerate", extra="training")
     from accelerate import Accelerator
-    from accelerate.utils import DistributedDataParallelKwargs, DistributedType
+    from accelerate.utils import DistributedDataParallelKwargs, GradientAccumulationPlugin
 
     cfg.validate()
+    gradient_accumulation = getattr(cfg.trainable_config, "gradient_accumulation", 1)
 
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
@@ -239,11 +233,20 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         policy_dtype = getattr(cfg.trainable_config, "dtype", None)
         mixed_precision = {"bfloat16": "bf16", "float16": "fp16"}.get(policy_dtype)
         accelerator = Accelerator(
+            gradient_accumulation_plugin=GradientAccumulationPlugin(
+                num_steps=gradient_accumulation, sync_with_dataloader=False
+            ),
             step_scheduler_with_optimizer=False,
             mixed_precision=mixed_precision,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
         )
+    else:
+        # The policy CLI is authoritative, including for programmatic callers.
+        accelerator.gradient_accumulation_steps = gradient_accumulation
+        accelerator.gradient_state.plugin_kwargs["sync_with_dataloader"] = False
+        accelerator.step_scheduler_with_optimizer = False
+        accelerator.step = 0
 
     init_logging(accelerator=accelerator)
 
@@ -255,8 +258,17 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if is_main_process:
         logging.info(pformat(cfg.to_dict()))
 
-    # Only the main process initializes the SDK and sends experiment logs.
-    experiment_logger = make_experiment_logger(cfg) if is_main_process else None
+    # Keep shutdown handling active during model/dataset initialization as well
+    # as training: failures and Ctrl+C must close the experiment too.
+    with experiment_logging(cfg, enabled=is_main_process) as experiment_logger:
+        _train_with_logger(cfg, accelerator, experiment_logger)
+
+
+def _train_with_logger(cfg: TrainPipelineConfig, accelerator: "Accelerator", experiment_logger):
+    from accelerate.utils import DistributedType
+
+    gradient_accumulation = accelerator.gradient_accumulation_steps
+    is_main_process = accelerator.is_main_process
     if experiment_logger is None and is_main_process:
         logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
@@ -401,7 +413,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             dataset_repo_id=cfg.dataset.repo_id,
         )
 
-    step = 0  # number of policy updates (forward + backward + optim)
+    step = 0  # completed optimizer updates, independent of micro-batch count
+    data_batches_seen = 0
 
     if cfg.resume:
         # Under FSDP the optimizer state is sharded and must be loaded after `accelerator.prepare()`
@@ -410,18 +423,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         step, optimizer, lr_scheduler = load_training_state(
             cfg.checkpoint_path, optimizer, lr_scheduler, load_optimizer=not is_fsdp
         )
-
-    tensorboard_enabled = bool(
-        not cfg.is_reward_model_training
-        and cfg.policy is not None
-        and getattr(cfg.policy, "tensorboard_enable", False)
-    )
-    tensorboard_log_freq = int(getattr(cfg.policy, "tensorboard_log_freq", 1))
-    tensorboard_logger = (
-        TensorBoardLogger(cfg, purge_step=step if cfg.resume else None)
-        if tensorboard_enabled and is_main_process
-        else None
-    )
+        saved_data_batches = load_training_data_batches_seen(cfg.checkpoint_path)
+        # Before accumulation was supported, each optimizer step consumed one batch.
+        data_batches_seen = (
+            saved_data_batches if saved_data_batches is not None else step - cfg.data_sampling_start_step
+        )
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -439,28 +445,48 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
-        effective_bs = cfg.batch_size * num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        effective_bs = cfg.batch_size * num_processes * gradient_accumulation
+        logging.info(
+            "Effective batch size: %d per device x %d processes x %d accumulation = %d",
+            cfg.batch_size,
+            num_processes,
+            gradient_accumulation,
+            effective_bs,
+        )
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
+    sampler_state = None
     if not cfg.dataset.streaming:
-        # All non-streaming (map-style) datasets use EpisodeAwareSampler.
+        # Native datasets use episode-aware shuffling; configured mixtures use weighted sampling.
         # The order is a pure function of (seed, epoch), so every rank independently produces the
         # same permutation. accelerate then shards it disjointly across ranks via BatchSamplerShard
         # without needing a `generator` attribute to synchronize an RNG, and resume is sample-exact.
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
-            shuffle=True,
-            seed=cfg.seed if cfg.seed is not None else 0,
-            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
-        )
-        if cfg.resume and step > 0:
+        if cfg.dataset.datasets:
+            sampler = dataset.make_sampler(
+                seed=cfg.seed if cfg.seed is not None else 0,
+                batch_multiple=cfg.batch_size * accelerator.num_processes,
+            )
+        else:
+            sampler = EpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=dataset.episodes,
+                drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
+                shuffle=True,
+                seed=cfg.seed if cfg.seed is not None else 0,
+                absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+            )
+        if getattr(cfg, "_reset_data_order", False):
+            cfg.data_sampling_start_step = step
+            data_batches_seen = 0
+            if is_main_process:
+                logging.warning(
+                    "Dataset mixture changed on resume: keeping training state, restarting data sampling at epoch 0."
+                )
+        if cfg.resume and step > 0 and not getattr(cfg, "_reset_data_order", False):
             # The resume offset depends on the (num_processes, batch_size) that produced `step`, so
             # use the values recorded in the checkpoint (falling back to the current ones for older
             # ckpts that did not store them).
@@ -480,7 +506,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     f"batch_size={saved_batch_size}. The data order resumes at the right epoch/offset, "
                     "but per-rank sample-exactness requires the same batch size."
                 )
-            sampler_state = compute_sampler_state(step, len(sampler), ckpt_batch_size, ckpt_num_processes)
+            sampler_state = compute_sampler_state(
+                data_batches_seen, len(sampler), ckpt_batch_size, ckpt_num_processes
+            )
             sampler.load_state_dict(sampler_state)
             if is_main_process:
                 logging.info(
@@ -508,11 +536,44 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
     )
 
-    # Build eval dataloader if a held-out split exists
+    action_chunk_eval = (
+        cfg.policy is not None
+        and cfg.policy.type in {"pi05", "pi05_lap"}
+        and getattr(cfg.policy, "training_stage", "post-training") == "post-training"
+    )
+    # Build eval dataloader if a held-out split exists.
     eval_dataloader = None
-    if eval_dataset is not None:
+    if cfg.eval_steps > 0 and eval_dataset is None:
+        raise ValueError("eval_steps > 0 requires a nonempty held-out dataset from eval_split.")
+    if eval_dataset is not None and cfg.eval_steps > 0:
         eval_ds = eval_dataset
-        if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
+        if action_chunk_eval:
+            dimensions = (
+                {
+                    name: sum(len(indices) for _, indices in eval_dataset.schema.action_fields[name])
+                    for name, _, _ in eval_dataset.children
+                }
+                if cfg.dataset.datasets
+                else {cfg.dataset.repo_id: eval_dataset.meta.features["action"]["shape"][0]}
+            )
+            if any(dimension not in (7, 14) for dimension in dimensions.values()):
+                raise ValueError(
+                    f"Action chunk evaluation requires 7 or 14 mapped action dimensions: {dimensions}."
+                )
+            indices = full_horizon_indices(eval_dataset, cfg.policy.chunk_size)
+            if not indices:
+                raise ValueError(
+                    "No held-out episode has a complete action horizon; adjust eval_split or chunk_size."
+                )
+            eval_ds = torch.utils.data.Subset(eval_dataset, indices)
+            logging.info(
+                "Full action evaluation: %d complete held-out chunks (H=%d).",
+                len(indices),
+                cfg.policy.chunk_size,
+            )
+        elif cfg.max_eval_samples > 0 and cfg.dataset.datasets:
+            eval_ds = torch.utils.data.Subset(eval_dataset, eval_dataset.eval_indices(cfg.max_eval_samples))
+        elif cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
             task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
             unique_tasks = sorted(set(task_arr.tolist()))
             per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
@@ -533,6 +594,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             collate_fn=eval_collate_fn,
             prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
             persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+            generator=torch.Generator().manual_seed(cfg.seed or 0),
         )
 
     # Prepare everything with accelerator
@@ -551,6 +613,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if cfg.resume and accelerator.distributed_type == DistributedType.FSDP:
         load_fsdp_optimizer_state(policy, optimizer, cfg.checkpoint_path)
 
+    if sampler_state is not None:
+        # Accelerate calls sampler.set_epoch(self.iteration) when iteration begins.
+        # Restore its epoch as well, so it does not overwrite the resumed sampler with epoch 0.
+        dataloader.set_epoch(sampler_state["epoch"])
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -574,15 +640,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
-    effective_batch_size = cfg.batch_size * accelerator.num_processes
+    effective_batch_size = cfg.batch_size * accelerator.num_processes * gradient_accumulation
     train_tracker = MetricsTracker(
-        cfg.batch_size,
+        cfg.batch_size * gradient_accumulation,
         dataset.num_frames,
         dataset.num_episodes,
         train_metrics,
         initial_step=step,
         accelerator=accelerator,
     )
+    # Changing N on resume must not multiply all historical samples by the new N.
+    train_tracker.samples = data_batches_seen * cfg.batch_size * accelerator.num_processes
+    train_tracker.episodes = train_tracker.samples / (dataset.num_frames / dataset.num_episodes)
+    train_tracker.epochs = train_tracker.samples / dataset.num_frames
 
     if is_main_process:
         progbar = tqdm(
@@ -597,27 +667,23 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    for _ in range(step, cfg.steps):
+    while step < cfg.steps:
         start_time = time.perf_counter()
-        batch = next(dl_iter)
-        for cam_key in dataset.meta.camera_keys:
-            if cam_key in batch and batch[cam_key].dtype == torch.uint8:
-                batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
-        batch = preprocessor(batch)
-        train_tracker.dataloading_s = time.perf_counter() - start_time
-
-        train_tracker, output_dict = update_policy(
+        train_tracker, _ = update_policy(
             train_tracker,
             policy,
-            batch,
+            _training_batches(dl_iter, gradient_accumulation, preprocessor, dataset.meta.camera_keys),
             optimizer,
             cfg.optimizer.grad_clip_norm,
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
-            tensorboard_logger=tensorboard_logger,
-            step=step + 1,
         )
+        data_batches_seen += gradient_accumulation
+        train_tracker.dataloading_s = max(0.0, time.perf_counter() - start_time - train_tracker.update_s.val)
+        if accelerator.optimizer_step_was_skipped:
+            # A scaler overflow consumes data, but does not advance schedules/eval/checkpoints.
+            continue
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -629,29 +695,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
         is_eval_step = cfg.eval_steps > 0 and eval_dataloader is not None and step % cfg.eval_steps == 0
-        is_tensorboard_step = tensorboard_enabled and step % tensorboard_log_freq == 0
-
-        if is_tensorboard_step:
-            tensorboard_metrics = {
-                "loss": float(train_tracker.loss.val),
-                "grad_norm": float(train_tracker.grad_norm.val),
-                "lr": float(train_tracker.lr.val),
-                # "update_s": float(train_tracker.update_s.val),
-                # "dataloading_s": float(train_tracker.dataloading_s.val),
-            }
-            if torch.cuda.is_available():
-                tensorboard_metrics["gpu_mem_gb"] = float(train_tracker.gpu_mem_gb.val)
-            if output_dict:
-                tensorboard_metrics.update(
-                    {
-                        name: float(value)
-                        for name, value in output_dict.items()
-                        if name != "loss" and not isinstance(value, bool) and isinstance(value, (int, float))
-                    }
-                )
-            tensorboard_metrics = _reduce_scalar_metrics(tensorboard_metrics, accelerator)
-            if tensorboard_logger is not None:
-                tensorboard_logger.log_scalars(tensorboard_metrics, step, mode="train")
 
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
@@ -675,7 +718,23 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     experiment_logger.log_dict(log_dict, step)
             train_tracker.reset_averages()
 
-        if is_eval_step:
+        if is_eval_step and action_chunk_eval:
+            source_names = list(eval_dataset.sources) if cfg.dataset.datasets else [cfg.dataset.repo_id]
+            eval_metrics = evaluate_action_chunks(
+                policy,
+                preprocessor,
+                postprocessor,
+                eval_dataloader,
+                accelerator,
+                source_names,
+                seed=cfg.seed or 0,
+            )
+            if is_main_process:
+                logging.info("step %d: action evaluation %s", step, eval_metrics)
+                if experiment_logger:
+                    experiment_logger.log_dict(eval_metrics, step=step, mode="eval")
+
+        elif is_eval_step:
             policy.eval()
             eval_loss_sum = 0.0
             n_eval_batches = 0
@@ -697,8 +756,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if experiment_logger:
                     experiment_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
-                if tensorboard_logger:
-                    tensorboard_logger.log_scalars({"loss": eval_loss}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
@@ -725,6 +782,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     batch_size=cfg.batch_size,
                     model_state_dict=model_state_dict,
                     optim_state_dict=optim_state_dict,
+                    data_batches_seen=data_batches_seen,
                 )
                 update_last_checkpoint(checkpoint_dir)
                 if cfg.save_checkpoint_to_hub:
@@ -784,8 +842,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     log_dict = {**eval_tracker.to_dict(), **eval_info}
                     experiment_logger.log_dict(log_dict, step, mode="eval")
                     experiment_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
-                if tensorboard_logger:
-                    tensorboard_logger.log_scalars(eval_tracker.to_dict(), step, mode="eval")
 
             accelerator.wait_for_everyone()
 
@@ -800,10 +856,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if is_main_process:
         logging.info("End of training")
 
-        if tensorboard_logger:
-            tensorboard_logger.flush()
-            tensorboard_logger.close()
-
         if getattr(active_cfg, "push_to_hub", False):
             unwrapped_model = accelerator.unwrap_model(policy)
             # PEFT only applies when training a policy — reward models use the plain path.
@@ -813,9 +865,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 unwrapped_model.push_model_to_hub(cfg, state_dict=model_state_dict, dataset_meta=dataset.meta)
             preprocessor.push_to_hub(active_cfg.repo_id)
             postprocessor.push_to_hub(active_cfg.repo_id)
-
-        if experiment_logger:
-            experiment_logger.finish()
 
     # Properly clean up the distributed process group
     accelerator.wait_for_everyone()

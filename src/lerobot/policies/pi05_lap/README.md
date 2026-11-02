@@ -1,5 +1,9 @@
 # PI05 LAP
 
+多数据集混合训练可使用 `--dataset.config_path=dataset/libero.json`，各数据集独立配置字段映射、相机和抽样权重。详见 [数据配置说明](../../../../docs/dataset_config.md)。
+
+JSON 中每个数据集的 `camera_fields` 把 VLM 视角映射到数据集原始相机字段，可以选择部分相机，并用 `null`、`""` 或省略槽位表示空视角。`lam_camera_key` 填写其中一个非空原始相机字段，用于 latent 预训练；不能选择 VLM 输入之外的相机。只读取实际选中的相机。
+
 从当前 `pi05/` 复制并扩展的两阶段策略，原 PI05 策略保持独立。
 输入仍然是 PI05 的当前图像、任务指令和离散化状态，使用原有 processor 和归一化流程。
 
@@ -13,6 +17,7 @@
 | `policy.lam_model_path` | `null` | UniVLA stage-2 LAM 的本地 `.ckpt` 文件，仅预训练需要 |
 | `policy.lam_camera_key` | `null` | 单个 RGB 相机全名或短名，省略时自动选主视角 |
 | `policy.tokenizer_path` | `google/paligemma-3b-pt-224` | 初始化时使用的 PaliGemma tokenizer 目录或 Hub ID |
+| `policy.gradient_accumulation` | `1` | 累计多少个每卡 batch 后更新一次，预训练和后训练均支持 |
 
 自动选择相机时依次优先 `image`、`base_0_rgb`、`primary`、`front`、
 `agentview_image`、`image_primary`，否则使用 metadata 中的第一个 RGB 相机。
@@ -70,9 +75,20 @@ checkpoint 同时保存 `latent_tokenizer/` 和 `latent_action_tokens.json`，�
 动作专家从第一阶段保留的 PI05 权重开始训练，VLM 从预训练结果继续；
 `train_expert_only`、`freeze_vision_encoder` 等现有选项仍然有效。
 
+两个阶段都可以使用 `--policy.gradient_accumulation=4`。例如 `batch_size=8` 时，
+单卡有效 batch 为 32；保存、评估、学习率和训练总步数均按优化器更新次数计算。
+续训会恢复该配置，也可以显式覆盖；数据位置按已消费的 batch 数恢复。
+
 动作推理使用原有 `select_action` / `predict_action_chunk`。
 预训练模型可用 `predict_latent_actions(processed_batch)` 从当前观测自回归生成四个码本索引；
 它不需要未来图像或 LAM 权重。动作推理需切到 `post-training`。
+
+后训练可以设置 `--eval_steps=1000`，并在数据 JSON 中设置 `"eval_split": 0.05`，
+每隔 1000 步对留出 episode 中所有完整 horizon 执行动作推理，记录动作 RMSE、
+夹爪准确率和累计增量误差（总指标和各数据集指标）。夹爪暂按 `{-1, +1}`、阈值 0；
+7/14 维动作分别按单臂/双臂计算，排除补齐维度和不足 H 的末尾。
+评估使用真实的完整推理与反归一化流程，不设固定 10 组上限。
+详见 [后训练评估说明](../../../../docs/dataset_config.md#后训练中的完整动作推理评估)。
 
 ## 启动
 
@@ -85,7 +101,7 @@ checkpoint 同时保存 `latent_tokenizer/` 和 `latent_action_tokens.json`，�
 sh train_pi05_lap.sh
 ```
 
-启动脚本显式使用 `--dataset.video_backend=pyav`。如果 TorchCodec 报
+启动脚本选中的数据 JSON 使用 `"video_backend": "pyav"`。如果 TorchCodec 报
 `Could not load libtorchcodec`，并提示缺少 `libavutil.so.*`，可使用这一现有后端
 读取视频；该设置只影响数据解码，PI05 和 UniVLA 仍在 CUDA 上运行。
 
@@ -127,3 +143,11 @@ sh train_pi05_lap.sh
 `swanlab sync <output_dir>/swanlog/<run目录>` 上传本地实验。
 SwanLab 公有云不支持 checkpoint 文件上传，完整 checkpoint 继续保存在本地。
 环境评估产生的 MP4 会转换为 GIF 上传到 SwanLab，原 MP4 保留。
+
+训练入口会在正常结束时提交 `success`，在 Ctrl+C / SIGTERM 时提交 `aborted`，
+在初始化或训练报错时提交 `crashed`；只有主进程调用 SDK，提交后仍保留原异常及退出状态。
+按一次 Ctrl+C 后，请等待终端中 `Closing SwanLab experiment ...` 的同步收尾。
+再次中断同步、网络断开或 `kill -9` 都可能导致云端暂时继续显示“运行中”。
+对于已经停止的旧训练，可在 SwanLab 实验名旁点击终止按钮，将状态改为“中断”；
+这只改变云端记录，不会终止服务器进程。若不手动处理，官方规则是约 30 分钟无任何日志
+（包括系统指标）上传后自动标记中断，见 [SwanLab FAQ](https://docs.swanlab.cn/guide_cloud/experiment_track/FAQ.html)。

@@ -4,7 +4,12 @@ export CUDA_VISIBLE_DEVICES=0
 
 # 从最后一个 checkpoint 继续预训练；steps 是累计总步数（这里为 50 万）。
 # config_path 必须指向 pretrained_model/train_config.json。
-# 续训无需 policy.path，LAM、tokenizer 和数据集等配置从 checkpoint 读取。
+# 续训无需 policy.path，LAM 和 tokenizer 配置从 checkpoint 读取。
+# 数据配置选择下方 JSON；新增数据集就在 JSON 的 datasets 中添加一个配置块。
+# 不传 dataset.config_path 则沿用 checkpoint 内保存的数据配置快照。
+# 后训练动作评估：添加 --eval_steps=1000，并在数据 JSON 中设置 eval_split，例如 0.05。
+# 每次评估所有完整 horizon 的验证样本；当前预训练命令不计算动作推理指标。
+# gradient_accumulation 默认为 1；例如设为 4 时，batch_size=8 的单卡有效 batch 为 32。
 # 首次切换到 SwanLab 会创建新实验，之后的 checkpoint 会自动保存并复用实验 ID。
 # 运行前在当前环境安装依赖并登录：pip install -e '.[training,pi05-lap]'; swanlab login
 
@@ -14,7 +19,8 @@ args=(
   --steps=500000
   --save_freq=10000
   --batch_size=8
-  --dataset.video_backend=pyav
+  --policy.gradient_accumulation=1
+  --dataset.config_path=dataset/libero.json
   --wandb.enable=false
   --swanlab.enable=true
   --swanlab.project=pi05-lap

@@ -65,6 +65,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
+        camera_keys: list[str] | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -197,6 +198,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 instead of writing PNG images first. This makes save_episode() near-instant. Defaults to False.
             encoder_queue_maxsize (int, optional): Maximum number of frames to buffer per camera when using
                 streaming encoding. Defaults to 30 (~1s at 30fps).
+            camera_keys (list[str] | None, optional): Read only these source camera fields. None reads
+                all cameras. This affects decoding and video downloads, not the stored metadata.
 
         Note:
             Write-mode parameters (``streaming_encoding``, ``batch_encoding_size``) passed to
@@ -214,6 +217,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._depth_output_unit = depth_output_unit
         self._batch_encoding_size = batch_encoding_size
         self._encoder_threads = encoder_threads
+        self._camera_keys = list(camera_keys) if camera_keys is not None else None
 
         if self._requested_root is not None:
             self._requested_root.mkdir(exist_ok=True, parents=True)
@@ -254,6 +258,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             image_transforms=image_transforms,
             return_uint8=self._return_uint8,
             depth_output_unit=self._depth_output_unit,
+            camera_keys=camera_keys,
         )
         self.image_transforms = image_transforms
 
@@ -325,6 +330,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 image_transforms=self.image_transforms,
                 return_uint8=self._return_uint8,
                 depth_output_unit=self._depth_output_unit,
+                camera_keys=self._camera_keys,
             )
         return self.reader
 
@@ -626,7 +632,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """Downloads the dataset from the given 'repo_id' at the provided version."""
         ignore_patterns = None if download_videos else "videos/"
         files = None
-        if self.episodes is not None:
+        if self.episodes is not None or self._camera_keys is not None:
             # Reader is guaranteed to exist here (created in __init__ before _download)
             files = self.reader.get_episodes_file_paths()
 
@@ -743,6 +749,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.episodes = None
         obj._video_backend = video_backend if video_backend is not None else get_safe_default_video_backend()
         obj._return_uint8 = False
+        obj._camera_keys = None
         obj._depth_output_unit = DEFAULT_DEPTH_UNIT
         obj._batch_encoding_size = batch_encoding_size
         obj._encoder_threads = encoder_threads
@@ -842,6 +849,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.episodes = None
         obj._video_backend = video_backend if video_backend else get_safe_default_video_backend()
         obj._return_uint8 = False
+        obj._camera_keys = None
         obj._depth_output_unit = DEFAULT_DEPTH_UNIT
         obj._batch_encoding_size = batch_encoding_size
 

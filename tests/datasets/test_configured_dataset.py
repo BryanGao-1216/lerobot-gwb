@@ -1,0 +1,581 @@
+"""Small local datasets exercise the actual reader without loading model weights."""
+
+import json
+from copy import deepcopy
+from types import SimpleNamespace
+
+import draccus
+import numpy as np
+import pytest
+import torch
+from torch.utils.data import default_collate
+
+from lerobot.common.action_chunk_eval import full_horizon_indices
+from lerobot.configs.default import DatasetConfig
+from lerobot.configs.train import TrainPipelineConfig
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.dataset_reader import DatasetReader
+from lerobot.datasets.factory import make_train_eval_datasets
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.sampler import WeightedDatasetSampler, compute_sampler_state
+from lerobot.policies.common.masked_loss import reduce_action_loss
+from lerobot.policies.pi05_lap.configuration_pi05_lap import LAM_IMAGE_PAIR, PI05LAPConfig
+from lerobot.processor import DataProcessorPipeline, NormalizerProcessorStep, UnnormalizerProcessorStep
+from lerobot.processor.converters import batch_to_transition, identity_transition, transition_to_batch
+from lerobot.utils.feature_utils import dataset_to_policy_features
+
+
+@pytest.fixture(scope="module")
+def source_payload(tmp_path_factory):
+    root = tmp_path_factory.mktemp("mixture")
+    sources = {}
+    for i, (action_dim, state_dim, fps) in enumerate(((3, 2, 10), (5, 4, 20))):
+        # Different names, vector dimensions, image sizes, frame rates and camera counts.
+        ak, sk, ck = f"control{i}", f"state{i}", f"view{i}"
+        features = {
+            ak: {"dtype": "float32", "shape": (action_dim,), "names": None},
+            sk: {"dtype": "float32", "shape": (state_dim,), "names": None},
+            "gripper": {"dtype": "float32", "shape": (1,), "names": None},
+            ck: {"dtype": "image", "shape": (12 + i * 4, 16, 3), "names": ["height", "width", "channels"]},
+        }
+        cameras = {"observation.images.main": ck}
+        if i == 0:
+            features["wrist"] = deepcopy(features[ck])
+            cameras["observation.images.wrist"] = "wrist"
+        dataset = LeRobotDataset.create(
+            f"test/source{i}",
+            fps=fps,
+            root=root / str(i),
+            features=features,
+            use_videos=False,
+        )
+        for ep in range(2):
+            for frame in range(4):
+                value = ep * 40 + frame * 10 + i
+                row = {
+                    ak: np.arange(action_dim, dtype=np.float32) + value,
+                    sk: np.arange(state_dim, dtype=np.float32) + value,
+                    "gripper": np.array([frame % 2], dtype=np.float32),
+                    ck: np.full(features[ck]["shape"], value, dtype=np.uint8),
+                    "task": f"task{i}",
+                }
+                if i == 0:
+                    row["wrist"] = row[ck].copy()
+                dataset.add_frame(row)
+            dataset.save_episode()
+        dataset.finalize()
+        sources[f"source{i}"] = {
+            "repo_id": f"test/source{i}",
+            "root": str(root / str(i)),
+            "weight": 1 + 2 * i,
+            "action_fields": [{"key": ak, "indices": list(reversed(range(action_dim)))}, {"key": "gripper"}],
+            "state_fields": [{"key": sk}],
+            "camera_fields": cameras,
+            "lam_camera_key": ck,
+        }
+    return {"return_uint8": True, "video_backend": "pyav", "datasets": sources}
+
+
+def config(payload, stage="pre-training"):
+    return TrainPipelineConfig(
+        dataset=draccus.decode(DatasetConfig, deepcopy(payload)),
+        policy=PI05LAPConfig(
+            device="cpu",
+            training_stage=stage,
+            chunk_size=2,
+            n_action_steps=2,
+            image_resolution=(16, 16),
+            push_to_hub=False,
+        ),
+    )
+
+
+@pytest.fixture(scope="module")
+def multicamera_payload(source_payload, tmp_path_factory):
+    payload = deepcopy(source_payload)
+    root = tmp_path_factory.mktemp("cameras") / "three_views"
+    camera_values = {"front": 40, "wrist": 80, "side": 120, "teacher": 160, "unused": 200}
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        **{
+            key: {"dtype": "image", "shape": (16, 16, 3), "names": ["height", "width", "channels"]}
+            for key in camera_values
+        },
+    }
+    dataset = LeRobotDataset.create(
+        "test/three_views", fps=30, features=features, root=root, use_videos=False
+    )
+    for ep in range(2):
+        for frame in range(4):
+            dataset.add_frame(
+                {
+                    "action": np.full(6, frame + ep, dtype=np.float32),
+                    "observation.state": np.full(4, frame + ep, dtype=np.float32),
+                    "task": "third task",
+                    **{
+                        key: np.full((16, 16, 3), value + frame * 5 + ep, dtype=np.uint8)
+                        for key, value in camera_values.items()
+                    },
+                }
+            )
+        dataset.save_episode()
+    dataset.finalize()
+    payload["datasets"]["source2"] = {
+        "repo_id": "test/three_views",
+        "root": str(root),
+        "weight": 1,
+        "camera_fields": {
+            "observation.images.main": "front",
+            "observation.images.wrist": "wrist",
+            "observation.images.side": "side",
+        },
+        "lam_camera_key": "front",
+    }
+    return payload
+
+
+def test_mixed_batch_and_episode_clamping(source_payload):
+    cfg = config(source_payload)
+    ds, _ = make_train_eval_datasets(cfg)
+    assert len(ds) == 16
+    assert all(child.absolute_to_relative_idx is None for _, child, _ in ds.children)
+    assert ds.schema.action_dim == 6
+    assert ds.schema.state_dim == 4
+    a, b = ds[3], ds[8]
+    assert a["action"].shape == b["action"].shape == (2, 6)
+    assert a["action"][0].tolist() == [32, 31, 30, 1, 0, 0]
+    assert a["action"][1].tolist() == a["action"][0].tolist()
+    assert a["action_is_pad"].tolist() == [False, True]
+    assert a["action_dim_is_pad"].tolist() == [False] * 4 + [True] * 2
+    assert a["observation.state"].tolist() == [30, 31, 0, 0]
+    assert b["observation.images.wrist_is_pad"].item()
+    assert a[LAM_IMAGE_PAIR][0].mean().item() == pytest.approx(30 / 255)
+    assert a[LAM_IMAGE_PAIR][1].mean().item() == pytest.approx(30 / 255)
+    assert b[LAM_IMAGE_PAIR][1].mean().item() == pytest.approx(21 / 255)
+    assert ds[1][LAM_IMAGE_PAIR][1].mean().item() == pytest.approx(30 / 255)
+    batch = default_collate([a, b])
+    assert batch["observation.images.main"].dtype == torch.uint8
+    assert batch["observation.images.main"].shape == (2, 3, 16, 16)
+    assert batch["dataset_index"].tolist() == [0, 1]
+    assert a["episode_index"] != b["episode_index"]
+    assert transition_to_batch(batch_to_transition(batch))["action_dim_is_pad"].equal(
+        batch["action_dim_is_pad"]
+    )
+    assert transition_to_batch(batch_to_transition(batch))["dataset_index"].tolist() == [0, 1]
+
+
+def test_per_source_normalization_and_checkpoint(source_payload, tmp_path):
+    cfg = config(source_payload)
+    ds, _ = make_train_eval_datasets(cfg)
+    batch = default_collate([ds[0], ds[8]])
+    normalizer = NormalizerProcessorStep(
+        features=dataset_to_policy_features(ds.meta.features),
+        norm_map=cfg.policy.normalization_mapping,
+        stats=ds.meta.stats,
+    )
+    transition = batch_to_transition(batch)
+    normalized = normalizer(transition)
+    # Each source's first sample is near its own lower quantile despite different values/dimensions.
+    result = transition_to_batch(normalized)
+    torch.testing.assert_close(result["action"][0, :, 0], result["action"][1, :, 0])
+    assert torch.all(result["action"][..., -1][0] == 0)
+    assert torch.all(result["observation.state"][0, 2:] == 0)
+    unnormalizer = UnnormalizerProcessorStep(**normalizer.get_config(), stats=ds.meta.stats)
+    recovered = transition_to_batch(unnormalizer(normalized))
+    torch.testing.assert_close(recovered["action"], batch["action"])
+    torch.testing.assert_close(recovered["observation.state"], batch["observation.state"])
+    pipeline = DataProcessorPipeline(
+        [normalizer],
+        name="test",
+        to_transition=identity_transition,
+        to_output=identity_transition,
+    )
+    pipeline.save_pretrained(tmp_path)
+    restored = DataProcessorPipeline.from_pretrained(
+        tmp_path,
+        config_filename="test.json",
+        to_transition=identity_transition,
+        to_output=identity_transition,
+    )
+    torch.testing.assert_close(transition_to_batch(restored(transition))["action"], result["action"])
+    without_id = batch_to_transition({k: v for k, v in batch.items() if k != "dataset_index"})
+    with pytest.raises(ValueError, match="dataset_index"):
+        restored(without_id)
+    deployed = NormalizerProcessorStep(**normalizer.get_config(), stats=ds.meta.stats, dataset_index=1)
+    deployed(without_id)
+
+
+def test_post_training_has_no_teacher_and_split_is_episode_local(source_payload):
+    payload = deepcopy(source_payload)
+    payload["eval_split"] = 0.5
+    cfg = config(payload, "post-training")
+    train, evaluation = make_train_eval_datasets(cfg)
+    assert len(train) == len(evaluation) == 8
+    assert LAM_IMAGE_PAIR not in train[0]
+    assert train[3]["action"][0, 0] == 32
+    assert evaluation[0]["action"][0, 0] == 42
+    assert len(evaluation.eval_indices(3)) == 3
+    assert evaluation[0]["episode_index"] != train[0]["episode_index"]
+
+
+def test_full_horizon_evaluation_filters_each_held_out_source_without_decoding(
+    multicamera_payload, monkeypatch
+):
+    payload = deepcopy(multicamera_payload)
+    payload["eval_split"] = 0.5
+    _, evaluation = make_train_eval_datasets(config(payload, "post-training"))
+    # Two episodes per source: the second episode is held out, with 4 frames.
+    assert len(evaluation) == 12
+    indices = full_horizon_indices(evaluation, 2)
+    assert indices == [0, 1, 2, 4, 5, 6, 8, 9, 10]
+    assert all(not evaluation[i]["action_is_pad"].any() for i in indices)
+    for _, child, _ in evaluation.children:
+        assert full_horizon_indices(child, 2) == [0, 1, 2]
+    monkeypatch.setattr(
+        type(evaluation), "__getitem__", lambda *args: pytest.fail("selection must not decode frames")
+    )
+    assert full_horizon_indices(evaluation, 4) == [0, 4, 8]
+    assert full_horizon_indices(evaluation, 5) == []
+
+
+def test_eval_interval_validates_effective_source_splits(source_payload, monkeypatch):
+    payload = deepcopy(source_payload)
+    payload["eval_split"] = 0.5
+    for source in payload["datasets"].values():
+        source["eval_split"] = 0.0
+    cfg = config(payload, "post-training")
+    cfg.eval_steps = 50
+    monkeypatch.setattr(TrainPipelineConfig, "_resolve_pretrained_from_cli", lambda self: None)
+    monkeypatch.setattr("lerobot.configs.train.parser.parse_arg", lambda key: None)
+    with pytest.raises(ValueError, match="eval_split"):
+        cfg.validate()
+    cfg.dataset.datasets["source1"].eval_split = None
+    cfg.validate()
+    cfg.eval_steps = -1
+    with pytest.raises(ValueError, match="nonnegative"):
+        cfg.validate()
+
+
+def test_manifest_snapshot_and_reload(source_payload, tmp_path):
+    path = tmp_path / "train.json"
+    path.write_text(json.dumps(source_payload))
+    loaded = DatasetConfig(config_path=str(path)).resolve_file()
+    assert loaded.datasets["source1"].weight == 3
+    saved = draccus.decode(DatasetConfig, draccus.encode(loaded))
+    payload = deepcopy(source_payload)
+    payload["datasets"]["source1"]["weight"] = 9
+    path.write_text(json.dumps(payload))
+    assert saved.resolve_file().datasets["source1"].weight == 3
+    assert saved.resolve_file(reload=True).datasets["source1"].weight == 9
+    path.unlink()
+    assert saved.resolve_file().datasets["source1"].weight == 3
+
+
+def test_weights_and_resume_independent_of_dataset_size():
+    sampler = WeightedDatasetSampler([30000, 10000], [1, 3], seed=24)
+    order = list(sampler)
+    assert sum(i >= 30000 for i in order) / len(order) == pytest.approx(0.75, abs=0.01)
+    second_rank = WeightedDatasetSampler([30000, 10000], [1, 3], seed=24)
+    assert list(second_rank) == order
+    resumed = WeightedDatasetSampler([30000, 10000], [1, 3], seed=24)
+    resumed.load_state_dict(compute_sampler_state(step=103, num_frames=40000, batch_size=8, num_processes=2))
+    assert list(resumed) == order[103 * 16 :]
+    epoch1 = list(sampler)
+    resumed.load_state_dict({"epoch": 1, "start_index": 4097})
+    assert list(resumed) == epoch1[4097:]
+
+
+def test_accelerate_sharding_and_resume_at_nonzero_epoch():
+    from accelerate.data_loader import prepare_data_loader
+
+    # Eleven frames round up to twelve draws, so two ranks each receive three full batches.
+    for rank in range(2):
+        sampler = WeightedDatasetSampler([7, 4], [1, 3], seed=5, batch_multiple=4)
+        assert len(sampler) == 12
+        loader = prepare_data_loader(
+            torch.utils.data.DataLoader(list(range(11)), batch_size=2, sampler=sampler),
+            num_processes=2,
+            process_index=rank,
+        )
+        loader.set_epoch(3)
+        full = list(loader)
+        resumed_sampler = WeightedDatasetSampler([7, 4], [1, 3], seed=5, batch_multiple=4)
+        state = compute_sampler_state(step=10, num_frames=12, batch_size=2, num_processes=2)
+        assert state == {"epoch": 3, "start_index": 4}
+        resumed_sampler.load_state_dict(state)
+        resumed = prepare_data_loader(
+            torch.utils.data.DataLoader(list(range(11)), batch_size=2, sampler=resumed_sampler),
+            num_processes=2,
+            process_index=rank,
+        )
+        resumed.set_epoch(state["epoch"])
+        suffix = list(resumed)
+        assert len(suffix) == len(full) - 1
+        for actual, expected in zip(suffix, full[1:], strict=True):
+            assert actual.equal(expected)
+        # Both loaders must advance to the same next epoch too.
+        for actual, expected in zip(list(resumed), list(loader), strict=True):
+            assert actual.equal(expected)
+
+
+def test_padded_action_dimensions_have_zero_gradient():
+    losses = torch.tensor([[[2.0, 2.0, 100.0]], [[4.0, 4.0, 4.0]]], requires_grad=True)
+    loss, _ = reduce_action_loss(losses, torch.tensor([[False, False, True], [False, False, False]]), "mean")
+    assert loss.item() == 3
+    loss.backward()
+    assert losses.grad[0, 0, 2] == 0
+
+
+@pytest.mark.parametrize("policy_type", ["pi05", "pi05_lap"])
+def test_policy_masks_absent_views(multicamera_payload, policy_type):
+    if policy_type == "pi05":
+        from lerobot.policies.pi05.modeling_pi05 import PI05Policy as Policy
+    else:
+        from lerobot.policies.pi05_lap.modeling_pi05_lap import PI05LAPPolicy as Policy
+
+    cfg = config(multicamera_payload)
+    ds, _ = make_train_eval_datasets(cfg)
+    batch = default_collate([ds[0], ds[8], ds[16]])
+    for key in ds.meta.camera_keys:
+        batch[key] = batch[key].float() / 255
+    dummy = SimpleNamespace(
+        parameters=lambda: iter([torch.zeros(1)]),
+        config=SimpleNamespace(image_features=ds.meta.camera_keys, image_resolution=(16, 16)),
+    )
+    images, masks = Policy._preprocess_images(dummy, batch)
+    assert len(images) == 3
+    assert masks[0].tolist() == [True, True, True]
+    assert masks[1].tolist() == [True, False, True]
+    assert masks[2].tolist() == [False, False, True]
+
+
+def test_lam_camera_is_selected_student_view(multicamera_payload):
+    ds, _ = make_train_eval_datasets(config(multicamera_payload))
+    _, child, _ = ds.children[2]
+    assert set(child.reader.camera_keys) == {"front", "wrist", "side"}
+    assert "unused" not in child.hf_dataset.column_names
+    assert "teacher" not in child.hf_dataset.column_names
+    assert len(ds.meta.camera_keys) == 3
+    item = ds[16]
+    assert "teacher" not in item
+    assert item[LAM_IMAGE_PAIR][0].mean().item() == pytest.approx(40 / 255)
+    assert item[LAM_IMAGE_PAIR][1].mean().item() == pytest.approx(50 / 255)
+    assert item["observation.images.main"].float().mean().item() == 40
+    assert item["observation.images.side"].float().mean().item() == 120
+    tail = ds[19]
+    torch.testing.assert_close(tail[LAM_IMAGE_PAIR][0], tail[LAM_IMAGE_PAIR][1])
+
+    # Teacher labels must be captured before random student image augmentation.
+    ds.image_transforms = lambda image: torch.zeros_like(image)
+    augmented = ds[16]
+    torch.testing.assert_close(augmented[LAM_IMAGE_PAIR], item[LAM_IMAGE_PAIR])
+    assert not augmented["observation.images.main"].any()
+
+
+@pytest.mark.parametrize("camera_count", [1, 2, 3])
+def test_loads_only_configured_cameras_in_post_training(multicamera_payload, camera_count):
+    payload = deepcopy(multicamera_payload)
+    source = payload["datasets"]["source2"]
+    source["camera_fields"] = dict(list(source["camera_fields"].items())[:camera_count])
+    payload["datasets"] = {"source2": source}
+    ds, _ = make_train_eval_datasets(config(payload, "post-training"))
+    _, child, _ = ds.children[0]
+    assert len(ds.meta.camera_keys) == camera_count
+    assert set(child.reader.camera_keys) == set(source["camera_fields"].values())
+    assert set(child.meta.camera_keys).intersection(child.hf_dataset.column_names) == set(
+        child.reader.camera_keys
+    )
+    assert "teacher" not in child.hf_dataset.column_names
+    assert "unused" not in child.hf_dataset.column_names
+    assert LAM_IMAGE_PAIR not in ds[0]
+
+
+def test_lam_camera_defaults_aliases_and_validation(multicamera_payload):
+    payload = deepcopy(multicamera_payload)
+    payload["datasets"] = {"source2": payload["datasets"]["source2"]}
+    source = payload["datasets"]["source2"]
+    for choice in (None, "observation.images.main", "front"):
+        source["lam_camera_key"] = choice
+        ds, _ = make_train_eval_datasets(config(payload))
+        assert ds[0][LAM_IMAGE_PAIR][0].mean().item() == pytest.approx(40 / 255)
+        assert set(ds.children[0][1].reader.camera_keys) == {"front", "wrist", "side"}
+    for choice in ("teacher", "missing_camera", "action"):
+        source["lam_camera_key"] = choice
+        with pytest.raises(draccus.utils.ParsingError) as error:
+            config(payload)
+        assert "nonempty VLM view" in str(error.value.__cause__)
+    for choice in ("", "front,side", "[front,side]"):
+        source["lam_camera_key"] = choice
+        with pytest.raises(draccus.utils.ParsingError):
+            config(payload)
+
+
+def test_empty_slots_and_default_lam_camera(multicamera_payload):
+    payload = deepcopy(multicamera_payload)
+    source = payload["datasets"]["source2"]
+    source["camera_fields"] = {
+        "observation.images.main": None,
+        "observation.images.wrist": "wrist",
+        "observation.images.side": "",
+    }
+    source["lam_camera_key"] = None
+    cfg = config(payload)
+    ds, _ = make_train_eval_datasets(cfg)
+    assert ds.children[2][1].reader.camera_keys == ["wrist"]
+    item = ds[16]
+    assert item["observation.images.main_is_pad"].item()
+    assert item["observation.images.side_is_pad"].item()
+    assert not item["observation.images.wrist_is_pad"].item()
+    assert not item["observation.images.main"].any()
+    assert item[LAM_IMAGE_PAIR][0].mean().item() == pytest.approx(80 / 255)
+    assert item[LAM_IMAGE_PAIR][1].mean().item() == pytest.approx(90 / 255)
+    default_collate([ds[0], ds[8], item])
+    saved = draccus.decode(DatasetConfig, draccus.encode(cfg.dataset))
+    assert saved.datasets["source2"].camera_fields["observation.images.side"] is None
+    for choice in ("front", "observation.images.main"):
+        source["lam_camera_key"] = choice
+        with pytest.raises(draccus.utils.ParsingError) as error:
+            config(payload)
+        assert "nonempty VLM view" in str(error.value.__cause__)
+
+
+@pytest.mark.parametrize("policy_type", ["pi05", "pi05_lap"])
+@pytest.mark.parametrize("camera_fields", [{}, {"observation.images.main": None}])
+def test_no_cameras_in_post_training(multicamera_payload, policy_type, camera_fields):
+    if policy_type == "pi05":
+        from lerobot.policies.pi05.modeling_pi05 import PI05Policy as Policy
+    else:
+        from lerobot.policies.pi05_lap.modeling_pi05_lap import PI05LAPPolicy as Policy
+
+    payload = deepcopy(multicamera_payload)
+    source = payload["datasets"]["source2"]
+    source["camera_fields"] = camera_fields
+    source["lam_camera_key"] = None
+    payload["datasets"] = {"source2": source}
+    ds, _ = make_train_eval_datasets(config(payload, "post-training"))
+    child = ds.children[0][1]
+    assert child.reader.camera_keys == []
+    assert not set(child.meta.camera_keys).intersection(child.hf_dataset.column_names)
+    batch = default_collate([ds[0], ds[1]])
+    dummy = SimpleNamespace(
+        parameters=lambda: iter([torch.zeros(1)]),
+        config=SimpleNamespace(image_features=ds.meta.camera_keys, image_resolution=(16, 16)),
+    )
+    images, masks = Policy._preprocess_images(dummy, batch)
+    assert len(images) == len(camera_fields)
+    assert all(not mask.any() for mask in masks)
+    assert LAM_IMAGE_PAIR not in batch
+    with pytest.raises(ValueError, match="nonempty camera_fields"):
+        make_train_eval_datasets(config(payload))
+
+
+def test_video_queries_and_cache_checks_ignore_unselected_cameras(multicamera_payload, tmp_path, monkeypatch):
+    # Reuse real scalar parquet data but supply video metadata and a decoder spy.
+    # Only the two selected video files exist; excluded views must not trigger downloads.
+    source = multicamera_payload["datasets"]["source2"]
+    original_meta = LeRobotDatasetMetadata(source["repo_id"], root=source["root"])
+    features = deepcopy(original_meta.features)
+    video_keys = list(original_meta.camera_keys)
+    for key in video_keys:
+        features[key]["dtype"] = "video"
+    episodes = [dict(row) for row in original_meta.episodes]
+    for row in episodes:
+        for key in video_keys:
+            row[f"videos/{key}/from_timestamp"] = 0.0
+
+    def video_path(ep, key):
+        return tmp_path / f"{key}-{ep}.mp4"
+
+    for ep in range(2):
+        for key in ("front", "teacher"):
+            video_path(ep, key).touch()
+    meta = SimpleNamespace(
+        features=features,
+        camera_keys=video_keys,
+        video_keys=video_keys,
+        image_keys=[],
+        depth_keys=[],
+        fps=30,
+        episodes=episodes,
+        total_frames=8,
+        total_episodes=2,
+        tasks=original_meta.tasks,
+        get_video_file_path=video_path,
+        get_data_file_path=original_meta.get_data_file_path,
+    )
+    reader = DatasetReader(
+        meta,
+        original_meta.root,
+        episodes=None,
+        tolerance_s=1e-4,
+        video_backend="pyav",
+        delta_timestamps={"teacher": [0.0, 2 / 30]},
+        image_transforms=None,
+        camera_keys=["front", "teacher"],
+    )
+    assert reader.try_load()
+    calls = []
+
+    def decode(path, timestamps, *args, **kwargs):
+        calls.append((path.name, timestamps))
+        return torch.zeros(len(timestamps), 3, 16, 16)
+
+    monkeypatch.setattr("lerobot.datasets.dataset_reader.decode_video_frames", decode)
+    item = reader.get_item(3)
+    assert set(video_keys).intersection(item) == {"front", "teacher"}
+    calls = dict(calls)
+    assert set(calls) == {"front-0.mp4", "teacher-0.mp4"}
+    assert calls["front-0.mp4"] == pytest.approx([3 / 30])
+    assert calls["teacher-0.mp4"] == pytest.approx([3 / 30, 3 / 30])
+    files = reader.get_episodes_file_paths()
+    assert not any("unused" in path or "side" in path for path in files)
+    # A missing selected camera still fails the cache check.
+    video_path(0, "teacher").unlink()
+    assert not reader._check_cached_episodes_sufficient()
+
+
+def test_json_cli_and_resume_snapshot(source_payload, tmp_path, monkeypatch):
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps(source_payload))
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            f"--dataset.config_path={path}",
+            "--policy.type=pi05_lap",
+            "--policy.device=cpu",
+            "--policy.push_to_hub=false",
+            "--env_eval_freq=0",
+        ],
+    )
+    cfg.validate()
+    assert len(cfg.dataset.datasets) == 2
+    cfg.save_pretrained(tmp_path / "checkpoint")
+    cfg.resume = True
+    # Avoid resolving an actual model checkpoint; only check data configuration behavior.
+    monkeypatch.setattr(TrainPipelineConfig, "_resolve_pretrained_from_cli", lambda self: None)
+    monkeypatch.setattr("lerobot.configs.train.parser.parse_arg", lambda key: None)
+    cfg.validate()
+    assert not cfg._reset_data_order
+    changed = deepcopy(source_payload)
+    changed["datasets"] = dict(reversed(list(changed["datasets"].items())))
+    path.write_text(json.dumps(changed))
+    monkeypatch.setattr("lerobot.configs.train.parser.parse_arg", lambda key: str(path))
+    cfg.validate()
+    assert cfg._reset_data_order
+    assert list(cfg.dataset.datasets) == ["source1", "source0"]
+
+
+def test_invalid_source_and_missing_field_errors(source_payload):
+    payload = deepcopy(source_payload)
+    payload["datasets"]["source0"]["weight"] = -1
+    with pytest.raises(draccus.utils.ParsingError):
+        config(payload)
+    cfg = config(source_payload)
+    cfg.dataset.datasets["source0"].action_fields[0].key = "does_not_exist"
+    with pytest.raises(ValueError, match="Missing vector field"):
+        make_train_eval_datasets(cfg)
+    cfg = config(source_payload)
+    cfg.policy.max_action_dim = 3
+    with pytest.raises(ValueError, match="exceed policy capacity"):
+        make_train_eval_datasets(cfg)

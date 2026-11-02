@@ -90,6 +90,8 @@ class TrainPipelineConfig(HubMixin):
     # is to use the configuration from the checkpoint, regardless of what's provided with the training
     # command at the time of resumption (CLI `--*` flags still override).
     resume: bool = False
+    # Checkpoint bookkeeping: optimizer step at which the current data mixture began.
+    data_sampling_start_step: int = 0
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
@@ -105,9 +107,12 @@ class TrainPipelineConfig(HubMixin):
     # Run policy in the simulation environment every N steps to measure reward/success (0 = disabled).
     env_eval_freq: int = 20_000
     log_freq: int = 100
-    # Compute eval loss on held-out episodes every N steps (0 = disabled). Requires eval_split > 0.
+    # Evaluate held-out episodes every N steps (0 = disabled). Requires eval_split > 0.
+    # PI05 / PI05 LAP post-training use full action inference and chunk metrics;
+    # other policies and latent pre-training keep their existing eval-loss path.
     eval_steps: int = 0
-    # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
+    # Optional cap for legacy eval-loss evaluation only. Action evaluation uses all
+    # complete held-out horizons selected by eval_split, without a fixed sample cap.
     max_eval_samples: int = 0
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
@@ -219,6 +224,14 @@ class TrainPipelineConfig(HubMixin):
 
     def validate(self) -> None:
         self._resolve_pretrained_from_cli()
+        saved_dataset = draccus.encode(self.dataset)
+        saved_dataset.pop("config_path", None)
+        self.dataset = self.dataset.resolve_file(reload=parser.parse_arg("dataset.config_path") is not None)
+        resolved_dataset = draccus.encode(self.dataset)
+        resolved_dataset.pop("config_path", None)
+        # Source order determines dataset_index and sampler offsets. Dict equality
+        # ignores order, so compare ordered serialized snapshots instead.
+        self._reset_data_order = self.resume and json.dumps(saved_dataset) != json.dumps(resolved_dataset)
 
         if self.policy is None and self.reward_model is None:
             raise ValueError(
@@ -227,6 +240,43 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if self.dataset.datasets:
+            if self.job.is_remote:
+                raise ValueError("JSON dataset mixtures require a local/server launch, not HF Jobs dispatch.")
+            if any(
+                value is not None
+                for value in (
+                    self.dataset.repo_id,
+                    self.dataset.root,
+                    self.dataset.episodes,
+                    self.dataset.revision,
+                )
+            ):
+                raise ValueError("Put repo_id/root/episodes/revision inside each entry of dataset.datasets.")
+            if (
+                self.dataset.streaming
+                or self.is_reward_model_training
+                or active_cfg.type not in {"pi05", "pi05_lap"}
+            ):
+                raise ValueError(
+                    "JSON dataset mixtures currently support non-streaming PI05/PI05 LAP training."
+                )
+            if getattr(active_cfg, "use_relative_actions", False):
+                raise ValueError(
+                    "Configured datasets contain relative end-effector actions; set policy.use_relative_actions=false."
+                )
+            if self.rename_map:
+                raise ValueError("Use camera_fields/state_fields in the dataset JSON instead of rename_map.")
+            if self.sample_weighting is not None:
+                raise ValueError(
+                    "Per-frame sample_weighting is not supported with configured dataset mixtures."
+                )
+            if self.env is not None and self.env_eval_freq > 0:
+                raise ValueError(
+                    "Mixed-dataset training uses offline evaluation. Set env_eval_freq=0; evaluate a selected source separately."
+                )
+        elif not self.dataset.repo_id:
+            raise ValueError("Provide --dataset.config_path=dataset/<name>.json or --dataset.repo_id.")
         if active_cfg.type == "pi05_lap" and active_cfg.training_stage == "pre-training":
             if active_cfg.pretrained_path is None:
                 raise ValueError("PI05 LAP pre-training must start from --policy.path=<PI05 checkpoint>.")
@@ -257,7 +307,7 @@ class TrainPipelineConfig(HubMixin):
             self.output_dir = Path("outputs/train") / train_dir
 
         if isinstance(self.dataset.repo_id, list):
-            raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+            raise ValueError("Select a JSON mixture with --dataset.config_path instead of a repo_id list.")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
@@ -265,7 +315,17 @@ class TrainPipelineConfig(HubMixin):
             self.optimizer = active_cfg.get_optimizer_preset()
             self.scheduler = active_cfg.get_scheduler_preset()
 
-        if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
+        if self.eval_steps < 0 or self.max_eval_samples < 0:
+            raise ValueError("eval_steps and max_eval_samples must be nonnegative.")
+        has_eval_split = (
+            any(
+                (s.eval_split if s.eval_split is not None else self.dataset.eval_split) > 0
+                for s in self.dataset.datasets.values()
+            )
+            if self.dataset.datasets
+            else self.dataset.eval_split > 0
+        )
+        if self.eval_steps > 0 and not has_eval_split:
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
 
         # Remote runs auto-generate the repo_id in submit_to_hf (the policy may only be

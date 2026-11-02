@@ -2900,7 +2900,6 @@ all = [
     { name = "scipy" },
     { name = "swanlab" },
     { name = "teleop" },
-    { name = "tensorboard" },
     { name = "timm" },
     { name = "torchcodec", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "torchdiffeq" },
@@ -3237,7 +3236,6 @@ training = [
     { name = "pandas" },
     { name = "pyarrow" },
     { name = "swanlab" },
-    { name = "tensorboard" },
     { name = "torchcodec", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "wandb" },
 ]
@@ -3494,7 +3492,6 @@ requires-dist = [
     { name = "setuptools", specifier = ">=71.0.0,<81.0.0" },
     { name = "swanlab", marker = "extra == 'training'", specifier = ">=0.10.3,<0.11.0" },
     { name = "teleop", marker = "extra == 'phone'", specifier = ">=0.1.0,<0.2.0" },
-    { name = "tensorboard", marker = "extra == 'training'", specifier = ">=2.20.0,<3.0.0" },
     { name = "termcolor", specifier = ">=2.4.0,<4.0.0" },
     { name = "timm", marker = "extra == 'timm-dep'", specifier = ">=1.0.0,<1.1.0" },
     { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.7,<2.12.0" },

@@ -2,14 +2,16 @@
 
 import json
 import logging
+import signal
 import sys
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import SimpleNamespace
 
 import draccus
 import pytest
 
-from lerobot.common.swanlab_utils import SwanLabLogger, make_experiment_logger
+from lerobot.common.swanlab_utils import SwanLabLogger, experiment_logging, make_experiment_logger
 from lerobot.configs.default import DatasetConfig, SwanLabConfig, WandBConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.pi05_lap.configuration_pi05_lap import PI05LAPConfig
@@ -28,21 +30,30 @@ def sdk(monkeypatch):
         def log(self, data, step):
             self.logged.append((step, data))
 
-        def finish(self):
+        def finish(self, *, state="success", error=None):
             self.finished = True
+            self.alive = False
+            self.finish_calls.append((state, error))
 
     run = Run()
     run.kwargs = {}
     run.logged = []
     run.finished = False
+    run.alive = True
+    run.finish_calls = []
 
     def init(**kwargs):
         run.kwargs = kwargs
+        run.alive = True
         return run
 
     # Match SwanLab >=0.10's Run API: url property, no get_url() method.
     fake = SimpleNamespace(
-        init=init, Text=lambda text: ("text", text), Video=lambda path: ("video", path), run=run
+        init=init,
+        Text=lambda text: ("text", text),
+        Video=lambda path: ("video", path),
+        run=run,
+        __spec__=ModuleSpec("swanlab", loader=None),
     )
     monkeypatch.setitem(sys.modules, "swanlab", fake)
     # Any accidental initialization of W&B must fail, including on resume.
@@ -171,3 +182,93 @@ def test_swanlab_config_cli_validation():
     assert "swanlab.mode" in str(exc.value.__cause__)
     with pytest.raises(ValueError, match="swanlab.project"):
         SwanLabConfig(enable=True, project=" ")
+
+
+@pytest.mark.parametrize(
+    "error,expected_state",
+    [
+        (KeyboardInterrupt(), "aborted"),
+        (RuntimeError("model initialization failed"), "crashed"),
+        (SystemExit(0), "success"),
+        (SystemExit(1), "crashed"),
+    ],
+)
+def test_context_submits_exit_state_and_preserves_training_exception(tmp_path, sdk, error, expected_state):
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    with pytest.raises(type(error)) as caught, experiment_logging(make_config(tmp_path)):
+        raise error
+    assert caught.value is error
+    assert sdk.run.finish_calls[0][0] == expected_state
+    assert type(error).__name__ in sdk.run.finish_calls[0][1]
+    assert {sig: signal.getsignal(sig) for sig in previous} == previous
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_actual_signals_unwind_training_before_finishing(tmp_path, sdk, signum):
+    previous = signal.getsignal(signum)
+    unwound = []
+    sdk_finish = sdk.run.finish
+
+    def finish(**kwargs):
+        assert unwound == [True], "Finish must run after unwinding the interrupted training operation."
+        sdk_finish(**kwargs)
+
+    sdk.run.finish = finish
+    exception_type = KeyboardInterrupt if signum == signal.SIGINT else SystemExit
+    with pytest.raises(exception_type), experiment_logging(make_config(tmp_path)):
+        try:
+            signal.raise_signal(signum)
+        finally:
+            unwound.append(True)
+    assert sdk.run.finish_calls[0][0] == "aborted"
+    assert signal.getsignal(signum) == previous
+
+
+def test_context_finishes_once_on_success(tmp_path, sdk):
+    with experiment_logging(make_config(tmp_path)) as logger:
+        logger.log_dict({"loss": 1.0}, step=10)
+    assert sdk.run.finish_calls == [("success", None)]
+    logger.finish()
+    assert len(sdk.run.finish_calls) == 1
+
+
+def test_shutdown_failure_preserves_training_error(tmp_path, sdk, caplog):
+    def fail_finish(**kwargs):
+        raise ConnectionError("offline during shutdown")
+
+    sdk.run.finish = fail_finish
+    error = RuntimeError("CUDA out of memory")
+    with pytest.raises(RuntimeError) as caught, experiment_logging(make_config(tmp_path)):
+        raise error
+    assert caught.value is error
+    assert "SwanLab shutdown did not complete" in caplog.text
+
+
+def test_non_main_process_never_initializes_or_closes_sdk(tmp_path, sdk):
+    with experiment_logging(make_config(tmp_path), enabled=False) as logger:
+        assert logger is None
+    assert sdk.run.kwargs == {} and sdk.run.finish_calls == []
+
+
+def test_training_initialization_is_inside_logger_context(tmp_path, sdk, monkeypatch):
+    pytest.importorskip("datasets")
+    pytest.importorskip("accelerate")
+    import lerobot.scripts.lerobot_train as training
+
+    cfg = make_config(tmp_path)
+    cfg.seed = None
+    monkeypatch.setattr(cfg, "validate", lambda: None)
+    monkeypatch.setattr(training, "init_logging", lambda **kwargs: None)
+    error = RuntimeError("dataset initialization failed")
+
+    def fail_dataset(cfg):
+        raise error
+
+    monkeypatch.setattr(training, "make_train_eval_datasets", fail_dataset)
+    accelerator = SimpleNamespace(
+        is_main_process=True, device="cpu", gradient_state=SimpleNamespace(plugin_kwargs={})
+    )
+    with pytest.raises(RuntimeError) as caught:
+        training.train(cfg, accelerator=accelerator)
+    assert caught.value is error
+    assert sdk.run.finish_calls[0][0] == "crashed"

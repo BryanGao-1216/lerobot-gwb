@@ -159,10 +159,55 @@ class EpisodeAwareSampler:
         return self._num_frames
 
 
-def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_processes: int) -> dict:
-    """Map an optimization step to an `EpisodeAwareSampler` state for sample-exact resume.
+class WeightedDatasetSampler(EpisodeAwareSampler):
+    """Draw a source by weight, then a uniform eligible frame within that source.
 
-    Under accelerate's batch sharding, one step consumes `batch_size * num_processes` sampler
+    An epoch contains sum(lengths) draws, rounded up to batch_multiple, with replacement.
+    RNG streams are local to (seed, epoch); fixed blocks bound memory and preserve exact resume offsets.
+    Accelerate shards the resulting sequence, just as for EpisodeAwareSampler.
+    """
+
+    def __init__(self, lengths: list[int], weights: list[float], seed: int = 0, batch_multiple: int = 1):
+        if len(lengths) != len(weights) or not lengths or any(n <= 0 for n in lengths):
+            raise ValueError("Need one positive length per dataset weight.")
+        if any(not math.isfinite(w) or w <= 0 for w in weights):
+            raise ValueError("Dataset weights must be finite and positive.")
+        if batch_multiple < 1:
+            raise ValueError("batch_multiple must be positive.")
+        self._lengths = np.asarray(lengths, dtype=np.int64)
+        self._offsets = np.cumsum([0, *lengths[:-1]])
+        # Scale before summing to avoid overflowing for large valid weights.
+        weights_array = np.asarray(weights, dtype=np.float64)
+        weights_array /= weights_array.max()
+        self._probabilities = weights_array / weights_array.sum()
+        # Avoid Accelerate filling a partial last batch from the first samples
+        # of a resumed suffix instead of the original epoch's first samples.
+        self._num_frames = math.ceil(sum(lengths) / batch_multiple) * batch_multiple
+        self.seed = seed
+        self._epoch = 0
+        self._start_index = 0
+
+    def _frame_index(self, position: int) -> int:
+        # ConfiguredDataset already maps its contiguous indices to eligible episode frames.
+        return position
+
+    def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
+        block_size = 4096
+        for block in range(start // block_size, math.ceil(self._num_frames / block_size)):
+            rng = np.random.default_rng(np.random.SeedSequence([self.seed, epoch, block]))
+            count = min(block_size, self._num_frames - block * block_size)
+            sources = rng.choice(len(self._lengths), count, p=self._probabilities)
+            positions = rng.integers(0, self._lengths[sources])
+            indices = self._offsets[sources] + positions
+            offset = max(0, start - block * block_size)
+            yield from (int(i) for i in indices[offset:])
+
+
+def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_processes: int) -> dict:
+    """Map a consumed per-rank data-batch count to a sampler state for sample-exact resume.
+
+    `step` counts micro-batches, not optimizer updates when gradient accumulation is enabled.
+    Under accelerate's batch sharding, one data batch consumes `batch_size * num_processes` sampler
     positions and each rank sees `ceil(ceil(num_frames / batch_size) / num_processes)` batches
     per epoch (`even_batches` padding included). The start index provably stays below
     `num_frames`; the `min` is defensive.

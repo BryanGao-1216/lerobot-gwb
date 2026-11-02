@@ -19,16 +19,14 @@ from dataclasses import dataclass, field
 from lerobot.transforms import ImageTransformsConfig
 from lerobot.utils.import_utils import get_safe_default_video_backend
 
+from .dataset_mixture import DatasetSourceConfig
 from .video import DEFAULT_DEPTH_UNIT, DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT
 
 
 @dataclass
 class DatasetConfig:
-    # You may provide a list of datasets here. `train.py` creates them all and concatenates them. Note: only data
-    # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
-    # "dataset_index" into the returned item. The index mapping is made according to the order in which the
-    # datasets are provided.
-    repo_id: str
+    # Legacy single-dataset entry point, or a JSON file with named datasets below.
+    repo_id: str | None = None
     # Root directory for a concrete local dataset tree (e.g. 'dataset/path'). If None, local datasets are
     # looked up under $HF_LEROBOT_HOME/repo_id and Hub downloads use a revision-safe cache under $HF_LEROBOT_HOME/hub.
     root: str | None = None
@@ -46,8 +44,37 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    config_path: str | None = None
+    datasets: dict[str, DatasetSourceConfig] = field(default_factory=dict)
+    tolerance_s: float | None = None
+
+    def resolve_file(self, *, reload: bool = False) -> "DatasetConfig":
+        """Read a JSON manifest once; serialized datasets are the checkpoint snapshot."""
+        if not self.config_path or (self.datasets and not reload):
+            return self
+        import json
+        from pathlib import Path
+
+        import draccus
+
+        path = Path(self.config_path).expanduser().resolve()
+        with path.open() as f:
+            payload = json.load(f)
+        if not payload.get("datasets") or payload.get("config_path") or payload.get("repo_id"):
+            raise ValueError(
+                "Dataset JSON must contain 'datasets', without repo_id/config_path at top level."
+            )
+        resolved = draccus.decode(DatasetConfig, payload)
+        resolved.config_path = str(path)
+        for source in resolved.datasets.values():
+            if source.root is not None:
+                root = Path(source.root).expanduser()
+                source.root = str((path.parent / root).resolve())
+        return resolved
 
     def __post_init__(self) -> None:
+        if self.tolerance_s is not None and not 0 < self.tolerance_s < float("inf"):
+            raise ValueError("dataset.tolerance_s must be finite and positive.")
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
             raise ValueError(
                 f"depth_output_unit must be '{DEPTH_METER_UNIT}' or '{DEPTH_MILLIMETER_UNIT}', got {self.depth_output_unit!r}"

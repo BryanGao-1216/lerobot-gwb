@@ -300,7 +300,9 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 self.save_pretrained(saved_path, state_dict=state_dict)
 
             card = self.generate_model_card(
-                cfg.dataset.repo_id,
+                [source.repo_id for source in cfg.dataset.datasets.values()]
+                if cfg.dataset.datasets
+                else cfg.dataset.repo_id,
                 self.config.type,
                 self.config.license,
                 self.config.tags,
@@ -327,7 +329,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
     def generate_model_card(
         self,
-        dataset_repo_id: str,
+        dataset_repo_id: str | list[str],
         model_type: str,
         license: str | None,
         tags: list[str] | None,

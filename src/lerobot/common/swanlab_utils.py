@@ -13,6 +13,11 @@
 # limitations under the License.
 
 import logging
+import signal
+import threading
+import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -111,8 +116,14 @@ class SwanLabLogger:
             frames[0].save(path, save_all=True, append_images=frames[1:], duration=round(1000 / fps), loop=0)
         self._run.log({f"{mode}/video": self._swanlab.Video(str(path))}, step=step)
 
-    def finish(self) -> None:
-        self._run.finish()
+    def finish(self, *, state: str = "success", error: str | None = None) -> None:
+        # The SDK may already have closed the run via its own exit hooks.
+        if not self._run.alive:
+            return
+        logging.info(
+            "Closing SwanLab experiment %s (state=%s); waiting for log synchronization.", self._run.id, state
+        )
+        self._run.finish(state=state, error=error)
 
 
 def make_experiment_logger(cfg: "TrainPipelineConfig") -> SwanLabLogger | WandBLogger | None:
@@ -125,3 +136,60 @@ def make_experiment_logger(cfg: "TrainPipelineConfig") -> SwanLabLogger | WandBL
     if cfg.wandb.enable and cfg.wandb.project:
         return WandBLogger(cfg)
     return None
+
+
+def _terminate_training(signum: int, _frame) -> None:
+    # Accelerate can terminate a worker with SIGTERM after another worker exits.
+    # Raise an exception so the logger's context gets a chance to submit its state.
+    raise SystemExit(128 + signum)
+
+
+@contextmanager
+def experiment_logging(
+    cfg: "TrainPipelineConfig", *, enabled: bool = True
+) -> Iterator[SwanLabLogger | WandBLogger | None]:
+    """Own the experiment from dataset creation through training and final exports.
+
+    Only the main process calls the SDK. On interruption, finish before the exception
+    reaches Accelerate or Python's exit hooks, and preserve the original exception.
+    """
+    handlers = {}
+    if enabled and cfg.swanlab.enable and threading.current_thread() is threading.main_thread():
+        # Capture these BEFORE init(), which installs SwanLab's own SIGINT handler.
+        handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        logger = make_experiment_logger(cfg) if enabled else None
+        if isinstance(logger, SwanLabLogger) and handlers:
+            # Unwind training first; don't run SDK shutdown inside a signal handler
+            # while a metric write or CUDA operation may still hold locks.
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            signal.signal(signal.SIGTERM, _terminate_training)
+        try:
+            yield logger
+        except BaseException as exc:
+            if isinstance(logger, SwanLabLogger):
+                if isinstance(exc, KeyboardInterrupt) or (
+                    isinstance(exc, SystemExit) and exc.code in (128 + signal.SIGINT, 128 + signal.SIGTERM)
+                ):
+                    state = "aborted"
+                elif isinstance(exc, SystemExit) and exc.code in (None, 0):
+                    state = "success"
+                else:
+                    state = "crashed"
+                try:
+                    logger.finish(state=state, error=traceback.format_exc())
+                except (Exception, KeyboardInterrupt, SystemExit):
+                    # A network/shutdown failure must not hide the training error.
+                    logging.exception(
+                        "SwanLab shutdown did not complete. The cloud run may still show as running; "
+                        "local logs are in %s. Once the process has stopped, its state can be "
+                        "changed with the stop button on the experiment page.",
+                        logger.log_dir,
+                    )
+            raise
+        else:
+            if logger is not None:
+                logger.finish()
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
