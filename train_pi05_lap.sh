@@ -16,6 +16,7 @@ export CUDA_VISIBLE_DEVICES=0
 args=(
   --policy.path=/tmp/g-models/PI05-base
   --policy.training_stage=post-training
+  --eval_steps=1000
   --resume=false
   --steps=300000
   --save_freq=10000
