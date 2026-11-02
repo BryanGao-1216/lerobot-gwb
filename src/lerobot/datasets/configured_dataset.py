@@ -75,9 +75,9 @@ def _split_episodes(meta, source: DatasetSourceConfig, default_split: float):
     if split == 0:
         return sorted(episodes), []
     by_task = {}
+    task_keys = meta.get_episode_task_keys(episodes)
     for ep in sorted(episodes):
-        tasks = meta.episodes[ep]["tasks"]
-        by_task.setdefault(tasks[0] if tasks else "", []).append(ep)
+        by_task.setdefault(task_keys[ep], []).append(ep)
     train, evaluation = [], []
     for group in by_task.values():
         n = math.ceil(len(group) * split)
@@ -142,12 +142,15 @@ class ConfiguredDataset(torch.utils.data.Dataset):
         by_task = {}
         offset = 0
         for _, child, index in self.children:
+            # Locate the original episodes containing these intervals.
+            episodes = [
+                bisect_right(child.meta.episodes["dataset_from_index"], int(start)) - 1
+                for start in index._starts
+            ]
+            task_keys = child.meta.get_episode_task_keys(episodes)
             previous = 0
-            for start, end in zip(index._starts, index._cum_lengths, strict=True):
-                # Locate the original episode containing this interval.
-                episode = bisect_right(child.meta.episodes["dataset_from_index"], int(start)) - 1
-                tasks = child.meta.episodes[episode]["tasks"]
-                task = tasks[0] if tasks else ""
+            for episode, end in zip(episodes, index._cum_lengths, strict=True):
+                task = task_keys[episode]
                 by_task.setdefault(task, []).append(range(offset + previous, offset + int(end)))
                 previous = int(end)
             offset += len(index)

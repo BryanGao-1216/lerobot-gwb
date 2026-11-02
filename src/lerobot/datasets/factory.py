@@ -186,11 +186,10 @@ def make_train_eval_datasets(
         full_dataset.episodes if full_dataset.episodes is not None else list(range(full_dataset.num_episodes))
     )
 
-    episode_tasks = full_dataset.meta.episodes["tasks"]
+    task_keys = full_dataset.meta.get_episode_task_keys(base_episodes)
     task_to_episodes: dict[str, list[int]] = {}
     for ep_idx in base_episodes:
-        task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
-        task_to_episodes.setdefault(task_key, []).append(ep_idx)
+        task_to_episodes.setdefault(task_keys[ep_idx], []).append(ep_idx)
 
     train_episodes, eval_episodes = [], []
     for eps in task_to_episodes.values():

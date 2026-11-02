@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import draccus
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 import torch
 from torch.utils.data import default_collate
@@ -88,6 +89,106 @@ def config(payload, stage="pre-training"):
             push_to_hub=False,
         ),
     )
+
+
+@pytest.fixture(scope="module")
+def missing_episode_tasks_payload(tmp_path_factory):
+    """A v3 dataset with per-frame task labels but no episode-level tasks column."""
+    root = tmp_path_factory.mktemp("missing_episode_tasks") / "libero"
+    camera = "observation.images.image"
+    dataset = LeRobotDataset.create(
+        "test/no_episode_tasks",
+        fps=10,
+        root=root,
+        use_videos=False,
+        features={
+            "action": {"dtype": "float32", "shape": (7,), "names": None},
+            "observation.state": {"dtype": "float32", "shape": (7,), "names": None},
+            camera: {"dtype": "image", "shape": (16, 16, 3), "names": ["height", "width", "channels"]},
+        },
+    )
+    for episode, task in enumerate(("task A", "task A", "task B", "task B")):
+        for frame in range(3):
+            dataset.add_frame(
+                {
+                    "action": np.full(7, episode + frame, dtype=np.float32),
+                    "observation.state": np.full(7, episode + frame, dtype=np.float32),
+                    camera: np.full((16, 16, 3), episode + frame, dtype=np.uint8),
+                    "task": task,
+                }
+            )
+        dataset.save_episode()
+    dataset.finalize()
+    for path in (root / "meta" / "episodes").glob("*/*.parquet"):
+        table = pq.read_table(path)
+        pq.write_table(table.drop(["tasks"]), path)
+    return {
+        "eval_split": 0.5,
+        "video_backend": "pyav",
+        "datasets": {
+            "libero": {
+                "repo_id": "test/no_episode_tasks",
+                "root": str(root),
+                "camera_fields": {camera: camera},
+                "lam_camera_key": camera,
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize("stage", ["pre-training", "post-training"])
+@pytest.mark.parametrize("configured", [True, False])
+def test_split_without_episode_tasks(missing_episode_tasks_payload, stage, configured, tmp_path):
+    payload = deepcopy(missing_episode_tasks_payload)
+    if configured:
+        # Exercise the training-script JSON entry point, even for a single source.
+        path = tmp_path / "dataset.json"
+        path.write_text(json.dumps(payload))
+        cfg = config({"config_path": str(path)}, stage)
+    else:
+        source = payload["datasets"]["libero"]
+        cfg = config({"repo_id": source["repo_id"], "root": source["root"], "eval_split": 0.5}, stage)
+    train, evaluation = make_train_eval_datasets(cfg)
+    train_child = train.children[0][1] if configured else train
+    eval_child = evaluation.children[0][1] if configured else evaluation
+    assert "tasks" not in train_child.meta.episodes.column_names
+    # Splitting all episodes as one group would incorrectly select [0, 1] for training.
+    assert train_child.episodes == [0, 2]
+    assert eval_child.episodes == [1, 3]
+    assert len(train) == len(evaluation) == 6
+    assert [evaluation[i]["task"] for i in (0, 3)] == ["task A", "task B"]
+    assert (LAM_IMAGE_PAIR in train[0]) == (stage == "pre-training")
+    assert full_horizon_indices(evaluation, 2) == [0, 1, 3, 4]
+    if configured:
+        assert evaluation.eval_indices(4) == [0, 1, 3, 4]
+
+
+def test_episode_task_fallback_reads_only_scalar_columns(missing_episode_tasks_payload, monkeypatch):
+    source = missing_episode_tasks_payload["datasets"]["libero"]
+    meta = LeRobotDatasetMetadata(source["repo_id"], root=source["root"])
+    projections = []
+    original = pq.ParquetFile.iter_batches
+
+    def read_batches(self, *args, **kwargs):
+        projections.append(kwargs["columns"])
+        # Small batches exercise episodes that span multiple batches in one shared data file.
+        kwargs["batch_size"] = 2
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", read_batches)
+    monkeypatch.setattr(DatasetReader, "get_item", lambda *args: pytest.fail("must not decode frames"))
+    assert meta.get_episode_task_keys([0, 3]) == {0: "task A", 3: "task B"}
+    assert projections == [["episode_index", "task_index"]]
+
+
+def test_episode_task_summaries_do_not_read_frames(source_payload, monkeypatch):
+    source = source_payload["datasets"]["source0"]
+    meta = LeRobotDatasetMetadata(source["repo_id"], root=source["root"])
+    monkeypatch.setattr(pq, "ParquetFile", lambda *args: pytest.fail("must not scan frame parquet"))
+    assert meta.get_episode_task_keys([0, 1]) == {0: "task0", 1: "task0"}
+    meta.episodes = meta.episodes.remove_columns("tasks")
+    # A single task in the task table also needs no frame scan.
+    assert meta.get_episode_task_keys([0, 1]) == {0: "task0", 1: "task0"}
 
 
 @pytest.fixture(scope="module")

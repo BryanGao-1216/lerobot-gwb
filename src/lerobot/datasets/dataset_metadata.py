@@ -486,6 +486,55 @@ class LeRobotDatasetMetadata:
         else:
             return None
 
+    def get_episode_task_keys(self, episodes: list[int]) -> dict[int, str]:
+        """Resolve the primary task of each episode for stratified sampling.
+
+        Some v3 datasets omit ``tasks`` from episode summaries. In that case,
+        use the first frame's ``task_index`` and the task table instead. Only
+        these scalar parquet columns are read; images and videos are not decoded.
+        """
+        self.ensure_readable()
+        result = {}
+        by_file: dict[Path, set[int]] = {}
+        for episode in episodes:
+            tasks = self.episodes[episode].get("tasks")
+            if tasks is not None:
+                result[episode] = tasks[0] if tasks else ""
+            elif len(self.tasks) == 1:
+                result[episode] = str(self.tasks.index[0])
+            else:
+                by_file.setdefault(self.get_data_file_path(episode), set()).add(episode)
+
+        if by_file:
+            logging.info(
+                "%s: resolving episode tasks from frame-level task_index (episode summaries omit tasks).",
+                self.repo_id,
+            )
+            missing = [str(path) for path in by_file if not (self.root / path).is_file()]
+            if missing:
+                self._pull_from_repo(allow_patterns=missing)
+
+        for path, pending in by_file.items():
+            with pq.ParquetFile(self.root / path) as parquet:
+                for batch in parquet.iter_batches(columns=["episode_index", "task_index"]):
+                    episode_ids, first_rows = np.unique(batch.column(0).to_numpy(), return_index=True)
+                    for episode, row in zip(episode_ids, first_rows, strict=True):
+                        episode = int(episode)
+                        if episode not in pending:
+                            continue
+                        task_index = batch.column(1)[int(row)].as_py()
+                        if task_index is None or not 0 <= task_index < len(self.tasks):
+                            raise ValueError(
+                                f"{self.repo_id}: episode {episode} has invalid task_index={task_index}."
+                            )
+                        result[episode] = str(self.tasks.iloc[task_index].name)
+                        pending.remove(episode)
+                    if not pending:
+                        break
+            if pending:
+                raise ValueError(f"{self.repo_id}: no frame-level task_index for episodes {sorted(pending)}.")
+        return result
+
     def save_episode_tasks(self, tasks: list[str]):
         """Register tasks for the current episode and persist to disk.
 
