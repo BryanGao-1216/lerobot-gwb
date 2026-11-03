@@ -261,10 +261,6 @@ class TrainPipelineConfig(HubMixin):
                 raise ValueError(
                     "JSON dataset mixtures currently support non-streaming PI05/PI05 LAP training."
                 )
-            if getattr(active_cfg, "use_relative_actions", False):
-                raise ValueError(
-                    "Configured datasets contain relative end-effector actions; set policy.use_relative_actions=false."
-                )
             if self.rename_map:
                 raise ValueError("Use camera_fields/state_fields in the dataset JSON instead of rename_map.")
             if self.sample_weighting is not None:

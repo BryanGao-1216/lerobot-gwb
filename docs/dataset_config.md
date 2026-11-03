@@ -52,6 +52,8 @@ uv run python -m lerobot.scripts.convert_dataset_v21_to_v30 \
       "repo_id": "libero_only",
       "root": "/gaowenbin/datasets/libero",
       "weight": 1.0,
+      "use_relative_actions": false,
+      "image_augmentation": true,
       "action_fields": [{"key": "action"}],
       "state_fields": [{"key": "observation.state"}],
       "camera_fields": {
@@ -64,6 +66,8 @@ uv run python -m lerobot.scripts.convert_dataset_v21_to_v30 \
       "repo_id": "your_account/another_dataset",
       "root": "/path/to/another_lerobot_dataset",
       "weight": 3.0,
+      "use_relative_actions": false,
+      "image_augmentation": false,
       "action_fields": [
         {"key": "action.delta_pose", "indices": [0, 1, 2, 3, 4, 5]},
         {"key": "action.gripper"}
@@ -84,6 +88,9 @@ uv run python -m lerobot.scripts.convert_dataset_v21_to_v30 \
 | 字段 | 含义 |
 | --- | --- |
 | `weight` | 正数，相对抽样权重。上例两个数据集约占 25% 和 75%，不再乘以数据集帧数。 |
+| `use_relative_actions` | 默认 `false`，直接使用数据中保存的动作。只有存储绝对动作、需要额外计算 `action - state` 时才设为 `true`。 |
+| `relative_exclude_joints` | 默认 `["gripper"]`，启用动作转换时，按动作维度名或源字段名排除对应分量；`[]` 表示转换全部真实动作维度。 |
+| `image_augmentation` | 默认 `true`，只对该数据集的训练样本执行策略内的 OpenPI 图像增强。验证和推理均不增强。 |
 | `action_fields` | 按列表顺序读取并拼接为 `action`；`indices` 可选，从 0 开始，用于选取或重排维度。 |
 | `state_fields` | 同样按顺序拼接为 `observation.state`。 |
 | `camera_fields` | **左边是统一 VLM 视角槽位，右边填数据集内的原始相机字段**；左侧必须以 `observation.images.` 开头。右侧允许 `null` 或 `""` 表示空视角，也可以省略不用的槽位。 |
@@ -134,13 +141,17 @@ uv run python -m lerobot.scripts.convert_dataset_v21_to_v30 \
 
 ## 不同维度与归一化
 
-动作按数据中保存的原始值读取，当前混合入口的 `policy.use_relative_actions` 需要保持 `false`。字段映射只负责选维、重排和拼接，不转换动作表示、坐标系、单位或旋转表示。动作后训练时需先保证各来源相同输出位置具有一致的控制含义；关节动作与 LIBERO 末端相对动作无法仅靠重排完成统一。
+每个来源用自己的 `use_relative_actions` 和 `image_augmentation` 控制动作转换和训练图像增强；使用 JSON 入口时，这两个来源级设置优先于同名 `policy` 参数，训练脚本无需再传全局开关。当前 LIBERO 的动作已是相对动作，因此 `dataset/config.json` 设置 `use_relative_actions=false`、`image_augmentation=true`。
+
+启用 `use_relative_actions` 后，在字段选择和拼接完成后、归一化之前，对未排除的真实动作维度计算 `action - state`。动作与状态对应位置必须具有相同含义；缺少所需状态维度会报错。混合 batch 按每条样本的来源选择转换掩码；推理反归一化后仅对启用转换的来源加回缓存的原始 state，返回该数据集原有的动作表示。归一化仍读取来源 metadata 的统计量，启用转换时需确保这些统计量适用于转换后的训练动作。
+
+字段映射和相对转换不会自动转换坐标系、单位或旋转表示。动作后训练时需先保证各来源相同输出位置具有一致的控制含义；关节动作与 LIBERO 末端相对动作无法仅靠重排完成统一。
 
 各数据集单独使用自己的统计量归一化，PI05 默认使用 `q01/q99`。每个被选择的向量字段都要有对应统计量；缺失时会在模型加载前报错，不会套用另一个数据集的统计量。
 
 向量先补零到本次配置中最大的动作/状态维度，补齐位置在归一化后仍为零；模型进一步补零到 `max_action_dim`（原生 PI05 为 32）。为对齐 OpenPI，动作训练损失计算全部模型维度，包括补齐维度；动作评估指标仍只计算真实维度。超出策略的 `max_action_dim/max_state_dim` 会直接报错，不会截断标签。PI05/LAP 的 quantile 归一化和反归一化统一使用 `q99-q01+1e-6`。不同分辨率的相机先按官方 PIL bilinear 等比缩放、补边到策略分辨率。相机集合取统一字段的并集，缺少的视角用空图和注意力掩码处理，模型固定接收三个视角槽位。教师帧对在学生图像增强前提取。
 
-`dataset/config.json` 对齐官方 `pi05_libero` 输入输出：主相机与腕部相机分别映射到 `base_0_rgb`、`left_wrist_0_rgb`，右腕槽位为空；`image_transforms.enable=false`，由策略的 `image_augmentation=true` 在训练时执行官方 PyTorch 增强，避免叠加两套增强。验证和推理不做增强。LAP 默认 `discrete_state_input=false`；普通 PI05 配置的通用默认值为 true，LIBERO 应显式改为 false。详见 [策略说明](../src/lerobot/policies/pi05_lap/README.md#openpi-输入输出对齐)。
+`dataset/config.json` 对齐官方 `pi05_libero` 输入输出：主相机与腕部相机分别映射到 `base_0_rgb`、`left_wrist_0_rgb`，右腕槽位为空；`image_transforms.enable=false`，由每个来源的 `image_augmentation` 决定是否在训练时执行官方 PyTorch 增强，避免叠加两套增强。验证和推理不做增强。LAP 默认 `discrete_state_input=false`；普通 PI05 配置的通用默认值为 true，LIBERO 应显式改为 false。详见 [策略说明](../src/lerobot/policies/pi05_lap/README.md#openpi-输入输出对齐)。
 
 先按权重抽数据集，再在其可用帧中均匀抽样，采用有放回采样。一轮以所有数据集可用帧数之和为基数，向上凑齐到全局 batch 的整数倍。多进程使用同一确定性采样序列，由 Accelerate 切分 batch。
 
@@ -200,7 +211,10 @@ checkpoint 的 `train_config.json` 保存解析后的数据配置，包括数据
 数据源按 JSON 的顺序编号为 `dataset_index=0,1,...`。独立部署混合数据训练出的模型时，必须选择目标数据集的统计量，并按训练配置映射输入字段、补齐维度。例如加载 processor 时：
 
 ```python
-preprocessor_overrides = {"normalizer_processor": {"dataset_index": 0}}
+preprocessor_overrides = {
+    "normalizer_processor": {"dataset_index": 0},
+    "relative_actions_processor": {"dataset_index": 0},
+}
 postprocessor_overrides = {"unnormalizer_processor": {"dataset_index": 0}}
 ```
 

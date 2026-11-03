@@ -12,6 +12,8 @@
       "repo_id": "libero_only",
       "root": "/gaowenbin/datasets/libero",
       "weight": 1.0,
+      "use_relative_actions": false,
+      "image_augmentation": true,
       "action_fields": [
         {
           "key": "action"

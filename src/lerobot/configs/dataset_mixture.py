@@ -26,6 +26,11 @@ class DatasetSourceConfig:
     repo_id: str
     root: str | None = None
     weight: float = 1.0
+    # Convert stored absolute actions to offsets before normalization.
+    use_relative_actions: bool = False
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Policy-owned OpenPI image augmentation, applied only during training.
+    image_augmentation: bool = True
     action_fields: list[VectorFieldConfig] = field(default_factory=lambda: [VectorFieldConfig("action")])
     state_fields: list[VectorFieldConfig] = field(
         default_factory=lambda: [VectorFieldConfig("observation.state")]
@@ -45,6 +50,8 @@ class DatasetSourceConfig:
             raise ValueError("Each dataset needs a nonempty repo_id.")
         if not math.isfinite(self.weight) or self.weight <= 0:
             raise ValueError(f"{self.repo_id}: weight must be finite and positive.")
+        if not isinstance(self.use_relative_actions, bool) or not isinstance(self.image_augmentation, bool):
+            raise ValueError("use_relative_actions and image_augmentation must be booleans.")
         if not self.action_fields or not self.state_fields:
             raise ValueError("Each dataset needs action_fields and state_fields.")
         if any(

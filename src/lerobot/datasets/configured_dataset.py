@@ -66,6 +66,23 @@ def _vector_stats(meta, fields, size: int, mode: NormalizationMode) -> dict:
     return result
 
 
+def _relative_action_mask(source, meta, action_fields, state_fields, size):
+    mask = []
+    excluded = [name.lower() for name in source.relative_exclude_joints if name]
+    for key, indices in action_fields:
+        names = meta.features[key].get("names")
+        for index in indices:
+            name = names[index] if names is not None and len(names) == meta.features[key]["shape"][0] else key
+            mask.append(source.use_relative_actions and not any(token in name.lower() for token in excluded))
+    state_dim = sum(len(indices) for _, indices in state_fields)
+    if any(mask[state_dim:]):
+        raise ValueError(
+            f"{source.repo_id}: relative action dimensions need matching state components; "
+            "align action_fields/state_fields or exclude the unmatched joints."
+        )
+    return mask + [False] * (size - len(mask))
+
+
 def _split_episodes(meta, source: DatasetSourceConfig, default_split: float):
     episodes = source.episodes if source.episodes is not None else list(range(meta.total_episodes))
     if any(ep >= meta.total_episodes for ep in episodes):
@@ -123,6 +140,7 @@ class ConfiguredDataset(torch.utils.data.Dataset):
             fps=schema.fps,
             tasks=schema.tasks,
             is_mixture=True,
+            relative_action_masks=schema.relative_action_masks,
         )
 
     def __len__(self):
@@ -178,6 +196,7 @@ class ConfiguredDataset(torch.utils.data.Dataset):
         source_index = self.schema.source_indices[name]
         item = {
             "dataset_index": torch.tensor(source_index),
+            "image_augmentation": torch.tensor(source.image_augmentation),
             "index": torch.tensor(idx),
             "episode_index": raw["episode_index"] + self.schema.episode_offsets[name],
             "frame_index": raw["frame_index"],
@@ -294,8 +313,12 @@ def make_configured_datasets(cfg):
             for key in cameras
         },
     }
+    relative_action_masks = {}
     for source_index, (name, source) in enumerate(sources.items()):
         meta = metadata[name]
+        relative_action_masks[str(source_index)] = _relative_action_mask(
+            source, meta, action_fields[name], state_fields[name], action_dim
+        )
         for key, fields, size, feature_type in (
             (ACTION, action_fields[name], action_dim, FeatureType.ACTION),
             (OBS_STATE, state_fields[name], state_dim, FeatureType.STATE),
@@ -318,6 +341,7 @@ def make_configured_datasets(cfg):
         state_dim=state_dim,
         action_fields=action_fields,
         state_fields=state_fields,
+        relative_action_masks=relative_action_masks,
         lam_camera_keys=lam_camera_keys,
         image_resolution=policy.image_resolution,
         source_indices={name: i for i, name in enumerate(sources)},

@@ -54,7 +54,8 @@ flow matching 学习真实动作。PI05 与 LAP 共用对齐 OpenPI 的输入输
 | `policy.tokenizer_path` | `google/paligemma-3b-pt-224` | latent token ID 注册用的 PaliGemma HF tokenizer 目录或 Hub ID |
 | `policy.tokenizer_model_path` | `null` | 官方文本 SentencePiece `.model` 文件，省略时自动缓存 |
 | `policy.discrete_state_input` | `false` | 是否把归一化状态写入 prompt，LIBERO 官方设为 false |
-| `policy.image_augmentation` | `true` | 训练时使用 OpenPI PyTorch 图像增强 |
+| `datasets.<name>.image_augmentation` | `true` | 数据集 JSON 中逐来源控制训练图像增强；验证和推理关闭 |
+| `datasets.<name>.use_relative_actions` | `false` | 数据集 JSON 中逐来源控制是否额外计算 `action - state` |
 | `policy.gradient_accumulation` | `1` | 累计多少个每卡 batch 后更新一次，预训练和后训练均支持 |
 | `policy.attention_backend` | `eager` | 训练注意力：`eager`、`sdpa`、`flash_attention_2` |
 

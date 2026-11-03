@@ -157,6 +157,8 @@ def make_openpi_processors(config, dataset_stats=None):
         exclude_joints=config.relative_exclude_joints,
         action_names=config.action_feature_names,
     )
+    absolute = AbsoluteActionsProcessorStep(relative_step=relative)
+    _configure_relative_actions(config, relative, absolute)
     tokenizer = OpenPITokenizerProcessorStep(
         tokenizer_model_path=config.tokenizer_model_path,
         max_length=config.tokenizer_max_length,
@@ -173,10 +175,24 @@ def make_openpi_processors(config, dataset_stats=None):
         ],
         output_steps=[
             steps.unnormalize,
-            AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative),
+            absolute,
             steps.to_cpu,
         ],
     )
+
+
+def _configure_relative_actions(config, relative, absolute):
+    metadata = getattr(config, "_runtime_dataset_meta", None)
+    masks = getattr(metadata, "relative_action_masks", None)
+    if masks is not None:
+        relative.dataset_masks = masks
+    relative.enabled = (
+        any(any(mask) for mask in relative.dataset_masks.values())
+        if relative.dataset_masks is not None
+        else config.use_relative_actions
+    )
+    absolute.enabled = relative.enabled
+    absolute.relative_step = relative
 
 
 def reconcile_openpi_processors(config, preprocessor, postprocessor, tokenizer):
@@ -189,14 +205,26 @@ def reconcile_openpi_processors(config, preprocessor, postprocessor, tokenizer):
             step = tokenizer
         steps.append(step)
     preprocessor.steps = steps
+    relative = next((step for step in steps if isinstance(step, RelativeActionsProcessorStep)), None)
+    if relative is None:
+        relative = RelativeActionsProcessorStep(
+            exclude_joints=config.relative_exclude_joints, action_names=config.action_feature_names
+        )
+        position = next(i for i, step in enumerate(steps) if isinstance(step, NormalizerProcessorStep))
+        steps.insert(position, relative)
+    absolute = next(
+        (step for step in postprocessor.steps if isinstance(step, AbsoluteActionsProcessorStep)), None
+    )
+    if absolute is None:
+        absolute = AbsoluteActionsProcessorStep()
+        postprocessor.steps.insert(1, absolute)
+    _configure_relative_actions(config, relative, absolute)
     for pipeline in (preprocessor, postprocessor):
         for step in pipeline.steps:
             if hasattr(step, "quantile_epsilon"):
                 step.quantile_epsilon = 1e-6
             if isinstance(step, NormalizerProcessorStep):
                 step.normalize_before_padding = True
-            if isinstance(step, (RelativeActionsProcessorStep, AbsoluteActionsProcessorStep)):
-                step.enabled = config.use_relative_actions
     return preprocessor, postprocessor
 
 
@@ -266,9 +294,30 @@ def prepare_openpi_images(policy, batch):
         token_ar_mask=None,
         token_loss_mask=None,
     )
-    output = preprocess_observation_pytorch(
-        observation,
-        train=policy.training and policy.config.image_augmentation,
-        image_resolution=policy.config.image_resolution,
+    augment = torch.as_tensor(
+        batch.get("image_augmentation", policy.config.image_augmentation), device=device, dtype=torch.bool
+    ).flatten()
+    if augment.numel() not in (1, batch_size):
+        raise ValueError("image_augmentation must have one value per sample.")
+    augment = (
+        augment.expand(batch_size)
+        if policy.training
+        else torch.zeros(batch_size, device=device, dtype=torch.bool)
     )
+    output = preprocess_observation_pytorch(
+        observation, train=bool(augment.all()), image_resolution=policy.config.image_resolution
+    )
+    if augment.any() and not augment.all():
+        selected = SimpleNamespace(**vars(observation))
+        selected.images = {
+            key: value[augment].contiguous(memory_format=torch.channels_last)
+            for key, value in observation.images.items()
+        }
+        selected.image_masks = {key: value[augment] for key, value in masks.items()}
+        selected.state = observation.state[augment]
+        augmented = preprocess_observation_pytorch(
+            selected, train=True, image_resolution=policy.config.image_resolution
+        )
+        for key, image in augmented.images.items():
+            output.images[key][augment] = image
     return list(output.images.values()), list(output.image_masks.values())

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
@@ -37,7 +38,19 @@ __all__ = [
 ]
 
 
-def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
+def _state_offset(actions: Tensor, state: Tensor, mask: Sequence[bool] | Tensor) -> Tensor:
+    mask_t = torch.as_tensor(mask, dtype=actions.dtype, device=actions.device)
+    dims = mask_t.shape[-1]
+    state = state.to(device=actions.device, dtype=actions.dtype)
+    if state.shape[-1] < dims:
+        if mask_t[..., state.shape[-1] :].any():
+            raise ValueError("Relative action dimensions require matching state components.")
+        state = F.pad(state, (0, dims - state.shape[-1]))
+    offset = state[..., :dims] * mask_t
+    return offset.unsqueeze(-2) if actions.ndim == 3 else offset
+
+
+def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool] | Tensor) -> Tensor:
     """Convert absolute actions to relative: relative = action - state (for masked dims).
 
     Args:
@@ -45,21 +58,13 @@ def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
         state: (B, state_dim). Broadcast across time dimension.
         mask: Which dims to convert. Can be shorter than action_dim.
     """
-    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
-    # Align state to the same device/dtype as actions. _last_state is cached before
-    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
-    if state.device != actions.device or state.dtype != actions.dtype:
-        state = state.to(device=actions.device, dtype=actions.dtype)
-    state_offset = state[..., :dims] * mask_t
-    if actions.ndim == 3:
-        state_offset = state_offset.unsqueeze(-2)
+    state_offset = _state_offset(actions, state, mask)
     actions = actions.clone()
-    actions[..., :dims] -= state_offset
+    actions[..., : state_offset.shape[-1]] -= state_offset
     return actions
 
 
-def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
+def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool] | Tensor) -> Tensor:
     """Convert relative actions back to absolute: absolute = relative + state (for masked dims).
 
     Args:
@@ -67,17 +72,9 @@ def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
         state: (B, state_dim). Broadcast across time dimension.
         mask: Which dims to convert. Can be shorter than action_dim.
     """
-    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
-    # Align state to the same device/dtype as actions. _last_state is cached before
-    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
-    if state.device != actions.device or state.dtype != actions.dtype:
-        state = state.to(device=actions.device, dtype=actions.dtype)
-    state_offset = state[..., :dims] * mask_t
-    if actions.ndim == 3:
-        state_offset = state_offset.unsqueeze(-2)
+    state_offset = _state_offset(actions, state, mask)
     actions = actions.clone()
-    actions[..., :dims] += state_offset
+    actions[..., : state_offset.shape[-1]] += state_offset
     return actions
 
 
@@ -101,7 +98,37 @@ class RelativeActionsProcessorStep(ProcessorStep):
     enabled: bool = False
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
+    # Source-specific masks override enabled/exclude_joints for configured datasets.
+    dataset_masks: dict[str, list[bool]] | None = None
+    dataset_index: int | None = None
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _last_mask: Tensor | None = field(default=None, init=False, repr=False)
+
+    def _cache_dataset_mask(self, transition: EnvTransition, state: Tensor) -> None:
+        ids = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get("dataset_index")
+        if ids is None:
+            ids = self.dataset_index
+        if ids is None and len(self.dataset_masks) == 1:
+            ids = int(next(iter(self.dataset_masks)))
+        if ids is None:
+            raise ValueError("Supply dataset_index to select the dataset's relative action conversion.")
+        ids = torch.as_tensor(ids).flatten()
+        if ids.numel() not in (1, state.shape[0]):
+            raise ValueError("dataset_index length must match the batch size.")
+        ids = ids.expand(state.shape[0]).tolist()
+        if any(str(source_id) not in self.dataset_masks for source_id in ids):
+            raise ValueError(f"Unknown dataset_index in relative action conversion: {ids}.")
+        self._last_mask = torch.tensor(
+            [self.dataset_masks[str(source_id)] for source_id in ids], device=state.device, dtype=torch.bool
+        )
+
+    def get_action_mask(self, action_dim: int) -> list[bool] | Tensor:
+        if self.dataset_masks is None:
+            return self._build_mask(action_dim)
+        if self._last_mask is None:
+            raise RuntimeError("Run the preprocessor before converting dataset-specific actions.")
+        mask = self._last_mask[..., :action_dim]
+        return F.pad(mask, (0, max(0, action_dim - mask.shape[-1])), value=False)
 
     def _build_mask(self, action_dim: int) -> list[bool]:
         if not self.exclude_joints or self.action_names is None:
@@ -133,12 +160,17 @@ class RelativeActionsProcessorStep(ProcessorStep):
         if not self.enabled:
             return transition
 
+        if self.dataset_masks is not None:
+            if state is None:
+                raise ValueError("Dataset-specific relative action conversion requires observation.state.")
+            self._cache_dataset_mask(transition, state)
+
         new_transition = transition.copy()
         action = new_transition.get(TransitionKey.ACTION)
         if action is None or state is None:
             return new_transition
 
-        mask = self._build_mask(action.shape[-1])
+        mask = self.get_action_mask(action.shape[-1])
         new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)
         return new_transition
 
@@ -151,6 +183,8 @@ class RelativeActionsProcessorStep(ProcessorStep):
             "enabled": self.enabled,
             "exclude_joints": self.exclude_joints,
             "action_names": self.action_names,
+            "dataset_masks": self.dataset_masks,
+            "dataset_index": self.dataset_index,
         }
 
     def transform_features(
@@ -198,7 +232,7 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
         if action is None:
             return new_transition
 
-        mask = self.relative_step._build_mask(action.shape[-1])
+        mask = self.relative_step.get_action_mask(action.shape[-1])
         new_transition[TransitionKey.ACTION] = to_absolute_actions(action, cached_state, mask)
         return new_transition
 

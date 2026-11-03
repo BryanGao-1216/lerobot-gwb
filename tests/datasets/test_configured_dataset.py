@@ -2,6 +2,7 @@
 
 import json
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 
 import draccus
@@ -23,6 +24,7 @@ from lerobot.policies.common.masked_loss import reduce_action_loss
 from lerobot.policies.pi05_lap.configuration_pi05_lap import LAM_IMAGE_PAIR, PI05LAPConfig
 from lerobot.processor import DataProcessorPipeline, NormalizerProcessorStep, UnnormalizerProcessorStep
 from lerobot.processor.converters import batch_to_transition, identity_transition, transition_to_batch
+from lerobot.types import TransitionKey
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 
@@ -322,6 +324,100 @@ def test_per_source_normalization_and_checkpoint(source_payload, tmp_path):
         restored(without_id)
     deployed = NormalizerProcessorStep(**normalizer.get_config(), stats=ds.meta.stats, dataset_index=1)
     deployed(without_id)
+
+
+@pytest.mark.parametrize("policy_type", ["pi05", "pi05_lap"])
+def test_source_action_settings_survive_mixed_batches_and_reload(source_payload, tmp_path, policy_type):
+    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config
+    from lerobot.processor import RelativeActionsProcessorStep
+
+    payload = deepcopy(source_payload)
+    payload["datasets"]["source0"].update(use_relative_actions=False, image_augmentation=False)
+    payload["datasets"]["source1"].update(use_relative_actions=True, image_augmentation=True)
+    payload["datasets"]["source1"]["action_fields"][0]["indices"] = [3, 2, 1, 0]
+    cfg = config(payload, "post-training")
+    if policy_type == "pi05":
+        cfg.policy = PI05Config(device="cpu", chunk_size=2, n_action_steps=2)
+    # JSON source flags are authoritative even if the global defaults differ.
+    cfg.policy.use_relative_actions = True
+    cfg.policy.image_augmentation = False
+    ds, _ = make_train_eval_datasets(cfg)
+    features = dataset_to_policy_features(ds.meta.features)
+    cfg.policy.input_features = {key: feature for key, feature in features.items() if key != "action"}
+    cfg.policy.output_features = {"action": features["action"]}
+    cfg.policy._runtime_dataset_meta = ds.meta
+    pre, post = make_pre_post_processors(cfg.policy, dataset_stats=ds.meta.stats)
+    post = replace(post, to_transition=batch_to_transition)
+    batch = default_collate([ds[1], ds[9]])
+    result = pre(batch)
+    assert result["image_augmentation"].tolist() == [False, True]
+    relative = next(step for step in pre.steps if isinstance(step, RelativeActionsProcessorStep))
+    expected = batch["action"].clone()
+    expected[1, :, :4] -= batch["observation.state"][1, None, :4]
+    converted = relative(batch_to_transition(batch))[TransitionKey.ACTION]
+    torch.testing.assert_close(converted, expected)
+    recovered = post({"action": result["action"], "dataset_index": batch["dataset_index"]})
+    for row, dims in enumerate((4, 5)):
+        torch.testing.assert_close(recovered[row, :, :dims], batch["action"][row, :, :dims])
+    assert torch.count_nonzero(result["action"][0, :, 4:]) == 0
+    pre.save_pretrained(tmp_path)
+    post.save_pretrained(tmp_path)
+    del cfg.policy._runtime_dataset_meta
+    cfg.policy.use_relative_actions = False
+    loaded_pre, loaded_post = make_pre_post_processors(cfg.policy, pretrained_path=str(tmp_path))
+    loaded_post = replace(loaded_post, to_transition=batch_to_transition)
+    loaded = loaded_pre(batch)
+    torch.testing.assert_close(loaded["action"], result["action"])
+    restored = loaded_post({"action": loaded["action"], "dataset_index": batch["dataset_index"]})
+    torch.testing.assert_close(restored, recovered)
+    # Inference has no action labels; preprocessing must still cache the correct source and state.
+    inference = {key: value for key, value in batch.items() if key != "action"}
+    loaded_pre(inference)
+    torch.testing.assert_close(
+        loaded_post({"action": loaded["action"], "dataset_index": batch["dataset_index"]}), recovered
+    )
+    relative = next(step for step in loaded_pre.steps if isinstance(step, RelativeActionsProcessorStep))
+    relative.dataset_index = 1
+    source1 = {key: value[1:] for key, value in inference.items()}
+    source1.pop("dataset_index")
+    relative(batch_to_transition(source1))
+    assert relative.get_action_mask(5).tolist() == [[True, True, True, True, False]]
+
+
+def test_relative_source_requires_matching_state(source_payload):
+    payload = deepcopy(source_payload)
+    payload["datasets"]["source1"]["use_relative_actions"] = True
+    with pytest.raises(ValueError, match="matching state components"):
+        make_train_eval_datasets(config(payload, "post-training"))
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_source_image_augmentation_is_per_sample_and_train_only(training):
+    from lerobot.policies.common.openpi_io import prepare_openpi_images
+
+    key = "observation.images.base_0_rgb"
+    policy = SimpleNamespace(
+        training=training,
+        parameters=lambda: iter([torch.zeros(1)]),
+        config=SimpleNamespace(image_features=[key], image_resolution=(224, 224), image_augmentation=False),
+    )
+    batch = {
+        key: torch.full((2, 3, 224, 224), 128, dtype=torch.uint8),
+        "observation.state": torch.zeros(2, 32),
+        "image_augmentation": torch.tensor([False, True]),
+    }
+    torch.manual_seed(47)
+    before = torch.random.get_rng_state()
+    images, masks = prepare_openpi_images(policy, batch)
+    expected = torch.full_like(images[0][0], 128).div(255).mul(2).sub(1)
+    assert torch.equal(images[0][0], expected)
+    assert masks[0].tolist() == [True, True]
+    if training:
+        assert not torch.equal(images[0][1], expected)
+    else:
+        assert torch.equal(images[0][1], expected)
+        assert torch.equal(torch.random.get_rng_state(), before)
 
 
 def test_post_training_has_no_teacher_and_split_is_episode_local(source_payload):
