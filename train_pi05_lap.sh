@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # config_path 必须指向 pretrained_model/train_config.json。
 # 续训无需 policy.path，LAM 和 tokenizer 配置从 checkpoint 读取。
@@ -10,7 +10,7 @@ export CUDA_VISIBLE_DEVICES=0
 
 args=(
   --policy.type=pi05_lap
-  --policy.path=/tmp/g-models/PI05-base
+  --policy.path=/tmp/gmodels/PI05-base
   --policy.training_stage=post-training
   --policy.tokenizer_path=/gaowenbin/models/tokenizers/paligemma-tokenizer
   --policy.push_to_hub=false
