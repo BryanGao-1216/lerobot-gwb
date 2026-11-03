@@ -159,7 +159,7 @@ def tiny_policy(monkeypatch):
     vocabulary = LatentActionVocabulary(tokenizer)
 
     def small_config(variant):
-        return lap.GemmaConfig(width=16, depth=2, mlp_dim=32, num_heads=8, num_kv_heads=1, head_dim=4)
+        return lap.GemmaConfig(width=16, depth=2, mlp_dim=32, num_heads=8, num_kv_heads=1, head_dim=8)
 
     def init_wrapper(
         self, vlm_config, expert_config, *, freeze_vision_encoder=False, train_expert_only=False, **kwargs
@@ -174,7 +174,7 @@ def tiny_policy(monkeypatch):
             "num_hidden_layers": 2,
             "num_attention_heads": 8,
             "num_key_value_heads": 1,
-            "head_dim": 4,
+            "head_dim": 8,
             "hidden_activation": "gelu_pytorch_tanh",
             "use_adarms": False,
             "adarms_cond_dim": None,
@@ -250,6 +250,102 @@ def test_actual_decoder_has_no_future_label_leak(tiny_policy, monkeypatch):
     second = policy.model.latent_action_logits(*args, changed)
     torch.testing.assert_close(first[:, :-1], second[:, :-1], rtol=0, atol=0)
     assert not torch.equal(first[:, -1], second[:, -1])
+
+
+@pytest.mark.parametrize("backend", ["sdpa", "flash_attention_2"])
+@pytest.mark.parametrize("stage", ["pre-training", "post-training"])
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+@pytest.mark.parametrize("amp", [False, True])
+def test_optimized_attention_preserves_lap_loss_and_gradients(
+    tiny_policy, monkeypatch, backend, stage, gradient_checkpointing, amp
+):
+    from lerobot.policies.common import pi_attention
+    from tests.policies.pi0_pi05.test_pi_attention import packed_math_reference
+
+    # CPU verifies the complete packing/training integration. Separate CUDA tests
+    # run the actual Flash kernels, without replacing this boundary.
+    monkeypatch.setattr(pi_attention, "_flash_varlen", packed_math_reference)
+    torch.manual_seed(123)
+    reference = tiny_policy(stage, gradient_checkpointing=gradient_checkpointing)
+    optimized = tiny_policy(stage, gradient_checkpointing=gradient_checkpointing, attention_backend=backend)
+    optimized.load_state_dict(reference.state_dict(), strict=True)
+    teacher = SimpleNamespace(
+        device=torch.device("cpu"), encode=lambda frames: torch.tensor([[0, 15, 2, 8]] * len(frames))
+    )
+    reference._lam_encoder = optimized._lam_encoder = teacher
+    reference.train()
+    optimized.train()
+    data = batch()
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=amp):
+        torch.manual_seed(17)
+        ref_loss, _ = reference(data)
+        torch.manual_seed(17)
+        loss, _ = optimized(data)
+    torch.testing.assert_close(loss, ref_loss, atol=3e-3 if amp else 2e-6, rtol=1e-2 if amp else 1e-5)
+    loss.backward()
+    ref_loss.backward()
+    difference_sq = reference_sq = 0.0
+    for (name, parameter), (_, ref_parameter) in zip(
+        optimized.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        if parameter.grad is None:
+            assert ref_parameter.grad is None
+        else:
+            assert torch.isfinite(parameter.grad).all()
+            if not amp:
+                torch.testing.assert_close(parameter.grad, ref_parameter.grad, atol=5e-6, rtol=5e-4, msg=name)
+            difference_sq += (parameter.grad.float() - ref_parameter.grad.float()).square().sum().item()
+            reference_sq += ref_parameter.grad.float().square().sum().item()
+    relative_gradient_error = (difference_sq / max(reference_sq, 1e-20)) ** 0.5
+    assert relative_gradient_error < (0.02 if amp else 1e-4)
+    if stage == "pre-training":
+        images, image_masks = optimized._preprocess_images(data)
+        args = (images, image_masks, data[OBS_LANGUAGE_TOKENS], data[OBS_LANGUAGE_ATTENTION_MASK])
+        suffix = torch.tensor([[32, 33, 34, 35], [32, 36, 37, 38]])
+        first = optimized.model.latent_action_logits(*args, suffix)
+        suffix[:, -1] = 40
+        second = optimized.model.latent_action_logits(*args, suffix)
+        torch.testing.assert_close(first[:, :-1], second[:, :-1], atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA FlashAttention")
+@pytest.mark.parametrize("stage", ["pre-training", "post-training"])
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+def test_cuda_lap_flash_loss_and_gradients(tiny_policy, stage, gradient_checkpointing):
+    """Real CUDA kernels with FP32 weights + BF16 AMP, matching the training launch."""
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("BF16 FlashAttention requires Ampere or newer")
+    torch.manual_seed(123)
+    reference = tiny_policy(stage, gradient_checkpointing=gradient_checkpointing).cuda()
+    optimized = tiny_policy(
+        stage, gradient_checkpointing=gradient_checkpointing, attention_backend="flash_attention_2"
+    ).cuda()
+    optimized.load_state_dict(reference.state_dict(), strict=True)
+    teacher = SimpleNamespace(
+        device=torch.device("cuda"),
+        encode=lambda frames: torch.tensor([[0, 15, 2, 8]] * len(frames), device="cuda"),
+    )
+    reference._lam_encoder = optimized._lam_encoder = teacher
+    reference.train()
+    optimized.train()
+    data = {key: value.cuda() for key, value in batch().items()}
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        torch.manual_seed(17)
+        ref_loss, _ = reference(data)
+        torch.manual_seed(17)
+        loss, _ = optimized(data)
+    torch.testing.assert_close(loss, ref_loss, atol=3e-3, rtol=1e-2)
+    loss.backward()
+    ref_loss.backward()
+    difference_sq = reference_sq = 0.0
+    for parameter, ref_parameter in zip(optimized.parameters(), reference.parameters(), strict=True):
+        assert (parameter.grad is None) == (ref_parameter.grad is None)
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all()
+            difference_sq += (parameter.grad.float() - ref_parameter.grad.float()).square().sum().item()
+            reference_sq += ref_parameter.grad.float().square().sum().item()
+    relative_gradient_error = (difference_sq / max(reference_sq, 1e-20)) ** 0.5
+    assert relative_gradient_error < 0.02
 
 
 @pytest.mark.parametrize("mask_api", ["with_cache_position", "without_cache_position"])

@@ -18,6 +18,43 @@ JSON 中每个数据集的 `camera_fields` 把 VLM 视角映射到数据集原�
 | `policy.lam_camera_key` | `null` | 单个 RGB 相机全名或短名，省略时自动选主视角 |
 | `policy.tokenizer_path` | `google/paligemma-3b-pt-224` | 初始化时使用的 PaliGemma tokenizer 目录或 Hub ID |
 | `policy.gradient_accumulation` | `1` | 累计多少个每卡 batch 后更新一次，预训练和后训练均支持 |
+| `policy.attention_backend` | `eager` | 训练注意力：`eager`、`sdpa`、`flash_attention_2` |
+
+### A100 单卡显存优化
+
+已有 BF16 autocast 的训练可增加：
+
+```bash
+--policy.attention_backend=flash_attention_2 \
+--policy.gradient_checkpointing=true
+```
+
+保持 `accelerate launch --mixed_precision=bf16`。无需安装第三方 `flash-attn`：
+这里使用 PyTorch 自带的 FlashAttention。PyTorch 2.10+ 将可变长度块打包成一次
+Flash 调用；更早的受支持版本使用逐块 SDPA Flash 内核，不会静默回退为 dense attention。
+不支持的设备或精度会明确报错。非 CUDA / FP32 训练可选择 `sdpa` 或保留 `eager`。
+
+保持 `batch_size=8`、`policy.gradient_accumulation=4`，有效 batch 仍为 32。
+如果还需降低激活显存，可以同时改为 4 和 8，有效 batch 与更新步数口径仍不变。
+梯度检查点通过重计算降低激活显存，会增加计算量；FlashAttention 不消除模型权重、
+梯度和 Adam 优化器状态的显存占用。
+
+Flash 路径按原始 block mask 打包：观测 prefix 双向、动作块能看见 prefix 与整个动作块、
+PI0 状态 token 独立成块，LAP latent suffix 逐 token 因果。padding token 不作为 key，
+其 query 输出置零且不参与监督；真实 token 的注意力关系不变。不会额外降低精度，
+原有 FP32 权重、FP32 norm/视觉模块和 BF16 autocast 设置继续生效。
+默认 `eager` 和动作推理/KV cache 路径保持不变，旧 checkpoint 不需要转换。
+
+融合内核的浮点累加顺序与 eager 不同，不能保证逐位相同或仅靠单元测试保证最终任务成功率。
+本仓库提供前向、loss、梯度、因果泄漏和重计算一致性测试，以及真正调用 CUDA Flash
+的 BF16 回归与显存测试。服务器上先运行：
+
+```bash
+uv run --no-sync pytest tests/policies/pi0_pi05/test_pi_attention.py tests/policies/pi05_lap/test_pi05_lap.py -q
+```
+
+CPU 测试会跳过真实 CUDA 用例；CPU 打包测试只使用数学参考内核，不代表 A100 实测。
+对真实 checkpoint 的长期精度仍应对比相同数据、种子与有效 batch 下的验证指标。
 
 自动选择相机时依次优先 `image`、`base_0_rgb`、`primary`、`front`、
 `agentview_image`、`image_primary`，否则使用 metadata 中的第一个 RGB 相机。

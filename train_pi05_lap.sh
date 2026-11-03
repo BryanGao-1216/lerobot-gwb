@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # config_path 必须指向 pretrained_model/train_config.json。
 # 续训无需 policy.path，LAM 和 tokenizer 配置从 checkpoint 读取。
@@ -14,14 +14,15 @@ args=(
   --policy.training_stage=post-training
   --policy.tokenizer_path=/gaowenbin/models/tokenizers/paligemma-tokenizer
   --policy.push_to_hub=false
+  --policy.attention_backend=flash_attention_2
   --policy.gradient_checkpointing=false
   --resume=false
   --output_dir=/gaowenbin/models/trained_models/PI05-lap-baseline
   --eval_steps=2000
-  --steps=500000
+  --steps=30000
   --save_freq=10000
-  --batch_size=8
-  --policy.gradient_accumulation=4
+  --batch_size=4
+  --policy.gradient_accumulation=8
   --dataset.config_path=dataset/config.json
   --wandb.enable=false
   --swanlab.enable=true

@@ -51,6 +51,7 @@ from lerobot.utils.constants import (
 
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
 from ..common.masked_loss import reduce_action_loss
+from ..common.pi_attention import PiAttentionLayout, pi_attention_forward, prepare_pi_attention
 from ..common.vla_utils import (
     clone_past_key_values,
     create_sinusoidal_pos_embedding,
@@ -73,7 +74,16 @@ class ActionSelectKwargs(TypedDict, total=False):
 
 
 # Define the complete layer computation function for gradient checkpointing
-def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_cond, layers, rotary_emb):
+def compute_layer_complete(
+    inputs_embeds,
+    attention_mask,
+    position_ids,
+    adarms_cond,
+    layers,
+    rotary_emb,
+    attention_backend="eager",
+    attention_layout=None,
+):
     query_states = []
     key_states = []
     value_states = []
@@ -109,13 +119,15 @@ def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_c
     paligemma_layer = layers[0]
     scaling = paligemma_layer.self_attn.scaling
     # Attention computation
-    att_output, _ = modeling_gemma.eager_attention_forward(
+    att_output = pi_attention_forward(
         paligemma_layer.self_attn,
         query_states,
         key_states,
         value_states,
         attention_mask,
         scaling,
+        backend=attention_backend,
+        layout=attention_layout,
     )
     # Get head_dim from the current layer, not from the model
     head_dim = paligemma_layer.self_attn.head_dim
@@ -304,6 +316,8 @@ class PaliGemmaWithExpertModel(
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        attention_backend: str = "eager",
+        attention_layout: PiAttentionLayout | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -315,6 +329,8 @@ class PaliGemmaWithExpertModel(
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                pi_attention_backend=attention_backend,
+                pi_attention_layout=attention_layout,
             )
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
@@ -356,6 +372,8 @@ class PaliGemmaWithExpertModel(
                         preserve_rng_state=False,
                         layers=layers,
                         rotary_emb=rotary_emb,
+                        attention_backend=attention_backend,
+                        attention_layout=attention_layout,
                     )
                 else:
                     inputs_embeds = compute_layer_complete(
@@ -365,6 +383,8 @@ class PaliGemmaWithExpertModel(
                         adarms_cond,
                         layers=layers,
                         rotary_emb=rotary_emb,
+                        attention_backend=attention_backend,
+                        attention_layout=attention_layout,
                     )
 
             # final norm
@@ -582,7 +602,8 @@ class PI05LAPPytorch(nn.Module):  # see openpi `PI0Pytorch`
         embeddings = torch.cat((prefix, suffix), dim=1)
         pad = torch.cat((prefix_pad, torch.ones_like(suffix_tokens, dtype=torch.bool)), dim=1)
         ar = torch.cat((prefix_ar, torch.ones_like(suffix_tokens, dtype=torch.bool)), dim=1)
-        attention = prepare_attention_masks_4d(make_att_2d_masks(pad, ar))
+        backend = self.config.attention_backend if self.training else "eager"
+        attention, attention_layout = prepare_pi_attention(pad, ar, backend)
         positions = torch.cumsum(pad, dim=1) - 1
         language_model = self.paligemma_with_expert.paligemma.model.language_model
         language_model.config._attn_implementation = "eager"
@@ -593,6 +614,8 @@ class PI05LAPPytorch(nn.Module):  # see openpi `PI0Pytorch`
             attention_mask=attention,
             position_ids=positions,
             use_cache=False,
+            attention_backend=backend,
+            attention_layout=attention_layout,
         )
         suffix_hidden = hidden[0][:, -suffix_tokens.shape[1] :]
         head = self.paligemma_with_expert.paligemma.get_output_embeddings()
@@ -617,10 +640,10 @@ class PI05LAPPytorch(nn.Module):  # see openpi `PI0Pytorch`
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        att_2d_masks_4d = prepare_attention_masks_4d(att_2d_masks)
+        att_2d_masks_4d, attention_layout = prepare_pi_attention(
+            pad_masks, att_masks, self.config.attention_backend
+        )
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
@@ -630,6 +653,8 @@ class PI05LAPPytorch(nn.Module):  # see openpi `PI0Pytorch`
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                attention_backend=self.config.attention_backend,
+                attention_layout=attention_layout,
             )
             return suffix_out
 

@@ -22,6 +22,8 @@ from torch import nn
 
 from lerobot.utils.import_utils import _transformers_available
 
+from .common.pi_attention import pi_attention_forward
+
 if TYPE_CHECKING or _transformers_available:
     from transformers.cache_utils import DynamicCache
     from transformers.masking_utils import create_causal_mask
@@ -33,6 +35,7 @@ if TYPE_CHECKING or _transformers_available:
         GemmaForCausalLM,
         GemmaMLP,
         GemmaModel,
+        apply_rotary_pos_emb,
     )
     from transformers.models.paligemma.modeling_paligemma import (
         PaliGemmaForConditionalGeneration,
@@ -169,16 +172,41 @@ def _get_pi_gemma_decoder_layer_base():
         ) -> torch.Tensor:
             residual = hidden_states
             hidden_states, gate = self.input_layernorm(hidden_states, cond=adarms_cond)
-            hidden_states, _ = self.self_attn(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
+            backend = kwargs.pop("pi_attention_backend", "eager")
+            layout = kwargs.pop("pi_attention_layout", None)
+            if backend == "eager":
+                hidden_states, _ = self.self_attn(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+            else:
+                if past_key_values is not None or use_cache:
+                    raise ValueError("Optimized PI training attention does not use a KV cache.")
+                attn = self.self_attn
+                input_shape = hidden_states.shape[:-1]
+                head_shape = (*input_shape, -1, attn.head_dim)
+                query = attn.q_proj(hidden_states).view(head_shape).transpose(1, 2)
+                key = attn.k_proj(hidden_states).view(head_shape).transpose(1, 2)
+                value = attn.v_proj(hidden_states).view(head_shape).transpose(1, 2)
+                query, key = apply_rotary_pos_emb(query, key, *position_embeddings)
+                output = pi_attention_forward(
+                    attn,
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn.scaling,
+                    backend=backend,
+                    layout=layout,
+                    dropout=attn.attention_dropout if self.training else 0.0,
+                )
+                hidden_states = attn.o_proj(output.reshape(*input_shape, -1).contiguous())
 
             hidden_states = _gated_residual(residual, hidden_states, gate)
 
@@ -262,7 +290,11 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        if attention_mask is not None and attention_mask.ndim == 4:
+        if kwargs.get("pi_attention_backend") == "flash_attention_2":
+            # The block layout carries the exact prefix/causal/padding semantics.
+            # Do not allocate or rebuild a dense causal mask.
+            causal_mask = None
+        elif attention_mask is not None and attention_mask.ndim == 4:
             # PI policies already supply a complete additive mask, including
             # bidirectional observation prefixes and causal latent suffixes.
             # Preserve it exactly instead of rebuilding it through HF's API.
