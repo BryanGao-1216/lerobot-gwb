@@ -20,6 +20,7 @@ from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTr
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
+from ..common.pi_attention import PI_ATTENTION_BACKENDS
 from ..rtc.configuration_rtc import RTCConfig
 
 DEFAULT_IMAGE_SIZE = 224
@@ -31,6 +32,8 @@ class PI0Config(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
+    # Training attention only; action inference keeps the original eager/KV-cache path.
+    attention_backend: str = "eager"  # "eager", "sdpa", "flash_attention_2" (PyTorch Flash)
 
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
@@ -119,6 +122,8 @@ class PI0Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        if self.attention_backend not in PI_ATTENTION_BACKENDS:
+            raise ValueError(f"attention_backend must be one of {PI_ATTENTION_BACKENDS}")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
