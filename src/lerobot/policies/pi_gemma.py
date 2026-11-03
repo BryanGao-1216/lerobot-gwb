@@ -376,6 +376,7 @@ class PiGemmaForCausalLM(GemmaForCausalLM):  # type: ignore[misc]
         super().__init__(config, **kwargs)
         del self.model
         self.model = PiGemmaModel(config)
+        self.tie_weights()
 
 
 class PaliGemmaModelWithPiGemma(PaliGemmaModel):
@@ -394,6 +395,8 @@ class PaliGemmaForConditionalGenerationWithPiGemma(PaliGemmaForConditionalGenera
         super().__init__(config)
         del self.model
         self.model = PaliGemmaModelWithPiGemma(config)
+        # The parent tied its head to the model that was just replaced.
+        self.tie_weights()
 
     # Make modules available through conditional class for BC
     @property

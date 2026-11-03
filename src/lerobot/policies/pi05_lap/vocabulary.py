@@ -69,11 +69,7 @@ class LatentActionVocabulary:
 
 
 def extend_vlm_vocabulary(vlm, size: int):
-    """Resize input/output separately, preserving PI05's original weights and tying semantics.
-
-    Avoid HF's mean-resizing and implicit re-tying, which can overwrite an independently
-    trained output head in a LAP checkpoint.
-    """
+    """Extend the vocabulary, preserving embedding scaling, old rows and weight sharing."""
     embedding = vlm.get_input_embeddings()
     head = vlm.get_output_embeddings()
     size = max(size, embedding.num_embeddings)

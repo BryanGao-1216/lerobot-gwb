@@ -420,8 +420,10 @@ def test_pretrain_gradients_and_native_action_loss(tiny_policy, gradient_checkpo
     loss, _ = policy(data)
     loss.backward()
     vlm = policy.model.paligemma_with_expert.paligemma
+    assert vlm.get_input_embeddings().weight is vlm.lm_head.weight
     assert vlm.get_input_embeddings().weight.grad is not None
-    assert vlm.lm_head.weight.grad is not None
+    assert vlm.get_input_embeddings().weight.grad is vlm.lm_head.weight.grad
+    assert sum(p is vlm.lm_head.weight for p in policy.get_optim_params()) == 1
     assert not vlm.model.vision_tower.training
     assert all(p.grad is None and not p.requires_grad for p in policy.model.action_in_proj.parameters())
     assert all(
@@ -440,24 +442,38 @@ def test_pretrain_gradients_and_native_action_loss(tiny_policy, gradient_checkpo
     expected, _ = PI05Policy.forward(post, data)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert post._lam_encoder is None
+    post_vlm = post.model.paligemma_with_expert.paligemma
+    assert post_vlm.get_input_embeddings().weight is post_vlm.lm_head.weight
+    assert post_vlm.get_input_embeddings().weight.requires_grad
+    actual.backward()
+    assert post_vlm.get_input_embeddings().weight.grad.abs().sum() > 0
 
 
 def test_checkpoint_preserves_head_embedding_and_ids(tiny_policy, tmp_path):
     policy = tiny_policy()
     vlm = policy.model.paligemma_with_expert.paligemma
+    assert vlm.get_input_embeddings().weight is vlm.lm_head.weight
     with torch.no_grad():
         vlm.get_input_embeddings().weight.fill_(0.1)
-        vlm.lm_head.weight.fill_(0.7)
     expected = {k: v.clone() for k, v in policy.state_dict().items()}
     policy.save_pretrained(tmp_path)
     config = replace(policy.config, training_stage="post-training", lam_model_path="/does/not/exist")
     restored = lap.PI05LAPPolicy.from_pretrained(tmp_path, config=config, local_files_only=True)
     assert restored.latent_vocabulary.metadata() == policy.latent_vocabulary.metadata()
+    restored_vlm = restored.model.paligemma_with_expert.paligemma
+    assert restored_vlm.get_input_embeddings().weight is restored_vlm.lm_head.weight
 
     assert not any("lam_encoder" in key for key in expected)
     for key, value in restored.state_dict().items():
         torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
-    state = {k: v for k, v in expected.items() if k != "model.paligemma_with_expert.paligemma.lm_head.weight"}
+    for omitted in (EMBEDDING_KEY, HEAD_KEY):
+        state = {k: v for k, v in expected.items() if k != omitted}
+        save_file(state, tmp_path / "model.safetensors")
+        loaded = lap.PI05LAPPolicy.from_pretrained(tmp_path, config=config, local_files_only=True)
+        loaded_vlm = loaded.model.paligemma_with_expert.paligemma
+        assert loaded_vlm.get_input_embeddings().weight is loaded_vlm.lm_head.weight
+        torch.testing.assert_close(loaded_vlm.lm_head.weight, expected[HEAD_KEY], rtol=0, atol=0)
+    state = {k: v for k, v in expected.items() if k not in {EMBEDDING_KEY, HEAD_KEY}}
     save_file(state, tmp_path / "model.safetensors")
     with pytest.raises(RuntimeError, match="Missing key"):
         lap.PI05LAPPolicy.from_pretrained(tmp_path, config=config, local_files_only=True)
@@ -468,7 +484,8 @@ def test_checkpoint_preserves_head_embedding_and_ids(tiny_policy, tmp_path):
         LatentActionVocabulary.from_pretrained(tmp_path, local_files_only=True)
 
 
-def test_vocabulary_extension_preserves_scaled_embedding():
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vocabulary_extension_preserves_scaled_embedding(dtype):
     from lerobot.policies.pi_gemma import PiGemmaForCausalLM
 
     model = PiGemmaForCausalLM(
@@ -482,12 +499,15 @@ def test_vocabulary_extension_preserves_scaled_embedding():
             head_dim=8,
         )
     )
+    model.to(dtype=dtype)
     model.config.text_config = model.config
+    assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
     tokens = torch.tensor([[1, 2, 3]])
     embedding = model.get_input_embeddings()
     before = embedding(tokens).detach().clone()
     weights = embedding.weight.detach().clone()
     extend_vlm_vocabulary(model, 49)
+    assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
     assert type(model.get_input_embeddings()) is type(embedding)
     torch.testing.assert_close(model.get_input_embeddings()(tokens), before, rtol=0, atol=0)
     torch.testing.assert_close(model.get_input_embeddings().weight[:32], weights, rtol=0, atol=0)
@@ -575,13 +595,23 @@ def test_native_checkpoint_expands_only_new_rows(tiny_policy, tmp_path):
     }
     state = {k: v.clone() for k, v in policy.state_dict().items()}
     state[EMBEDDING_KEY] = torch.full((257152, 16), 0.25)
-    state[HEAD_KEY] = torch.full((257152, 16), 0.75)
+    state[HEAD_KEY] = state[EMBEDDING_KEY].clone()
     save_file(state, tmp_path / "model.safetensors")
     load_student_state(policy, tmp_path, source_type="pi05")
     restored = policy.state_dict()
     for key in (EMBEDDING_KEY, HEAD_KEY):
         torch.testing.assert_close(restored[key][:257152], state[key], rtol=0, atol=0)
         torch.testing.assert_close(restored[key][257152:], new_rows[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("source_type", ["pi05", "pi05_lap"])
+def test_tied_checkpoint_rejects_different_head_weights(tiny_policy, tmp_path, source_type):
+    policy = tiny_policy()
+    state = {key: value.clone() for key, value in policy.state_dict().items()}
+    state[HEAD_KEY].add_(1)
+    save_file(state, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match="requires tied weights"):
+        load_student_state(policy, tmp_path, source_type=source_type)
 
 
 def _flatten_vision_wrapper(policy):
