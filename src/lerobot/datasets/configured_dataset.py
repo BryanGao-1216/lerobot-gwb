@@ -16,7 +16,6 @@ import torch.nn.functional as F  # noqa: N812
 
 from lerobot.configs.dataset_mixture import DatasetSourceConfig, VectorFieldConfig
 from lerobot.configs.types import FeatureType, NormalizationMode
-from lerobot.policies.common.vla_utils import resize_with_pad_torch
 from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_STATE
 
@@ -232,13 +231,13 @@ class ConfiguredDataset(torch.utils.data.Dataset):
             # Image columns are decoded as float32; videos may be uint8. Do not
             # let default_collate promote byte pixels to unscaled floats in mixed batches.
             if self.schema.return_uint8 and image.dtype != torch.uint8:
-                image = (image * 255).round().clamp(0, 255).to(torch.uint8)
+                image = (image * 255).to(torch.uint8)
             elif not self.schema.return_uint8 and image.dtype == torch.uint8:
                 image = image.float().div(255)
             # Resize before collating so different source resolutions can share a batch.
-            image = resize_with_pad_torch(image.permute(1, 2, 0).unsqueeze(0), *self.schema.image_resolution)[
-                0
-            ].permute(2, 0, 1)
+            from lerobot.policies.common.openpi_io import resize_openpi_image
+
+            image = resize_openpi_image(image, *self.schema.image_resolution)
             if self.image_transforms is not None:
                 image = self.image_transforms(image)
             item[camera] = image
@@ -276,6 +275,8 @@ def make_configured_datasets(cfg):
         if is_lap:
             lam_camera_keys[name] = source.resolve_lam_camera_key()
             _validate_rgb_camera(meta, lam_camera_keys[name], name)
+    if len(cameras) > 3:
+        raise ValueError("OpenPI PI05/LAP supports at most three shared camera slots across datasets.")
     if action_dim > policy.max_action_dim or state_dim > policy.max_state_dim:
         raise ValueError(
             f"Mapped action/state dimensions ({action_dim}, {state_dim}) exceed policy capacity "

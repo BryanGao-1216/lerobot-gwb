@@ -78,8 +78,7 @@ def mean_std_normalize(tensor: torch.Tensor, stats: dict[str, torch.Tensor]) -> 
 def quantile_normalize(tensor: torch.Tensor, stats: dict[str, torch.Tensor]) -> torch.Tensor:
     q01 = stats["q01"].to(device=tensor.device, dtype=tensor.dtype)
     q99 = stats["q99"].to(device=tensor.device, dtype=tensor.dtype)
-    denom = torch.where(q99 == q01, torch.full_like(q99, 1e-8), q99 - q01)
-    return 2.0 * (tensor - q01) / denom - 1.0
+    return (tensor - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
 
 
 def openpi_model_state_from_raw(
@@ -129,17 +128,6 @@ def _format_pi0_prompts(tasks: list[str]) -> list[str]:
     return [f"{task.strip().replace('_', ' ').replace(chr(10), ' ')}\n" for task in tasks]
 
 
-def _format_pi05_prompts(tasks: list[str], normalized_state: torch.Tensor) -> list[str]:
-    state_np = normalized_state.detach().cpu().numpy()
-    discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-    prompts = []
-    for task, state in zip(tasks, discretized_states, strict=True):
-        cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
-        state_str = " ".join(map(str, state))
-        prompts.append(f"Task: {cleaned_text}, State: {state_str};\nAction: ")
-    return prompts
-
-
 def _tokenize_prompts(prompts: list[str], *, max_token_len: int, device: torch.device | str):
     tokenized = paligemma_tokenizer()(
         prompts,
@@ -161,6 +149,7 @@ def make_openpi_observation_from_raw(
     max_token_len: int,
     dataset_stats: dict[str, dict[str, torch.Tensor]],
     pi05: bool,
+    discrete_state_input: bool = True,
 ) -> OpenPIObservation:
     batch_size = batch[OBS_STATE].shape[0]
     device = batch[OBS_STATE].device
@@ -172,13 +161,44 @@ def make_openpi_observation_from_raw(
     )
 
     tasks = _tasks_from_raw(batch, batch_size)
-    prompts = _format_pi05_prompts(tasks, state) if pi05 else _format_pi0_prompts(tasks)
-    tokens, masks = _tokenize_prompts(prompts, max_token_len=max_token_len, device=device)
+    if pi05:
+        import sentencepiece
+
+        from lerobot.policies.common.openpi_io import resolve_tokenizer_model
+
+        tokenizer = sentencepiece.SentencePieceProcessor(model_file=str(resolve_tokenizer_model()))
+        # OpenPI tokenizes the actual state before PadStatesAndActions adds zeros.
+        normalized = state[:, : batch[OBS_STATE].shape[-1]].cpu().numpy()
+        tokens = torch.zeros(batch_size, max_token_len, dtype=torch.long, device=device)
+        masks = torch.zeros_like(tokens, dtype=torch.bool)
+        for row, (task, values) in enumerate(zip(tasks, normalized, strict=True)):
+            prompt = task.strip().replace("_", " ").replace("\n", " ")
+            if discrete_state_input:
+                bins = np.digitize(values, np.linspace(-1, 1, 257)[:-1]) - 1
+                prompt = f"Task: {prompt}, State: {' '.join(map(str, bins))};\nAction: "
+                ids = tokenizer.encode(prompt, add_bos=True)
+            else:
+                ids = tokenizer.encode(prompt, add_bos=True) + tokenizer.encode("\n")
+            ids = ids[:max_token_len]
+            tokens[row, : len(ids)] = torch.tensor(ids, device=device)
+            masks[row, : len(ids)] = True
+    else:
+        tokens, masks = _tokenize_prompts(
+            _format_pi0_prompts(tasks), max_token_len=max_token_len, device=device
+        )
 
     images = {
         key: batch[f"observation.images.{key}"].to(device=device, dtype=torch.float32) * 2.0 - 1.0
         for key in IMAGE_KEYS
     }
+    if pi05:
+        # LiberoInputs quantizes decoded float images before Observation.from_dict.
+        images = {
+            key: (
+                batch[f"observation.images.{key}"].mul(255).to(torch.uint8).float().div(255) * 2 - 1
+            ).contiguous(memory_format=torch.channels_last)
+            for key in IMAGE_KEYS
+        }
     image_masks = {key: torch.ones(batch_size, dtype=torch.bool, device=device) for key in IMAGE_KEYS}
 
     return OpenPIObservation(
@@ -271,8 +291,8 @@ def deterministic_openpi_forward_preprocess(openpi_policy) -> Iterator[None]:
     """Disable OpenPI's training-time image augmentation only inside a parity forward block.
 
     OpenPI's `forward()` calls `_preprocess_observation(..., train=True)`, which can apply stochastic
-    image augmentation. LeRobot's policy forward path does not apply that augmentation, so parity would
-    otherwise compare two different image tensors rather than two model implementations. The context manager
+    image augmentation. Deterministic model parity disables augmentation in both models; stochastic image
+    preprocessing has its own reference tests. The context manager
     keeps the public `openpi_policy.forward(observation, ...)` call while making preprocessing deterministic.
 
     `yield` marks the body of the caller's `with` block. The `try/finally` restores the original method even

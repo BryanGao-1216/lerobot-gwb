@@ -1,7 +1,8 @@
 """CPU checks for sampling, causal supervision and two-stage checkpoint transfer.
 
-Use a tiny real PiGemma decoder and a local synthetic tokenizer: no CUDA, Hub,
-training run, or production checkpoints are needed.
+Use a tiny real PiGemma decoder and a local synthetic latent tokenizer: no CUDA,
+Hub model weights, training run, or production checkpoints are needed. Text IO
+checks use the cached public OpenPI SentencePiece model.
 """
 
 import json
@@ -28,6 +29,7 @@ from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies import pi_gemma
 from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.pi05 import modeling_pi05 as pi05
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 from lerobot.policies.pi05_lap import modeling_pi05_lap as lap
@@ -118,7 +120,8 @@ def test_dataset_keeps_raw_teacher_and_only_current_student(monkeypatch):
     assert item[ACTION] is actions
 
 
-def test_native_config_cli_conversion(tmp_path, monkeypatch):
+@pytest.mark.parametrize("horizon", [12, 37])
+def test_native_config_cli_conversion(tmp_path, monkeypatch, horizon):
     source = PI05Config(chunk_size=24, n_action_steps=12, max_state_dim=18, device="cpu")
     source._save_pretrained(tmp_path)
     monkeypatch.setattr(
@@ -130,7 +133,8 @@ def test_native_config_cli_conversion(tmp_path, monkeypatch):
             f"--policy.path={tmp_path}",
             "--policy.training_stage=pre-training",
             "--policy.lam_model_path=/tmp/lam.ckpt",
-            "--policy.chunk_size=12",
+            f"--policy.chunk_size={horizon}",
+            f"--policy.n_action_steps={horizon}",
             "--policy.lam_camera_key=image2",
             "--policy.tokenizer_path=/tmp/local-tokenizer",
         ],
@@ -140,7 +144,8 @@ def test_native_config_cli_conversion(tmp_path, monkeypatch):
     TrainPipelineConfig._resolve_pretrained_from_cli(cfg)
     assert isinstance(cfg.policy, PI05LAPConfig)
     assert cfg.policy.training_stage == "pre-training"
-    assert cfg.policy.chunk_size == 12
+    assert cfg.policy.chunk_size == horizon
+    assert cfg.policy.n_action_steps == horizon
     assert cfg.policy.max_state_dim == 18
     assert cfg.policy.pretrained_path == tmp_path
     assert cfg.policy.tokenizer_path == "/tmp/local-tokenizer"
@@ -202,22 +207,28 @@ def tiny_policy(monkeypatch):
 
     monkeypatch.setattr(lap, "get_gemma_config", small_config)
     monkeypatch.setattr(lap.PaliGemmaWithExpertModel, "__init__", init_wrapper)
+    monkeypatch.setattr(pi05, "get_gemma_config", small_config)
+    monkeypatch.setattr(pi05.PaliGemmaWithExpertModel, "__init__", init_wrapper)
 
-    def create(stage="pre-training", **kwargs):
-        config = PI05LAPConfig(
-            training_stage=stage,
+    def create(stage="pre-training", policy_type="pi05_lap", **kwargs):
+        config_class = PI05LAPConfig if policy_type == "pi05_lap" else PI05Config
+        if policy_type == "pi05_lap":
+            kwargs["training_stage"] = stage
+        config = config_class(
             device="cpu",
             image_resolution=(8, 8),
             chunk_size=3,
             n_action_steps=3,
-            max_action_dim=7,
-            max_state_dim=7,
+            max_action_dim=kwargs.pop("max_action_dim", 7),
+            max_state_dim=kwargs.pop("max_state_dim", 7),
             **kwargs,
         )
         from lerobot.configs import FeatureType, PolicyFeature
 
         config.input_features = {CAMERA: PolicyFeature(FeatureType.VISUAL, (3, 8, 8))}
         config.output_features = {ACTION: PolicyFeature(FeatureType.ACTION, (7,))}
+        if policy_type == "pi05":
+            return PI05Policy(config)
         return lap.PI05LAPPolicy(config, _latent_vocabulary=vocabulary)
 
     return create
@@ -442,6 +453,7 @@ def test_checkpoint_preserves_head_embedding_and_ids(tiny_policy, tmp_path):
     config = replace(policy.config, training_stage="post-training", lam_model_path="/does/not/exist")
     restored = lap.PI05LAPPolicy.from_pretrained(tmp_path, config=config, local_files_only=True)
     assert restored.latent_vocabulary.metadata() == policy.latent_vocabulary.metadata()
+
     assert not any("lam_encoder" in key for key in expected)
     for key, value in restored.state_dict().items():
         torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
@@ -454,6 +466,90 @@ def test_checkpoint_preserves_head_embedding_and_ids(tiny_policy, tmp_path):
     (tmp_path / TOKEN_MAP_FILE).write_text(json.dumps(mapping))
     with pytest.raises(ValueError, match="token IDs"):
         LatentActionVocabulary.from_pretrained(tmp_path, local_files_only=True)
+
+
+def test_vocabulary_extension_preserves_scaled_embedding():
+    from lerobot.policies.pi_gemma import PiGemmaForCausalLM
+
+    model = PiGemmaForCausalLM(
+        GemmaConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=8,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+    )
+    model.config.text_config = model.config
+    tokens = torch.tensor([[1, 2, 3]])
+    embedding = model.get_input_embeddings()
+    before = embedding(tokens).detach().clone()
+    weights = embedding.weight.detach().clone()
+    extend_vlm_vocabulary(model, 49)
+    assert type(model.get_input_embeddings()) is type(embedding)
+    torch.testing.assert_close(model.get_input_embeddings()(tokens), before, rtol=0, atol=0)
+    torch.testing.assert_close(model.get_input_embeddings().weight[:32], weights, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("policy_type", ["pi05", "pi05_lap"])
+def test_libero_seven_dim_loss_gradients_and_inference_match_openpi(tiny_policy, monkeypatch, policy_type):
+    import copy
+
+    from torch.nn import functional as functional
+
+    from tests.policies.pi0_pi05.openpi_pytorch.pi0_pytorch import PI0Pytorch as Reference
+
+    torch.manual_seed(47)
+    policy = tiny_policy(
+        "post-training", policy_type=policy_type, max_action_dim=32, image_augmentation=False
+    )
+    policy.eval()
+    data = batch()
+    images, image_masks = policy._preprocess_images(data)
+    observation = SimpleNamespace(
+        state=torch.zeros(2, 32),
+        images={},
+        image_masks={},
+        tokenized_prompt=data[OBS_LANGUAGE_TOKENS],
+        tokenized_prompt_mask=data[OBS_LANGUAGE_ATTENTION_MASK],
+    )
+    reference = Reference.__new__(Reference)
+    nn.Module.__init__(reference)
+    reference.pi05 = True
+    reference.config = SimpleNamespace(action_dim=32, action_horizon=3)
+    reference.gradient_checkpointing_enabled = False
+    for name in ("paligemma_with_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"):
+        setattr(reference, name, copy.deepcopy(getattr(policy.model, name)))
+    reference.eval()
+    reference._preprocess_observation = lambda obs, train=True: (
+        images,
+        image_masks,
+        obs.tokenized_prompt,
+        obs.tokenized_prompt_mask,
+        obs.state,
+    )
+    noise = torch.randn(2, 3, 32)
+    time = torch.tensor([0.2, 0.8])
+    monkeypatch.setattr(policy.model, "sample_noise", lambda *args: noise)
+    monkeypatch.setattr(policy.model, "sample_time", lambda *args: time)
+    expected = reference(observation, functional.pad(data[ACTION], (0, 25)), noise=noise, time=time).mean()
+    actual, metrics = policy(data)
+    assert len(metrics["loss_per_dim"]) == 32
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+    actual.backward()
+    expected.backward()
+    assert policy.model.action_out_proj.weight.grad[7:].abs().sum() > 0
+    for (name, p), (_, r) in zip(policy.model.named_parameters(), reference.named_parameters(), strict=True):
+        assert (p.grad is None) == (r.grad is None), name
+        if p.grad is not None:
+            torch.testing.assert_close(p.grad, r.grad, atol=1e-6, rtol=1e-4, msg=name)
+    expected_actions = reference.sample_actions(torch.device("cpu"), observation, noise=noise.clone())[
+        :, :, :7
+    ]
+    actual_actions = policy.predict_action_chunk(data, noise=noise.clone())
+    torch.testing.assert_close(actual_actions, expected_actions, atol=2e-6, rtol=1e-5)
 
 
 def test_lam_rejects_wrong_checkpoint(tmp_path):
@@ -497,9 +593,8 @@ def _flatten_vision_wrapper(policy):
     return policy
 
 
-@pytest.mark.parametrize("source_type", ["pi05", "pi05_lap"])
 @pytest.mark.parametrize("outer_prefix", [True, False])
-def test_legacy_vision_wrapper_loads_all_weights(tiny_policy, tmp_path, source_type, outer_prefix):
+def test_native_pi05_vision_wrapper_loads_all_weights(tiny_policy, tmp_path, outer_prefix):
     source = _flatten_vision_wrapper(tiny_policy())
     expected = {key: value.clone() for key, value in source.state_dict().items()}
     state = {}
@@ -512,7 +607,7 @@ def test_legacy_vision_wrapper_loads_all_weights(tiny_policy, tmp_path, source_t
         state[legacy if outer_prefix else legacy.removeprefix("model.")] = value
     save_file(state, tmp_path / "model.safetensors")
     restored = _flatten_vision_wrapper(tiny_policy())
-    load_student_state(restored, tmp_path, source_type=source_type)
+    load_student_state(restored, tmp_path, source_type="pi05")
     for key, value in restored.state_dict().items():
         torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
 
@@ -553,7 +648,7 @@ def test_local_tokenizer_used_for_initialization_and_saved_processor(tiny_policy
     config = replace(tiny_policy().config, tokenizer_path=str(directory))
     pre, post = make_pi05_lap_pre_post_processors(config)
     step = next(s for s in pre.steps if isinstance(s, TokenizerProcessorStep))
-    assert len(step.input_tokenizer) == len(tokenizer)
+    assert step.input_tokenizer.get_piece_size() == 257152
 
     source = tmp_path / "native-pi05"
     source.mkdir()
@@ -571,9 +666,9 @@ def test_local_tokenizer_used_for_initialization_and_saved_processor(tiny_policy
         preprocessor_overrides={"tokenizer_processor": {"max_length": 40}},
     )
     step = next(s for s in loaded.steps if isinstance(s, TokenizerProcessorStep))
-    assert step.tokenizer_name == str(directory)
-    assert step.max_length == 40
-    assert step.input_tokenizer.convert_tokens_to_ids("Task") == 1
+    assert step.tokenizer_name is None
+    assert step.max_length == config.tokenizer_max_length
+    assert step.input_tokenizer.get_piece_size() == 257152
 
     # A relocated LAP checkpoint also supplies the processor's tokenizer, even
     # when its original local tokenizer directory has been removed.
@@ -587,6 +682,7 @@ def test_local_tokenizer_used_for_initialization_and_saved_processor(tiny_policy
     for _ in range(2):
         loaded, output = make_pre_post_processors(config, pretrained_path=str(target))
         step = next(s for s in loaded.steps if isinstance(s, TokenizerProcessorStep))
-        assert step.input_tokenizer.convert_tokens_to_ids(list(LATENT_CODES)) == list(vocabulary.code_ids)
+        assert step.input_tokenizer.get_piece_size() == 257152
+        assert LatentActionVocabulary.from_pretrained(target).code_ids == vocabulary.code_ids
         loaded.save_pretrained(target, config_filename="policy_preprocessor.json")
         output.save_pretrained(target, config_filename="policy_postprocessor.json")

@@ -137,7 +137,7 @@ def test_pi05_processor_inputs_match_openpi_reference():
     )
 
     assert_processor_inputs_match_lerobot(
-        PI05PolicyInputAdapter(config),
+        PI05PolicyInputAdapter(config).eval(),
         lerobot_batch,
         openpi_observation,
         compare_state=False,

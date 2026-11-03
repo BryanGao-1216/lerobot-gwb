@@ -119,6 +119,7 @@ def instantiate_lerobot_pi05(*, compile_model: bool = False, gradient_checkpoint
     config.compile_model = compile_model
     config.compile_mode = COMPILE_MODE
     config.gradient_checkpointing = gradient_checkpointing
+    config.image_augmentation = False  # Stochastic preprocessing is tested separately.
 
     policy = PI05Policy.from_pretrained("lerobot/pi05_base", config=config, strict=True)
     policy.to(DEVICE)

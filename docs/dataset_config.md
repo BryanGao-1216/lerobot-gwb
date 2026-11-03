@@ -93,7 +93,7 @@ uv run python -m lerobot.scripts.convert_dataset_v21_to_v30 \
 
 ## 每个数据集的相机配置
 
-`camera_fields` 决定 VLM 接收哪些**当前帧**。每个数据集可以配置一台、两台、三台或更多相机，无需另设数量参数，也不必填写数据集中所有相机。下面是三个数据集配置块中的相机部分，其他字段按上面的完整示例填写：
+`camera_fields` 决定 VLM 接收哪些**当前帧**。PI05/LAP 按 OpenPI 使用三个固定槽位，所有数据集的统一槽位并集不能超过三个，不必填写数据集中所有相机。建议使用 `observation.images.base_0_rgb`、`observation.images.left_wrist_0_rgb`、`observation.images.right_wrist_0_rgb`；旧名称按配置顺序对应三个槽位。下面是三个数据集配置块中的相机部分，其他字段按上面的完整示例填写：
 
 ```json
 {
@@ -138,7 +138,9 @@ uv run python -m lerobot.scripts.convert_dataset_v21_to_v30 \
 
 各数据集单独使用自己的统计量归一化，PI05 默认使用 `q01/q99`。每个被选择的向量字段都要有对应统计量；缺失时会在模型加载前报错，不会套用另一个数据集的统计量。
 
-向量补零到本次配置中最大的动作/状态维度，补齐位置在归一化后仍为零；动作损失只计算该样本的有效维度。超出策略的 `max_action_dim/max_state_dim` 会直接报错，不会截断标签。不同分辨率的相机先等比缩放、补边到策略分辨率。相机集合取统一字段的并集，缺少的视角用空图和注意力掩码处理。教师帧对在学生图像增强前提取。
+向量先补零到本次配置中最大的动作/状态维度，补齐位置在归一化后仍为零；模型进一步补零到 `max_action_dim`（原生 PI05 为 32）。为对齐 OpenPI，动作训练损失计算全部模型维度，包括补齐维度；动作评估指标仍只计算真实维度。超出策略的 `max_action_dim/max_state_dim` 会直接报错，不会截断标签。PI05/LAP 的 quantile 归一化和反归一化统一使用 `q99-q01+1e-6`。不同分辨率的相机先按官方 PIL bilinear 等比缩放、补边到策略分辨率。相机集合取统一字段的并集，缺少的视角用空图和注意力掩码处理，模型固定接收三个视角槽位。教师帧对在学生图像增强前提取。
+
+`dataset/config.json` 对齐官方 `pi05_libero` 输入输出：主相机与腕部相机分别映射到 `base_0_rgb`、`left_wrist_0_rgb`，右腕槽位为空；`image_transforms.enable=false`，由策略的 `image_augmentation=true` 在训练时执行官方 PyTorch 增强，避免叠加两套增强。验证和推理不做增强。LAP 默认 `discrete_state_input=false`；普通 PI05 配置的通用默认值为 true，LIBERO 应显式改为 false。详见 [策略说明](../src/lerobot/policies/pi05_lap/README.md#openpi-输入输出对齐)。
 
 先按权重抽数据集，再在其可用帧中均匀抽样，采用有放回采样。一轮以所有数据集可用帧数之和为基数，向上凑齐到全局 batch 的整数倍。多进程使用同一确定性采样序列，由 Accelerate 切分 batch。
 
@@ -185,7 +187,7 @@ PI05 和 PI05 LAP 的动作后训练使用现有 `eval_steps` 控制评估间隔
 | `gripper_accuracy` | 预测和标签均以 `>0` 为一类、`<=0` 为另一类；7 维用索引 6，14 维用 6、13，按 H 和夹爪数量平均。值域为 0～1。 |
 | `cumulative_action_error` | 每个有效增量维度沿 H 求和，计算预测累计值与标签累计值之差的绝对值，再平均六维和有效臂。 |
 
-先计算每条 chunk 的三个指标，再按 chunk 数量平均。SwanLab 和终端同时记录总指标与分来源指标，例如 `eval/action_rmse`、`eval/libero/action_rmse`、`eval/aloha_boil/gripper_accuracy`，以及对应的 `num_action_chunks`。总体是所有验证 chunk 的平均，不使用训练抽样权重。
+先计算每条 chunk 的三个指标，再按 chunk 数量平均。单数据集时，SwanLab 和终端只记录总指标，例如 `eval/action_rmse`，以及 `eval/num_action_chunks`；不再记录数值相同的 `eval/libero/action_rmse` 等重复指标。多数据集时，同时记录总指标与分来源指标，例如 `eval/action_rmse`、`eval/libero/action_rmse`、`eval/aloha_boil/gripper_accuracy`，以及对应的 `num_action_chunks`。总体是所有验证 chunk 的平均，不使用训练抽样权重。
 
 ## 续训和部署
 

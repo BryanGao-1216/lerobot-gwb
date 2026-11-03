@@ -266,6 +266,23 @@ def test_mixed_batch_and_episode_clamping(source_payload):
     assert transition_to_batch(batch_to_transition(batch))["dataset_index"].tolist() == [0, 1]
 
 
+def test_configured_float_image_uses_official_truncation(source_payload, monkeypatch):
+    cfg = config(source_payload, stage="post-training")
+    ds, _ = make_train_eval_datasets(cfg)
+    original = LeRobotDataset.__getitem__
+
+    def decoded_float(self, index):
+        row = original(self, index)
+        for key in self.meta.camera_keys:
+            row[key] = torch.full_like(row[key], 127.75 / 255, dtype=torch.float32)
+        return row
+
+    monkeypatch.setattr(LeRobotDataset, "__getitem__", decoded_float)
+    item = ds[0]
+    assert item["observation.images.main"].max() == 127
+    assert item["observation.images.main"].dtype == torch.uint8
+
+
 def test_per_source_normalization_and_checkpoint(source_payload, tmp_path):
     cfg = config(source_payload)
     ds, _ = make_train_eval_datasets(cfg)
@@ -442,7 +459,10 @@ def test_policy_masks_absent_views(multicamera_payload, policy_type):
         batch[key] = batch[key].float() / 255
     dummy = SimpleNamespace(
         parameters=lambda: iter([torch.zeros(1)]),
-        config=SimpleNamespace(image_features=ds.meta.camera_keys, image_resolution=(16, 16)),
+        training=False,
+        config=SimpleNamespace(
+            image_features=ds.meta.camera_keys, image_resolution=(16, 16), image_augmentation=True
+        ),
     )
     images, masks = Policy._preprocess_images(dummy, batch)
     assert len(images) == 3
@@ -561,10 +581,13 @@ def test_no_cameras_in_post_training(multicamera_payload, policy_type, camera_fi
     batch = default_collate([ds[0], ds[1]])
     dummy = SimpleNamespace(
         parameters=lambda: iter([torch.zeros(1)]),
-        config=SimpleNamespace(image_features=ds.meta.camera_keys, image_resolution=(16, 16)),
+        training=False,
+        config=SimpleNamespace(
+            image_features=ds.meta.camera_keys, image_resolution=(16, 16), image_augmentation=True
+        ),
     )
     images, masks = Policy._preprocess_images(dummy, batch)
-    assert len(images) == len(camera_fields)
+    assert len(images) == 3
     assert all(not mask.any() for mask in masks)
     assert LAM_IMAGE_PAIR not in batch
     with pytest.raises(ValueError, match="nonempty camera_fields"):

@@ -29,7 +29,7 @@ class LatentActionVocabulary:
     def create(cls, tokenizer_path: str, **hub_args):
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **hub_args)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, fix_mistral_regex=False, **hub_args)
         tokenizer.add_special_tokens({"additional_special_tokens": [LATENT_START, *LATENT_CODES]})
         return cls(tokenizer)
 
@@ -51,7 +51,9 @@ class LatentActionVocabulary:
 
         from .checkpoint import checkpoint_file
 
-        tokenizer = AutoTokenizer.from_pretrained(str(source), subfolder=TOKENIZER_DIR, **hub_args)
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(source), subfolder=TOKENIZER_DIR, fix_mistral_regex=False, **hub_args
+        )
         vocab = cls(tokenizer)
         saved = json.loads(checkpoint_file(source, TOKEN_MAP_FILE, **hub_args).read_text())
         if saved != vocab.metadata():
@@ -78,13 +80,15 @@ def extend_vlm_vocabulary(vlm, size: int):
     if size == embedding.num_embeddings:
         return
     tied = head.weight is embedding.weight
-    new_embedding = nn.Embedding(
-        size,
-        embedding.embedding_dim,
-        padding_idx=embedding.padding_idx,
-        device=embedding.weight.device,
-        dtype=embedding.weight.dtype,
-    )
+    # GemmaTextScaledWordEmbedding includes sqrt(hidden_size) in forward().
+    # Retain the module class and scale when adding latent vocabulary rows.
+    embedding_kwargs = {}
+    if hasattr(embedding, "scalar_embed_scale"):
+        embedding_kwargs["embed_scale"] = embedding.scalar_embed_scale
+    with torch.device(embedding.weight.device):
+        new_embedding = type(embedding)(
+            size, embedding.embedding_dim, padding_idx=embedding.padding_idx, **embedding_kwargs
+        ).to(dtype=embedding.weight.dtype)
     new_head = nn.Linear(
         head.in_features,
         size,

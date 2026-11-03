@@ -47,6 +47,10 @@ class PI05LAPConfig(PreTrainedConfig):
     dtype: str = "float32"  # Options: "bfloat16", "float32"
     # Training attention only; action inference keeps the original eager/KV-cache path.
     attention_backend: str = "eager"  # "eager", "sdpa", "flash_attention_2" (PyTorch Flash)
+    # OpenPI input/output semantics. LIBERO scripts explicitly disable discrete state input.
+    discrete_state_input: bool = False  # OpenPI pi05_libero recipe, also used for latent pre-training.
+    image_augmentation: bool = True
+    tokenizer_model_path: str | None = None  # Official PaliGemma SentencePiece model; cached if omitted.
 
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"

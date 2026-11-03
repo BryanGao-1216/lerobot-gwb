@@ -1,11 +1,46 @@
 # PI05 LAP
 
-多数据集混合训练可使用 `--dataset.config_path=dataset/libero.json`，各数据集独立配置字段映射、相机和抽样权重。详见 [数据配置说明](../../../../docs/dataset_config.md)。
+多数据集混合训练可使用 `--dataset.config_path=dataset/config.json`，各数据集独立配置字段映射、相机和抽样权重。详见 [数据配置说明](../../../../docs/dataset_config.md)。
 
 JSON 中每个数据集的 `camera_fields` 把 VLM 视角映射到数据集原始相机字段，可以选择部分相机，并用 `null`、`""` 或省略槽位表示空视角。`lam_camera_key` 填写其中一个非空原始相机字段，用于 latent 预训练；不能选择 VLM 输入之外的相机。只读取实际选中的相机。
 
-从当前 `pi05/` 复制并扩展的两阶段策略，原 PI05 策略保持独立。
-输入仍然是 PI05 的当前图像、任务指令和离散化状态，使用原有 processor 和归一化流程。
+从当前 `pi05/` 扩展的两阶段策略：阶段一学习四个 latent action token，阶段二使用 PI05
+flow matching 学习真实动作。PI05 与 LAP 共用对齐 OpenPI 的输入输出实现。
+
+## OpenPI 输入输出对齐
+
+参考固定为 [OpenPI `215abfb217dbac7d5f1273282331b9b1866c0479`](https://github.com/Physical-Intelligence/openpi/tree/215abfb217dbac7d5f1273282331b9b1866c0479)，
+图像训练增强采用其 PyTorch 实现。仓库中的 baseline 和阶段二脚本对齐官方 `pi05_libero`
+配方的输入输出；动作 horizon、学习率、有效 batch、训练步数与留出评估按训练入口配置。
+
+| 项目 | 当前实现 |
+| --- | --- |
+| 文本 | 官方 PaliGemma SentencePiece；清理下划线和换行；BOS、单独编码的末尾换行、截断和 padding 与官方相同 |
+| 状态 | LAP 默认 `discrete_state_input=false`，与 `pi05_libero` 相同；启用时先归一化实际状态维度，再按官方 256 bins 写入 prompt，补齐维度不写入文本 |
+| 图像槽位 | 固定顺序 `base_0_rgb`、`left_wrist_0_rgb`、`right_wrist_0_rgb`；LIBERO 使用前两路，第三路零图像且 mask=false |
+| 图像数值 | 浮点图像先按官方方式转 uint8，PIL bilinear 等比例 resize/居中补零，随后转换到 `[-1,1]` |
+| 图像增强 | 仅训练时使用官方 PyTorch 裁剪、旋转和颜色增强；wrist 不做几何增强；验证和推理关闭；LAM teacher 始终使用未增强图像 |
+| 状态/动作归一化 | `(x-q01)/(q99-q01+1e-6)*2-1`，反归一化也保留相同 epsilon 和计算顺序 |
+| 动作训练输出 | 实际动作先归一化再补零到模型的 32 维，flow matching 对全部 32 维取平均，包括补齐维度 |
+| 动作推理输出 | 模型产生 32 维动作，截取真实动作维度并反归一化；LIBERO 输出 `[B,H,7]`，其中 H 为入口配置的 `policy.chunk_size` |
+| 扩展词表 | 保留 Gemma embedding 类型及 `sqrt(hidden_size)` 缩放，原词表权重和原 token 表示不变 |
+
+普通 `PI05Config` 的 `discrete_state_input` 仍按官方通用 PI05 默认为 `true`；LIBERO 应明确设为
+`false`。动作步数不跟随官方配方强制设为 10：`policy.chunk_size` 决定训练和推理的 horizon，
+`policy.n_action_steps` 决定一次执行多少步（不能超过 chunk_size）。两者由训练入口的参数或
+配置决定；未显式覆盖时沿用源 checkpoint 的配置，通用配置默认均为 50。
+模型 action dim=32，LIBERO 原始 state/action 分别为 8/7 维。
+`dataset/config.json` 明确映射主相机和腕部相机，关闭额外的数据集增强及 ImageNet 归一化。
+自定义数据的相机含义、动作坐标系、单位和统计量仍必须由实际数据正确提供。
+
+首次使用会缓存官方公开的 `paligemma_tokenizer.model`，也可用
+`--policy.tokenizer_model_path=/path/to/paligemma_tokenizer.model` 指定文件。
+所有路径均校验 SHA256：`8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6`。
+保存时复制为 checkpoint 内的 `openpi_tokenizer.model`，迁移机器后优先读取这个文件。
+文本输入不再依赖 HF tokenizer 的 regex 行为。
+
+本轮实验从 PI05-base 重新训练，不支持此前实现生成的旧 LAP 模型，也不进行旧 embedding
+权重换算。当前实现保存的 LAP checkpoint 可用于阶段二初始化或正常断点续训。
 
 ## 配置
 
@@ -16,7 +51,10 @@ JSON 中每个数据集的 `camera_fields` 把 VLM 视角映射到数据集原�
 | `policy.training_stage` | `post-training` | `pre-training` 或 `post-training` |
 | `policy.lam_model_path` | `null` | UniVLA stage-2 LAM 的本地 `.ckpt` 文件，仅预训练需要 |
 | `policy.lam_camera_key` | `null` | 单个 RGB 相机全名或短名，省略时自动选主视角 |
-| `policy.tokenizer_path` | `google/paligemma-3b-pt-224` | 初始化时使用的 PaliGemma tokenizer 目录或 Hub ID |
+| `policy.tokenizer_path` | `google/paligemma-3b-pt-224` | latent token ID 注册用的 PaliGemma HF tokenizer 目录或 Hub ID |
+| `policy.tokenizer_model_path` | `null` | 官方文本 SentencePiece `.model` 文件，省略时自动缓存 |
+| `policy.discrete_state_input` | `false` | 是否把归一化状态写入 prompt，LIBERO 官方设为 false |
+| `policy.image_augmentation` | `true` | 训练时使用 OpenPI PyTorch 图像增强 |
 | `policy.gradient_accumulation` | `1` | 累计多少个每卡 batch 后更新一次，预训练和后训练均支持 |
 | `policy.attention_backend` | `eager` | 训练注意力：`eager`、`sdpa`、`flash_attention_2` |
 
@@ -43,7 +81,7 @@ Flash 路径按原始 block mask 打包：观测 prefix 双向、动作块能看
 PI0 状态 token 独立成块，LAP latent suffix 逐 token 因果。padding token 不作为 key，
 其 query 输出置零且不参与监督；真实 token 的注意力关系不变。不会额外降低精度，
 原有 FP32 权重、FP32 norm/视觉模块和 BF16 autocast 设置继续生效。
-默认 `eager` 和动作推理/KV cache 路径保持不变，旧 checkpoint 不需要转换。
+默认 `eager` 和动作推理/KV cache 路径保持不变。切换注意力后端不需要转换权重。
 
 融合内核的浮点累加顺序与 eager 不同，不能保证逐位相同或仅靠单元测试保证最终任务成功率。
 本仓库提供前向、loss、梯度、因果泄漏和重计算一致性测试，以及真正调用 CUDA Flash
@@ -62,14 +100,14 @@ CPU 测试会跳过真实 CUDA 用例；CPU 打包测试只使用数学参考内
 
 本地 tokenizer 传目录，例如 `--policy.tokenizer_path=/mnt/models/paligemma-tokenizer`，
 目录内应有 `tokenizer.json`、`tokenizer_config.json` 等 tokenizer 文件。
-必须使用与 PI05 权重匹配的 PaliGemma tokenizer；该路径同时用于文本 processor 和
-latent 词表初始化，并覆盖原 PI05 processor 配置中保存的 Hub ID。
+必须使用与 PI05 权重匹配的 PaliGemma tokenizer；该路径只用于 latent 词表初始化。
+文本 processor 始终使用上面的官方 SentencePiece 模型。
 从 LAP checkpoint 继续训练或做动作微调时，自动使用其中保存的 `latent_tokenizer/` 和 ID 映射，
 无需再提供原始 tokenizer 路径。
 
 ## 预训练
 
-必须从原 PI05 checkpoint 初始化，也可从已有 PI05 LAP checkpoint 继续。
+从原 PI05-base checkpoint 初始化，也可从当前实现生成的 PI05 LAP checkpoint 继续。
 `--policy.type=pi05_lap --policy.path=<PI05目录>` 会继承源 checkpoint 的模型配置，
 再应用命令行覆盖；源目录需有 LeRobot 的 `config.json`、`model.safetensors` 和 processor 文件。
 
@@ -95,10 +133,10 @@ LAM 在每个 CUDA 进程上以冻结 FP32 模式在线生成 codebook 索引 `0
 checkpoint 同时保存 `latent_tokenizer/` 和 `latent_action_tokens.json`，后者记录准确的 ID 映射。
 加载 LAP checkpoint 时验证两者一致，严格恢复已训练 embedding、LM head 和其他权重。
 原始 PI05 权重加载时仅初始化新增词表行；加载失败直接报错。
-加载器兼容旧 checkpoint 中 `vision_tower.vision_model.*` 到当前 `vision_tower.*` 的名称变化，
+从 PI05-base 初始化时处理 `vision_tower.vision_model.*` 到当前 `vision_tower.*` 的名称变化，
 仅映射当前模型中确实存在的目标 key，并继续严格检查缺失项、额外项和 tensor shape。
-原始 checkpoint 的 `config.json` 保持 `type: pi05`，processor 中的 Google tokenizer 名称也无需手工改写；
-启动参数 `policy.type=pi05_lap`、`policy.tokenizer_path=...` 会负责配置转换和 tokenizer 覆盖。
+原始 PI05-base 的 `config.json` 保持 `type: pi05`，其 processor 也无需手工改写；
+加载器负责配置转换，将原生状态拼接和 HF 文本 tokenizer 步骤替换为官方输入流程。
 
 共享 `pi_gemma.py` 对策略已构造的四维注意力 mask 直接使用，保留 prefix 和 latent suffix 的
 注意力关系；需要自动构造 causal mask 时，按 Transformers 实际接口决定是否传入
@@ -122,20 +160,29 @@ checkpoint 同时保存 `latent_tokenizer/` 和 `latent_action_tokens.json`，�
 
 后训练可以设置 `--eval_steps=1000`，并在数据 JSON 中设置 `"eval_split": 0.05`，
 每隔 1000 步对留出 episode 中所有完整 horizon 执行动作推理，记录动作 RMSE、
-夹爪准确率和累计增量误差（总指标和各数据集指标）。夹爪暂按 `{-1, +1}`、阈值 0；
+夹爪准确率和累计增量误差（单数据集只记总指标，多数据集额外记各来源指标）。夹爪暂按 `{-1, +1}`、阈值 0；
 7/14 维动作分别按单臂/双臂计算，排除补齐维度和不足 H 的末尾。
 评估使用真实的完整推理与反归一化流程，不设固定 10 组上限。
 详见 [后训练评估说明](../../../../docs/dataset_config.md#后训练中的完整动作推理评估)。
 
 ## 启动
 
-安装依赖：`uv sync --extra training --extra pi05-lap`。
-仓库根目录的 `train_pi05_lap.sh` 为单命令续训模板：从 `checkpoints/last` 恢复，
-保留 checkpoint 中的预训练、LAM、相机、H 和优化器配置，训练到累计 50 万步。
-修改其中 `config_path` 后运行：
+安装依赖：`uv sync --locked --extra training --extra pi05-lap`。
+仓库根目录的 `train_pi05_lap.sh` 从原生 PI05-base 开始 baseline，
+`train_pi05_lap_s2.sh` 从当前实现重新生成的 latent 预训练结果开始阶段二，两者均为新训练。
+阶段二脚本的 `policy.path` 默认指向 `PI05-lap-pretrain-openpi/checkpoints/last/pretrained_model`，
+需与本轮阶段一实际保存路径一致。
+输出目录和实验名以 `-openpi` 区分已有实验，不覆盖旧训练。
+两份脚本使用同一数据配置、batch=4、梯度累积=8（单卡有效 batch=32）、
+FP32 模型参数配合 BF16 autocast、FlashAttention、视觉编码器可训练、30000 次优化器更新，
+峰值学习率 `2.5e-5`，warmup=1000，cosine decay 到第 30000 步的 `2.5e-6`。
+这些训练超参数为本项目对照实验设置，不声称与官方完整训练配方相同。
+按服务器实际位置修改模型、tokenizer 和数据路径后运行：
 
 ```bash
-sh train_pi05_lap.sh
+bash train_pi05_lap.sh --policy.chunk_size=12 --policy.n_action_steps=12
+# 阶段二使用当前实现的预训练权重，并按需要指定动作步数：
+bash train_pi05_lap_s2.sh --policy.chunk_size=12 --policy.n_action_steps=12
 ```
 
 启动脚本选中的数据 JSON 使用 `"video_backend": "pyav"`。如果 TorchCodec 报
@@ -151,11 +198,11 @@ sh train_pi05_lap.sh
 ```bash
 pip install -e '.[training,pi05-lap]'
 swanlab login
-sh train_pi05_lap.sh
+bash train_pi05_lap.sh
 ```
 
 使用 uv 管理环境时可运行 `uv sync --extra training --extra pi05-lap`，
-然后用 `uv run swanlab login` 和 `uv run sh train_pi05_lap.sh`。
+然后用 `uv run swanlab login` 和 `uv run bash train_pi05_lap.sh`。
 
 新训练或其他策略使用同一组参数即可：
 

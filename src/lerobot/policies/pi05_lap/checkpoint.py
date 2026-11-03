@@ -68,7 +68,9 @@ def load_student_state(policy, source, *, source_type: str, **hub_args):
         state = policy._fix_pytorch_state_dict_keys(state, policy.config)
     state = {k if k.startswith("model.") else f"model.{k}": v for k, v in state.items()}
     expected = policy.state_dict()
-    state = _remap_vision_tower_keys(state, expected)
+    if source_type == "pi05":
+        # Native PI05-base can use SigLIP's outer vision_model wrapper.
+        state = _remap_vision_tower_keys(state, expected)
     # safetensors omits one copy of a tied input/output tensor. Only this known alias
     # may be absent; all other missing or unexpected tensors are fatal.
     vlm = policy.model.paligemma_with_expert.paligemma

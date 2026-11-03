@@ -1,29 +1,39 @@
 #!/usr/bin/env bash
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-# config_path 必须指向 pretrained_model/train_config.json。
-# 续训无需 policy.path，LAM 和 tokenizer 配置从 checkpoint 读取。
-# 数据配置选择下方 JSON；新增数据集就在 JSON 的 datasets 中添加一个配置块。
-# 不传 dataset.config_path 则沿用 checkpoint 内保存的数据配置快照。
-# 首次切换到 SwanLab 会创建新实验，之后的 checkpoint 会自动保存并复用实验 ID。
+# 从原生 PI05-base 开始的动作微调 baseline（新训练，不恢复优化器）。
+# 与 train_pi05_lap_s2.sh 使用相同的 LIBERO 输入输出、训练参数和数据划分。
+# policy.tokenizer_path 只用于 latent token ID；文本输入使用官方 SentencePiece 模型。
+# 动作步数由入口参数/配置决定，例如追加 --policy.chunk_size=12 --policy.n_action_steps=12。
 
 args=(
   --policy.type=pi05_lap
   --policy.path=/tmp/gmodels/PI05-base
   --policy.training_stage=post-training
   --policy.tokenizer_path=/gaowenbin/models/tokenizers/paligemma-tokenizer
+  --policy.push_to_hub=false
+  --policy.discrete_state_input=false
+  --policy.image_augmentation=true
+  --policy.use_relative_actions=false
+  --policy.max_action_dim=32
+  --policy.max_state_dim=32
+  --policy.dtype=float32
+  --policy.freeze_vision_encoder=false
+  --policy.train_expert_only=false
   --policy.attention_backend=flash_attention_2
   --policy.freeze_vision_encoder=true
   --policy.gradient_checkpointing=false
   --policy.push_to_hub=false
   --policy.chunk_size=12
   --policy.n_action_steps=12
-  --policy.optimizer_lr=1e-4
+  --policy.optimizer_lr=1e-5
   --policy.scheduler_warmup_steps=1000
   --policy.scheduler_decay_steps=30000
-  --policy.scheduler_decay_lr=1e-5
-  --eval_steps=200
+  --policy.scheduler_decay_lr=1e-6
+  --resume=false
+  --output_dir=/gaowenbin/models/trained_models/PI05-lap-baseline-openpi
+  --eval_steps=2000
   --steps=30000
   --save_freq=10000
   --batch_size=4
@@ -35,7 +45,7 @@ args=(
   --swanlab.enable=true
   --swanlab.project=pi05-lap
   --swanlab.mode=online
-  --job_name=pi05-lap-pretrain-baseline
+  --job_name=pi05-lap-baseline-openpi
   --log_freq=10
 )
 
@@ -43,6 +53,6 @@ accelerate launch \
   --num_processes=1 \
   --num_machines=1 \
   --mixed_precision=bf16 \
-  --main_process_port=29501 \
+  --main_process_port="${MAIN_PROCESS_PORT:-29501}" \
   -m lerobot.scripts.lerobot_train \
-  "${args[@]}"
+  "${args[@]}" "$@"
