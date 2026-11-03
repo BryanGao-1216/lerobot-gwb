@@ -161,6 +161,23 @@ def test_evaluation_uses_full_inference_and_source_stats_without_changing_traini
     torch.testing.assert_close(noises[0], noises[1])
 
 
+def test_single_source_evaluation_does_not_duplicate_overall_metrics():
+    from accelerate import Accelerator
+
+    accelerator = Accelerator(cpu=True)
+    normalized, rows, preprocessor, postprocessor = inference_fixture()
+    loader = accelerator.prepare(DataLoader(rows[:1], batch_size=1))
+    result = evaluate_action_chunks(
+        InferencePolicy(normalized), preprocessor, postprocessor, loader, accelerator, ["libero"]
+    )
+    assert result == {
+        "action_rmse": 2,
+        "gripper_accuracy": 1,
+        "cumulative_action_error": 4,
+        "num_action_chunks": 1,
+    }
+
+
 def test_evaluation_restores_mode_and_rng_after_failure():
     from accelerate import Accelerator
 

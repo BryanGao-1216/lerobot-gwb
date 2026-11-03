@@ -95,6 +95,10 @@ class _NormalizationMixin:
     device: torch.device | str | None = None
     dtype: torch.dtype | None = None
     eps: float = 1e-8
+    # OpenPI adds epsilon to every quantile denominator (also during inversion).
+    quantile_epsilon: float | None = None
+    # Ignore batch-collation padding during normalization, then pad with exact zeros.
+    normalize_before_padding: bool = False
     normalize_observation_keys: set[str] | None = None
     # Select source statistics for deployment of a mixed-dataset checkpoint.
     # During training the batch supplies dataset_index for every sample.
@@ -263,6 +267,10 @@ class _NormalizationMixin:
             },
             "norm_map": {ft_type.value: norm_mode.value for ft_type, norm_mode in self.norm_map.items()},
         }
+        if self.quantile_epsilon is not None:
+            config["quantile_epsilon"] = self.quantile_epsilon
+        if self.normalize_before_padding:
+            config["normalize_before_padding"] = True
         if self.normalize_observation_keys is not None:
             config["normalize_observation_keys"] = sorted(self.normalize_observation_keys)
         if self.dataset_index is not None:
@@ -300,11 +308,23 @@ class _NormalizationMixin:
             if ids.numel() not in (1, tensor.shape[0]):
                 raise ValueError("dataset_index length must match the batch size.")
             batch_ids = ids.to(tensor.device).expand(tensor.shape[0])
+            padding = (
+                transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(f"{key}_dim_is_pad")
+                if self.normalize_before_padding and not inverse
+                else None
+            )
+            if padding is not None:
+                padding = torch.as_tensor(padding, device=tensor.device, dtype=torch.bool)
+                padding = padding.expand(tensor.shape[0], -1)
             result = tensor.clone()
             for source_id in unique_ids:
                 selected = batch_ids == source_id
-                result[selected] = self._apply_transform(
-                    tensor[selected], f"dataset_{source_id}/{key}", feature_type, inverse=inverse
+                result[selected] = self._transform_with_padding(
+                    tensor[selected],
+                    f"dataset_{source_id}/{key}",
+                    feature_type,
+                    padding=padding[selected] if padding is not None else None,
+                    inverse=inverse,
                 )
             return result
 
@@ -344,10 +364,16 @@ class _NormalizationMixin:
             if feature.type != FeatureType.ACTION and key in new_observation:
                 # Convert to tensor but preserve original dtype for adaptation logic
                 tensor = torch.as_tensor(new_observation[key])
-                new_observation[key] = self._apply_transform(tensor, key, feature.type, inverse=inverse)
+                new_observation[key] = self._transform_with_padding(
+                    tensor,
+                    key,
+                    feature.type,
+                    padding=observation.get(f"{key}_dim_is_pad"),
+                    inverse=inverse,
+                )
         return new_observation
 
-    def _normalize_action(self, action: Tensor, inverse: bool) -> Tensor:
+    def _normalize_action(self, action: Tensor, inverse: bool, padding: Tensor | None = None) -> Tensor:
         # Convert to tensor but preserve original dtype for adaptation logic
         """
         Applies (un)normalization to an action tensor.
@@ -359,11 +385,34 @@ class _NormalizationMixin:
         Returns:
             The transformed action tensor.
         """
-        processed_action = self._apply_transform(action, ACTION, FeatureType.ACTION, inverse=inverse)
+        processed_action = self._transform_with_padding(
+            action, ACTION, FeatureType.ACTION, padding=padding, inverse=inverse
+        )
         return processed_action
 
+    def _transform_with_padding(self, tensor, key, feature_type, *, padding=None, inverse=False):
+        if inverse or not self.normalize_before_padding or padding is None:
+            return self._apply_transform(tensor, key, feature_type, inverse=inverse)
+        padding = torch.as_tensor(padding, device=tensor.device, dtype=torch.bool)
+        padding = padding.expand(tensor.shape[0], -1)
+        if padding.shape != (tensor.shape[0], tensor.shape[-1]):
+            raise ValueError(f"{key}_dim_is_pad must match the batch and feature dimensions.")
+        result = torch.zeros_like(tensor)
+        for row, row_padding in enumerate(padding):
+            valid_dims = ~row_padding
+            result[row, ..., valid_dims] = self._apply_transform(
+                tensor[row, ..., valid_dims], key, feature_type, valid_dims=valid_dims
+            )
+        return result
+
     def _apply_transform(
-        self, tensor: Tensor, key: str, feature_type: FeatureType, *, inverse: bool = False
+        self,
+        tensor: Tensor,
+        key: str,
+        feature_type: FeatureType,
+        *,
+        inverse: bool = False,
+        valid_dims: Tensor | None = None,
     ) -> Tensor:
         """
         Core logic to apply a normalization or unnormalization transformation to a tensor.
@@ -408,10 +457,17 @@ class _NormalizationMixin:
                 self.to(device=tensor.device, dtype=tensor.dtype)
 
         stats = self._tensor_stats[key]
+        if valid_dims is not None:
+            stats = {
+                name: value[..., valid_dims]
+                if name != "count" and value.ndim > 0 and value.shape[-1] == valid_dims.numel()
+                else value
+                for name, value in stats.items()
+            }
 
         if norm_mode == NormalizationMode.MEAN_STD:
-            mean = stats.get("mean", None)
-            std = stats.get("std", None)
+            mean = stats.get("mean")
+            std = stats.get("std")
             if mean is None or std is None:
                 raise ValueError(
                     "MEAN_STD normalization mode requires mean and std stats, please update the dataset with the correct stats"
@@ -425,8 +481,8 @@ class _NormalizationMixin:
             return (tensor - mean) / denom
 
         if norm_mode == NormalizationMode.MIN_MAX:
-            min_val = stats.get("min", None)
-            max_val = stats.get("max", None)
+            min_val = stats.get("min")
+            max_val = stats.get("max")
             if min_val is None or max_val is None:
                 raise ValueError(
                     "MIN_MAX normalization mode requires min and max stats, please update the dataset with the correct stats"
@@ -447,25 +503,30 @@ class _NormalizationMixin:
             return 2 * (tensor - min_val) / denom - 1
 
         if norm_mode == NormalizationMode.QUANTILES:
-            q01 = stats.get("q01", None)
-            q99 = stats.get("q99", None)
+            q01 = stats.get("q01")
+            q99 = stats.get("q99")
             if q01 is None or q99 is None:
                 raise ValueError(
                     "QUANTILES normalization mode requires q01 and q99 stats, please update the dataset with the correct stats using the `augment_dataset_quantile_stats.py` script"
                 )
 
             denom = q99 - q01
-            # Avoid division by zero by adding epsilon when quantiles are identical
-            denom = torch.where(
-                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
-            )
+            if self.quantile_epsilon is not None:
+                denom = denom + self.quantile_epsilon
+                if inverse:
+                    return (tensor + 1.0) / 2.0 * denom + q01
+                return (tensor - q01) / denom * 2.0 - 1.0
+            else:
+                denom = torch.where(
+                    denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
+                )
             if inverse:
                 return (tensor + 1.0) * denom / 2.0 + q01
             return 2.0 * (tensor - q01) / denom - 1.0
 
         if norm_mode == NormalizationMode.QUANTILE10:
-            q10 = stats.get("q10", None)
-            q90 = stats.get("q90", None)
+            q10 = stats.get("q10")
+            q90 = stats.get("q90")
             if q10 is None or q90 is None:
                 raise ValueError(
                     "QUANTILE10 normalization mode requires q10 and q90 stats, please update the dataset with the correct stats using the `augment_dataset_quantile_stats.py` script"
@@ -550,7 +611,8 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
         if not isinstance(action, PolicyAction):
             raise ValueError(f"Action should be a PolicyAction type got {type(action)}")
 
-        new_transition[TransitionKey.ACTION] = self._normalize_action(action, inverse=False)
+        padding = new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(f"{ACTION}_dim_is_pad")
+        new_transition[TransitionKey.ACTION] = self._normalize_action(action, inverse=False, padding=padding)
 
         return new_transition
 

@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, Unpack
 
 import torch
@@ -172,19 +174,45 @@ def make_pre_post_processors(
     """
     if pretrained_path:
         preprocessor_overrides = kwargs.get("preprocessor_overrides", {})
-        if policy_cfg.type == "pi05_lap":
-            # Native PI05 checkpoints and LAP checkpoints use different registered
-            # state-to-prompt step names, with identical preprocessing behavior.
+        openpi_tokenizer = None
+        if policy_cfg.type in {"pi05", "pi05_lap"}:
+            # Native PI05-base prompt steps are replaced by the pinned OpenPI
+            # pipeline; current LAP checkpoints already save that pipeline.
+            from .common.openpi_io import OpenPITokenizerProcessorStep, resolve_tokenizer_model
             from .pi05 import processor_pi05 as _pi05_processor  # noqa: F401
-            from .pi05_lap.processor_pi05_lap import pi05_lap_tokenizer_override
 
-            preprocessor_overrides = {
-                **(preprocessor_overrides or {}),
-                "tokenizer_processor": {
-                    **(preprocessor_overrides or {}).get("tokenizer_processor", {}),
-                    **pi05_lap_tokenizer_override(policy_cfg, pretrained_path, pretrained_revision),
-                },
+            model = resolve_tokenizer_model(
+                policy_cfg.tokenizer_model_path, str(pretrained_path), revision=pretrained_revision
+            )
+            policy_cfg.tokenizer_model_path = str(model)
+            openpi_tokenizer = OpenPITokenizerProcessorStep(
+                tokenizer_model_path=str(model),
+                max_length=policy_cfg.tokenizer_max_length,
+                discrete_state_input=policy_cfg.discrete_state_input,
+            )
+
+            filename = kwargs.get("preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json")
+            saved = Path(pretrained_path) / filename
+            if not saved.is_file():
+                from huggingface_hub import hf_hub_download
+
+                saved = Path(hf_hub_download(str(pretrained_path), filename, revision=pretrained_revision))
+            names = {entry.get("registry_name") for entry in json.loads(saved.read_text())["steps"]}
+            token_key = (
+                "openpi_tokenizer_processor"
+                if "openpi_tokenizer_processor" in names
+                else "tokenizer_processor"
+            )
+            preprocessor_overrides = dict(preprocessor_overrides or {})
+            old_overrides = preprocessor_overrides.pop("tokenizer_processor", {})
+            token_overrides = {
+                **old_overrides,
+                "tokenizer_name": None,
+                "tokenizer": openpi_tokenizer.input_tokenizer,
             }
+            if token_key == "openpi_tokenizer_processor":
+                token_overrides["tokenizer_model_path"] = str(model)
+            preprocessor_overrides[token_key] = token_overrides
 
         if isinstance(policy_cfg, GrootConfig):
             from .groot.processor_groot import make_groot_pre_post_processors_from_pretrained
@@ -225,6 +253,12 @@ def make_pre_post_processors(
             revision=pretrained_revision,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        if openpi_tokenizer is not None:
+            from .common.openpi_io import reconcile_openpi_processors
+
+            preprocessor, postprocessor = reconcile_openpi_processors(
+                policy_cfg, preprocessor, postprocessor, openpi_tokenizer
+            )
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
 

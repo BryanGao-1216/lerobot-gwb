@@ -213,7 +213,7 @@ wallx = [
     "torchdiffeq>=0.2.4,<0.3.0",
     "lerobot[qwen-vl-utils-dep]",
 ]
-pi = ["lerobot[transformers-dep]", "lerobot[scipy-dep]"]
+pi = ["lerobot[transformers-dep]", "lerobot[scipy-dep]", "sentencepiece>=0.2.0,<0.3.0"]
 molmoact2 = ["lerobot[transformers-dep]", "lerobot[peft-dep]", "lerobot[scipy-dep]"]
 smolvla = ["lerobot[transformers-dep]", "num2words>=0.5.14,<0.6.0", "lerobot[accelerate-dep]"]
 pi05-lap = ["lerobot[pi]"]

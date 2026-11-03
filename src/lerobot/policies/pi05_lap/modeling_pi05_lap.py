@@ -50,7 +50,6 @@ from lerobot.utils.constants import (
 )
 
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
-from ..common.masked_loss import reduce_action_loss
 from ..common.pi_attention import PiAttentionLayout, pi_attention_forward, prepare_pi_attention
 from ..common.vla_utils import (
     clone_past_key_values,
@@ -58,7 +57,6 @@ from ..common.vla_utils import (
     make_att_2d_masks,
     pad_vector,
     prepare_attention_masks_4d,
-    resize_with_pad_torch,
 )
 from ..pretrained import PreTrainedPolicy
 from ..rtc.modeling_rtc import RTCProcessor
@@ -861,8 +859,11 @@ class PI05LAPPolicy(PreTrainedPolicy):
         return model
 
     def _save_pretrained(self, save_directory: Path, state_dict: dict[str, Tensor] | None = None):
+        from ..common.openpi_io import save_tokenizer_model
+
         super()._save_pretrained(save_directory, state_dict=state_dict)
         self.latent_vocabulary.save_pretrained(save_directory)
+        save_tokenizer_model(self.config, save_directory)
 
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config
@@ -997,76 +998,9 @@ class PI05LAPPolicy(PreTrainedPolicy):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
-        """Preprocess images for the model.
+        from ..common.openpi_io import prepare_openpi_images
 
-        Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
-        PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
-        """
-        images = []
-        img_masks = []
-
-        # A configuration with no camera slots deliberately uses only the text/state prefix.
-        if not self.config.image_features:
-            return images, img_masks
-
-        # Get device from model parameters
-        device = next(self.parameters()).device
-
-        present_img_keys = [key for key in self.config.image_features if key in batch]
-        missing_img_keys = [key for key in self.config.image_features if key not in batch]
-
-        if len(present_img_keys) == 0:
-            raise ValueError(
-                f"All image features are missing from the batch. At least one expected. "
-                f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
-            )
-
-        # Preprocess image features present in the batch
-        for key in present_img_keys:
-            img = batch[key]
-
-            # Ensure tensor is on the same device as the model
-            if img.device != device:
-                img = img.to(device)
-
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
-                img = img.to(torch.float32)
-
-            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
-
-            if is_channels_first:
-                # Convert [B, C, H, W] to [B, H, W, C] for processing
-                img = img.permute(0, 2, 3, 1)
-
-            # from openpi preprocess_observation_pytorch: Resize with padding if needed
-            if img.shape[1:3] != self.config.image_resolution:
-                img = resize_with_pad_torch(img, *self.config.image_resolution)
-
-            # Normalize from [0,1] to [-1,1] as expected by siglip
-            img = img * 2.0 - 1.0
-
-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
-            if is_channels_first:
-                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
-
-            images.append(img)
-            # Create mask (all ones for real images)
-            bsize = img.shape[0]
-            mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            if f"{key}_is_pad" in batch:
-                mask = ~batch[f"{key}_is_pad"].to(device=device, dtype=torch.bool).reshape(bsize)
-            img_masks.append(mask)
-
-        # Create image features not present in the batch as fully 0 padded images
-        for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
-            mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
-            images.append(img)
-            img_masks.append(mask)
-
-        return images, img_masks
+        return prepare_openpi_images(self, batch)
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1150,12 +1084,7 @@ class PI05LAPPolicy(PreTrainedPolicy):
         # Compute loss (no separate state needed for PI05LAP)
         losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
 
-        # Truncate losses to actual action dimensions
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
-
-        if "action_dim_is_pad" in batch:
-            return reduce_action_loss(losses, batch["action_dim_is_pad"], reduction)
+        # OpenPI supervises every model action dimension, including padded zeros.
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),

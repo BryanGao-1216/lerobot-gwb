@@ -23,15 +23,10 @@ import torch
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
-    AbsoluteActionsProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
     ProcessorStepRegistry,
-    RelativeActionsProcessorStep,
-    TokenizerProcessorStep,
-    make_default_policy_processor_steps,
-    make_policy_processor_pipelines,
 )
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import OBS_STATE
@@ -43,7 +38,9 @@ from .configuration_pi05 import PI05Config
 @dataclass
 class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
     """
-    Processor step to prepare the state and tokenize the language input.
+    Native PI05-base state-to-prompt step used only for checkpoint deserialization.
+
+    New and reconciled pipelines use OpenPITokenizerProcessorStep instead.
     """
 
     max_state_dim: int = 32
@@ -95,61 +92,6 @@ def make_pi05_pre_post_processors(
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
-    """
-    Constructs pre-processor and post-processor pipelines for the PI0 policy.
+    from ..common.openpi_io import make_openpi_processors
 
-    The pre-processing pipeline prepares input data for the model by:
-    1. Renaming features to match pretrained configurations.
-    2. Normalizing input and output features based on dataset statistics.
-    3. Adding a batch dimension.
-    4. Appending a newline character to the task description for tokenizer compatibility.
-    5. Tokenizing the text prompt using the PaliGemma tokenizer.
-    6. Moving all data to the specified device.
-
-    The post-processing pipeline handles the model's output by:
-    1. Moving data to the CPU.
-    2. Unnormalizing the output features to their original scale.
-
-    Args:
-        config: The configuration object for the PI0 policy.
-        dataset_stats: A dictionary of statistics for normalization.
-        preprocessor_kwargs: Additional arguments for the pre-processor pipeline.
-        postprocessor_kwargs: Additional arguments for the post-processor pipeline.
-
-    Returns:
-        A tuple containing the configured pre-processor and post-processor pipelines.
-    """
-
-    relative_step = RelativeActionsProcessorStep(
-        enabled=config.use_relative_actions,
-        exclude_joints=getattr(config, "relative_exclude_joints", []),
-        action_names=getattr(config, "action_feature_names", None),
-    )
-
-    steps = make_default_policy_processor_steps(config, dataset_stats)
-
-    # OpenPI order: raw → relative → normalize → model → unnormalize → absolute
-    input_steps: list[ProcessorStep] = [
-        steps.rename_observations,  # To mimic the same processor as pretrained one
-        steps.add_batch_dim,
-        relative_step,
-        # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
-        # because the tokenizer step expects normalized state in [-1, 1] range for discretization
-        steps.normalize,
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
-        TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
-            max_length=config.tokenizer_max_length,
-            padding_side="right",
-            padding="max_length",
-        ),
-        steps.to_device,
-    ]
-
-    output_steps: list[ProcessorStep] = [
-        steps.unnormalize,
-        AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
-        steps.to_cpu,
-    ]
-
-    return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)
+    return make_openpi_processors(config, dataset_stats)

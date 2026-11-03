@@ -1,8 +1,10 @@
 {
   "video_backend": "pyav",
   "return_uint8": true,
-  "use_imagenet_stats": true,
-  "image_transforms": {"enable": false},
+  "use_imagenet_stats": false,
+  "image_transforms": {
+    "enable": false
+  },
   "eval_split": 0.05,
   "tolerance_s": 0.0001,
   "datasets": {
@@ -10,11 +12,20 @@
       "repo_id": "libero_only",
       "root": "/gaowenbin/datasets/libero",
       "weight": 1.0,
-      "action_fields": [{"key": "action"}],
-      "state_fields": [{"key": "observation.state"}],
+      "action_fields": [
+        {
+          "key": "action"
+        }
+      ],
+      "state_fields": [
+        {
+          "key": "observation.state"
+        }
+      ],
       "camera_fields": {
-        "observation.images.image": "observation.images.image",
-        "observation.images.image2": "observation.images.image2"
+        "observation.images.base_0_rgb": "observation.images.image",
+        "observation.images.left_wrist_0_rgb": "observation.images.image2",
+        "observation.images.right_wrist_0_rgb": null
       },
       "lam_camera_key": "observation.images.image"
     }

@@ -167,7 +167,12 @@ def evaluate_action_chunks(
     overall = totals.sum(0)
     if overall[-1] == 0:
         raise ValueError("No complete action chunks are available for evaluation.")
-    for name, values in [("", overall), *zip(source_names, totals, strict=True)]:
+    summaries = [("", overall)]
+    # A single source is identical to the overall result. Logging both would
+    # create duplicate charts for every metric in SwanLab/W&B.
+    if len(source_names) > 1:
+        summaries.extend(zip(source_names, totals, strict=True))
+    for name, values in summaries:
         if values[-1] == 0:
             continue
         prefix = f"{name}/" if name else ""
