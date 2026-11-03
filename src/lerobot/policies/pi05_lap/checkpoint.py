@@ -61,6 +61,7 @@ def checkpoint_type(source, **hub_args) -> str:
 
 
 def load_student_state(policy, source, *, source_type: str, **hub_args):
+    import torch
     from safetensors.torch import load_file
 
     state = load_file(str(checkpoint_file(source, "model.safetensors", **hub_args)))
@@ -74,7 +75,18 @@ def load_student_state(policy, source, *, source_type: str, **hub_args):
     # safetensors omits one copy of a tied input/output tensor. Only this known alias
     # may be absent; all other missing or unexpected tensors are fatal.
     vlm = policy.model.paligemma_with_expert.paligemma
-    if source_type == "pi05" or vlm.get_input_embeddings().weight is vlm.get_output_embeddings().weight:
+    tied = vlm.get_input_embeddings().weight is vlm.get_output_embeddings().weight
+    if (
+        tied
+        and EMBEDDING_KEY in state
+        and HEAD_KEY in state
+        and not torch.equal(state[EMBEDDING_KEY], state[HEAD_KEY])
+    ):
+        raise ValueError(
+            "Checkpoint embedding and LM head differ, but the model requires tied weights. "
+            "Restart from PI05-base instead of an untied LAP checkpoint."
+        )
+    if source_type == "pi05" or tied:
         for key, alias in ((EMBEDDING_KEY, HEAD_KEY), (HEAD_KEY, EMBEDDING_KEY)):
             if key not in state and alias in state:
                 state[key] = state[alias]

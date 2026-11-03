@@ -23,7 +23,7 @@ flow matching 学习真实动作。PI05 与 LAP 共用对齐 OpenPI 的输入输
 | 状态/动作归一化 | `(x-q01)/(q99-q01+1e-6)*2-1`，反归一化也保留相同 epsilon 和计算顺序 |
 | 动作训练输出 | 实际动作先归一化再补零到模型的 32 维，flow matching 对全部 32 维取平均，包括补齐维度 |
 | 动作推理输出 | 模型产生 32 维动作，截取真实动作维度并反归一化；LIBERO 输出 `[B,H,7]`，其中 H 为入口配置的 `policy.chunk_size` |
-| 扩展词表 | 保留 Gemma embedding 类型及 `sqrt(hidden_size)` 缩放，原词表权重和原 token 表示不变 |
+| 扩展词表 | 保留 Gemma embedding 类型及 `sqrt(hidden_size)` 缩放，原词表权重和原 token 表示不变；输入 embedding 与 LM head 按模型配置共享权重 |
 
 普通 `PI05Config` 的 `discrete_state_input` 仍按官方通用 PI05 默认为 `true`；LIBERO 应明确设为
 `false`。动作步数不跟随官方配方强制设为 10：`policy.chunk_size` 决定训练和推理的 horizon，
@@ -41,6 +41,8 @@ flow matching 学习真实动作。PI05 与 LAP 共用对齐 OpenPI 的输入输
 
 本轮实验从 PI05-base 重新训练，不支持此前实现生成的旧 LAP 模型，也不进行旧 embedding
 权重换算。当前实现保存的 LAP checkpoint 可用于阶段二初始化或正常断点续训。
+共享权重在扩词表、参数更新和保存重载后均保持绑定。若 checkpoint 中的 embedding 与
+LM head 数值不一致，加载会报错；此前未绑定版本的第一阶段需从 PI05-base 重新训练。
 
 ## 配置
 
