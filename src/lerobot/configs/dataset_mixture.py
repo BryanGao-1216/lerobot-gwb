@@ -22,6 +22,31 @@ class VectorFieldConfig:
 
 
 @dataclass
+class GripperRepresentationConfig:
+    type: str = "discrete"
+    open: float | str | None = None
+    close: float | str | None = None
+
+    def __post_init__(self) -> None:
+        if self.type not in ("discrete", "continuous"):
+            raise ValueError("gripper_representation.type must be 'discrete' or 'continuous'.")
+        if self.type == "discrete":
+            for name in ("open", "close"):
+                value = getattr(self, name)
+                if isinstance(value, bool) or value is None:
+                    raise ValueError(f"Discrete gripper_representation requires a numeric {name} value.")
+                try:
+                    value = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"gripper_representation.{name} must be numeric.") from exc
+                if not math.isfinite(value):
+                    raise ValueError(f"gripper_representation.{name} must be finite.")
+                setattr(self, name, value)
+            if self.open == self.close:
+                raise ValueError("gripper_representation.open and close must differ.")
+
+
+@dataclass
 class DatasetSourceConfig:
     repo_id: str
     root: str | None = None
@@ -31,8 +56,9 @@ class DatasetSourceConfig:
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
     # Policy-owned OpenPI image augmentation, applied only during training.
     image_augmentation: bool = True
-    # Evaluation uses pose-only errors for discrete grippers, all action dimensions for continuous ones.
-    gripper_representation: str = "discrete"  # "discrete" or "continuous"
+    # An explicit discrete mapping unifies action labels to open=-1, close=+1.
+    # Legacy strings preserve the previous labels/statistics for existing checkpoints.
+    gripper_representation: GripperRepresentationConfig | str = "discrete"
     action_fields: list[VectorFieldConfig] = field(default_factory=lambda: [VectorFieldConfig("action")])
     state_fields: list[VectorFieldConfig] = field(
         default_factory=lambda: [VectorFieldConfig("observation.state")]
@@ -54,8 +80,13 @@ class DatasetSourceConfig:
             raise ValueError(f"{self.repo_id}: weight must be finite and positive.")
         if not isinstance(self.use_relative_actions, bool) or not isinstance(self.image_augmentation, bool):
             raise ValueError("use_relative_actions and image_augmentation must be booleans.")
-        if self.gripper_representation not in ("discrete", "continuous"):
-            raise ValueError("gripper_representation must be 'discrete' or 'continuous'.")
+        if not isinstance(self.gripper_representation, GripperRepresentationConfig) and (
+            not isinstance(self.gripper_representation, str)
+            or self.gripper_representation not in ("discrete", "continuous")
+        ):
+            raise ValueError(
+                "gripper_representation must be a type/open/close object or a legacy type string."
+            )
         if not self.action_fields or not self.state_fields:
             raise ValueError("Each dataset needs action_fields and state_fields.")
         if any(
@@ -91,6 +122,18 @@ class DatasetSourceConfig:
             raise ValueError("eval_split must be in [0, 1).")
         if self.tolerance_s is not None and (not math.isfinite(self.tolerance_s) or self.tolerance_s <= 0):
             raise ValueError("tolerance_s must be finite and positive.")
+
+    @property
+    def gripper_type(self) -> str:
+        representation = self.gripper_representation
+        return representation if isinstance(representation, str) else representation.type
+
+    @property
+    def gripper_mapping(self) -> GripperRepresentationConfig | None:
+        representation = self.gripper_representation
+        if isinstance(representation, GripperRepresentationConfig) and representation.type == "discrete":
+            return representation
+        return None
 
     def resolve_lam_camera_key(self) -> str:
         """Select exactly one of the student's nonempty source cameras."""

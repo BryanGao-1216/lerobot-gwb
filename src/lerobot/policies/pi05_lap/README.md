@@ -58,7 +58,7 @@ LM head 数值不一致，加载会报错；此前未绑定版本的第一阶段
 | `policy.discrete_state_input` | `false` | 是否把归一化状态写入 prompt，LIBERO 官方设为 false |
 | `datasets.<name>.image_augmentation` | `true` | 数据集 JSON 中逐来源控制训练图像增强；验证和推理关闭 |
 | `datasets.<name>.use_relative_actions` | `false` | 数据集 JSON 中逐来源控制是否额外计算 `action - state` |
-| `datasets.<name>.gripper_representation` | `discrete` | `discrete` 沿用原夹爪准确率；`continuous` 将夹爪纳入动作 RMSE 和累计误差，不记分类准确率 |
+| `datasets.<name>.gripper_representation` | 兼容旧 `discrete` | 新配置用 `{"type":"discrete","open":-1,"close":1}`，统一开=-1/闭=+1；`{"type":"continuous"}` 保留连续值并纳入动作 RMSE 和累计误差 |
 | `policy.gradient_accumulation` | `1` | 累计多少个每卡 batch 后更新一次，预训练和后训练均支持 |
 | `policy.attention_backend` | `eager` | 训练注意力：`eager`、`sdpa`、`flash_attention_2` |
 
@@ -165,8 +165,10 @@ checkpoint 同时保存 `latent_tokenizer/` 和 `latent_action_tokens.json`，�
 后训练可以设置 `--eval_steps=1000`，并在数据 JSON 中设置 `"eval_split": 0.05`，
 每隔 1000 步对留出 episode 中所有完整 horizon 执行动作推理，记录动作 RMSE、
 夹爪准确率和累计增量误差（单数据集只记总指标，多数据集额外记各来源指标）。每个来源的
-`gripper_representation` 默认为 `discrete`，夹爪按 `{-1, +1}`、阈值 0 计算准确率；设为
-`continuous` 时，两种误差包含夹爪维度，不再记录该来源的夹爪分类准确率。
+`gripper_representation` 的对象配置通过 `type` 选择模式：`discrete` 必须提供原始 `open/close`，
+加载后统一开=-1、闭=+1，并使用固定的夹爪归一化基准；评估以 0 为阈值计算准确率。
+`continuous` 不映射标签，两种误差包含夹爪维度，不再记录该来源的夹爪分类准确率。
+旧字符串配置仍按旧行为读取，便于恢复历史 checkpoint。
 7/14 维动作分别按单臂/双臂计算，排除补齐维度和不足 H 的末尾。
 评估使用真实的完整推理与反归一化流程，不设固定 10 组上限。
 详见 [后训练评估说明](../../../../docs/dataset_config.md#后训练中的完整动作推理评估)。

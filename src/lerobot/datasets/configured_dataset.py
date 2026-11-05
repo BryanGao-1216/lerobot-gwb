@@ -23,6 +23,8 @@ from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .sampler import EpisodeAwareSampler, WeightedDatasetSampler
 
+_NEUTRAL_VECTOR_STATS = {"mean": 0, "std": 1, "min": -1, "max": 1, "q01": -1, "q99": 1, "q10": -1, "q90": 1}
+
 
 def _vector_indices(fields: list[VectorFieldConfig], features: dict) -> list[tuple[str, list[int]]]:
     result = []
@@ -48,7 +50,6 @@ def _vector_stats(meta, fields, size: int, mode: NormalizationMode) -> dict:
         NormalizationMode.QUANTILE10: ("q10", "q90"),
     }[mode]
     # Neutral statistics keep padded zero components exactly zero after normalization.
-    neutral = {"mean": 0, "std": 1, "min": -1, "max": 1, "q01": -1, "q99": 1, "q10": -1, "q90": 1}
     result = {"count": torch.tensor([meta.total_frames])}
     for stat in required:
         values = []
@@ -62,18 +63,65 @@ def _vector_stats(meta, fields, size: int, mode: NormalizationMode) -> dict:
         combined = torch.cat(values)
         if not torch.isfinite(combined).all():
             raise ValueError(f"{meta.repo_id}: non-finite {stat} normalization statistics.")
-        result[stat] = F.pad(combined, (0, size - len(combined)), value=neutral[stat])
+        result[stat] = F.pad(combined, (0, size - len(combined)), value=_NEUTRAL_VECTOR_STATS[stat])
     return result
 
 
-def _relative_action_mask(source, meta, action_fields, state_fields, size):
+def _gripper_indices(source, meta, action_fields) -> list[int]:
+    if source.gripper_mapping is None:
+        return []
+    action_dim = sum(len(indices) for _, indices in action_fields)
+    if action_dim in (7, 14):
+        return list(range(6, action_dim, 7))
+    # Also support explicitly named gripper fields in other vector layouts.
+    result, offset = [], 0
+    for key, indices in action_fields:
+        names = meta.features[key].get("names")
+        if names and isinstance(names[0], list):
+            names = names[0]
+        for index in indices:
+            name = names[index] if names and len(names) == meta.features[key]["shape"][0] else key
+            if "gripper" in key.lower() or "gripper" in str(name).lower():
+                result.append(offset)
+            offset += 1
+    if not result:
+        raise ValueError(
+            f"{source.repo_id}: discrete gripper mapping requires 7/14-D actions "
+            "or action fields/components named 'gripper'."
+        )
+    return result
+
+
+def _map_discrete_gripper(action, source, indices):
+    mapping = source.gripper_mapping
+    if mapping is None:
+        return action
+    values = action[..., indices]
+    endpoints = values.new_tensor([mapping.open, mapping.close])
+    is_open = torch.isclose(values, endpoints[0], rtol=0, atol=1e-6)
+    is_closed = torch.isclose(values, endpoints[1], rtol=0, atol=1e-6)
+    if (is_open & is_closed).any() or not (is_open | is_closed).all():
+        raise ValueError(
+            f"{source.repo_id}: discrete gripper labels must match open={mapping.open}, "
+            f"close={mapping.close}; found {values.unique().tolist()}."
+        )
+    action[..., indices] = torch.where(is_open, -1.0, 1.0)
+    return action
+
+
+def _relative_action_mask(source, meta, action_fields, state_fields, size, gripper_indices=()):
     mask = []
     excluded = [name.lower() for name in source.relative_exclude_joints if name]
     for key, indices in action_fields:
         names = meta.features[key].get("names")
+        if names and isinstance(names[0], list):
+            names = names[0]
         for index in indices:
             name = names[index] if names is not None and len(names) == meta.features[key]["shape"][0] else key
             mask.append(source.use_relative_actions and not any(token in name.lower() for token in excluded))
+    # Canonical discrete commands must not be changed by action-state conversion.
+    for index in gripper_indices:
+        mask[index] = False
     state_dim = sum(len(indices) for _, indices in state_fields)
     if any(mask[state_dim:]):
         raise ValueError(
@@ -221,6 +269,8 @@ class ConfiguredDataset(torch.utils.data.Dataset):
                     value = value[0]
                 values.append(value[..., indices])
             value = torch.cat(values, dim=-1)
+            if target == ACTION:
+                value = _map_discrete_gripper(value, source, self.schema.gripper_indices[name])
             item[target] = F.pad(value, (0, size - value.shape[-1]))
             item[f"{target}_dim_is_pad"] = torch.arange(size) >= value.shape[-1]
         item["action_is_pad"] = torch.stack(
@@ -274,6 +324,7 @@ def make_configured_datasets(cfg):
         for name, source in sources.items()
     }
     action_fields, state_fields, cameras, stats = {}, {}, [], {}
+    gripper_indices = {}
     lam_camera_keys = {}
     action_dim, state_dim = 0, 0
     episode_offsets, episode_offset = {}, 0
@@ -282,6 +333,7 @@ def make_configured_datasets(cfg):
         meta = metadata[name]
         action_fields[name] = _vector_indices(source.action_fields, meta.features)
         state_fields[name] = _vector_indices(source.state_fields, meta.features)
+        gripper_indices[name] = _gripper_indices(source, meta, action_fields[name])
         action_dim = max(action_dim, sum(len(i) for _, i in action_fields[name]))
         state_dim = max(state_dim, sum(len(i) for _, i in state_fields[name]))
         episode_offsets[name], episode_offset = episode_offset, episode_offset + meta.total_episodes
@@ -317,7 +369,7 @@ def make_configured_datasets(cfg):
     for source_index, (name, source) in enumerate(sources.items()):
         meta = metadata[name]
         relative_action_masks[str(source_index)] = _relative_action_mask(
-            source, meta, action_fields[name], state_fields[name], action_dim
+            source, meta, action_fields[name], state_fields[name], action_dim, gripper_indices[name]
         )
         for key, fields, size, feature_type in (
             (ACTION, action_fields[name], action_dim, FeatureType.ACTION),
@@ -326,6 +378,12 @@ def make_configured_datasets(cfg):
             mode = NormalizationMode(policy.normalization_mapping.get(feature_type.value, "IDENTITY"))
             # Prefixes are understood by the regular normalizer and saved in its safetensors.
             stats[f"dataset_{source_index}/{key}"] = _vector_stats(meta, fields, size, mode)
+            if key == ACTION and gripper_indices[name]:
+                # Fixed canonical statistics keep all discrete sources in the same
+                # model space, including one-state datasets and MEAN_STD normalization.
+                for stat, vector in stats[f"dataset_{source_index}/{key}"].items():
+                    if stat in _NEUTRAL_VECTOR_STATS:
+                        vector[gripper_indices[name]] = _NEUTRAL_VECTOR_STATS[stat]
         for camera, key in source.camera_fields.items():
             if key is None:
                 continue
@@ -341,6 +399,7 @@ def make_configured_datasets(cfg):
         state_dim=state_dim,
         action_fields=action_fields,
         state_fields=state_fields,
+        gripper_indices=gripper_indices,
         relative_action_masks=relative_action_masks,
         lam_camera_keys=lam_camera_keys,
         image_resolution=policy.image_resolution,

@@ -54,7 +54,7 @@ uv run python -m lerobot.scripts.convert_dataset_v21_to_v30 \
       "weight": 1.0,
       "use_relative_actions": false,
       "image_augmentation": true,
-      "gripper_representation": "discrete",
+      "gripper_representation": {"type": "discrete", "open": "-1", "close": "1"},
       "action_fields": [{"key": "action"}],
       "state_fields": [{"key": "observation.state"}],
       "camera_fields": {
@@ -69,7 +69,7 @@ uv run python -m lerobot.scripts.convert_dataset_v21_to_v30 \
       "weight": 3.0,
       "use_relative_actions": false,
       "image_augmentation": false,
-      "gripper_representation": "continuous",
+      "gripper_representation": {"type": "continuous"},
       "action_fields": [
         {"key": "action.delta_pose", "indices": [0, 1, 2, 3, 4, 5]},
         {"key": "action.gripper"}
@@ -91,9 +91,9 @@ uv run python -m lerobot.scripts.convert_dataset_v21_to_v30 \
 | --- | --- |
 | `weight` | 正数，相对抽样权重。上例两个数据集约占 25% 和 75%，不再乘以数据集帧数。 |
 | `use_relative_actions` | 默认 `false`，直接使用数据中保存的动作。只有存储绝对动作、需要额外计算 `action - state` 时才设为 `true`。 |
-| `relative_exclude_joints` | 默认 `["gripper"]`，启用动作转换时，按动作维度名或源字段名排除对应分量；`[]` 表示转换全部真实动作维度。 |
+| `relative_exclude_joints` | 默认 `["gripper"]`，启用动作转换时，按动作维度名或源字段名排除对应分量；`[]` 表示转换其他全部真实动作维度。显式映射的离散夹爪始终排除，不做 `action - state`。 |
 | `image_augmentation` | 默认 `true`，只对该数据集的训练样本执行策略内的 OpenPI 图像增强。验证和推理均不增强。 |
-| `gripper_representation` | `"discrete"`（默认）或 `"continuous"`，逐数据集选择评估方式。连续夹爪参与 RMSE 和累计误差，不记录开合准确率；不会转换或二值化训练标签。 |
+| `gripper_representation` | 对象配置：`{"type":"discrete","open":-1,"close":1}` 或 `{"type":"continuous"}`。离散模式需填写原始开、闭数值，读取后统一为开=-1、闭=+1。连续模式保持标签不变，夹爪参与 RMSE 和累计误差，不记录分类准确率。 |
 | `action_fields` | 按列表顺序读取并拼接为 `action`；`indices` 可选，从 0 开始，用于选取或重排维度。 |
 | `state_fields` | 同样按顺序拼接为 `observation.state`。 |
 | `camera_fields` | **左边是统一 VLM 视角槽位，右边填数据集内的原始相机字段**；左侧必须以 `observation.images.` 开头。右侧允许 `null` 或 `""` 表示空视角，也可以省略不用的槽位。 |
@@ -144,6 +144,22 @@ uv run python -m lerobot.scripts.convert_dataset_v21_to_v30 \
 
 ## 不同维度与归一化
 
+每个来源的离散夹爪配置填写**原始标签**的物理含义。例如一个来源开=1、闭=0，另一个来源开=-1、闭=1：
+
+```json
+{
+  "dataset_a": {"gripper_representation": {"type": "discrete", "open": "1", "close": "0"}},
+  "dataset_b": {"gripper_representation": {"type": "discrete", "open": -1, "close": 1}},
+  "dataset_c": {"gripper_representation": {"type": "continuous"}}
+}
+```
+
+数字和数字字符串均支持；离散的 `open/close` 必须是不同的有限值。先按 `action_fields` 拼接、重排，再将夹爪动作映射为**开=-1、闭=+1**，随后补齐和归一化。7 维使用索引 6，14 维使用 6、13；其他动作布局需要字段或维度名明确包含 `gripper`。遇到不匹配所配开/闭值的离散标签会报错，不会按未知阈值猜测类别。
+
+映射后的夹爪使用统一归一化基准：mean=0、std=1，下界=-1、上界=1（含 quantile/min-max）。这样不同来源的归一化统计量、开闭占比或单一夹爪状态都不会把统一标签再次变成不同的模型表示。位姿与 state 继续使用各来源原有统计量，磁盘上的 metadata/stats 不会被改写；state 中可能是连续传感器读数，因此不套用 action 的夹爪映射。推理反归一化后仍输出统一的夹爪表示，机器人接口需要其他编码时再按物理含义转换。
+
+旧的 `"discrete"` / `"continuous"` 字符串配置仍可读取；旧离散字符串保持原标签和统计量，不启用新增映射，以兼容历史 checkpoint。新实验请使用对象配置并为每个离散来源明确填写 `open/close`。当前 `dataset/config.json` 的两份 LIBERO 配置按开=-1、闭=1 填写；若某份数据相反，应修改对应来源的数值。
+
 每个来源用自己的 `use_relative_actions` 和 `image_augmentation` 控制动作转换和训练图像增强；使用 JSON 入口时，这两个来源级设置优先于同名 `policy` 参数，训练脚本无需再传全局开关。当前 LIBERO 的动作已是相对动作，因此 `dataset/config.json` 设置 `use_relative_actions=false`、`image_augmentation=true`。
 
 启用 `use_relative_actions` 后，在字段选择和拼接完成后、归一化之前，对未排除的真实动作维度计算 `action - state`。动作与状态对应位置必须具有相同含义；缺少所需状态维度会报错。混合 batch 按每条样本的来源选择转换掩码；推理反归一化后仅对启用转换的来源加回缓存的原始 state，返回该数据集原有的动作表示。归一化仍读取来源 metadata 的统计量，启用转换时需确保这些统计量适用于转换后的训练动作。
@@ -193,7 +209,7 @@ PI05 和 PI05 LAP 的动作后训练使用现有 `eval_steps` 控制评估间隔
 
 评估使用无图像增强的验证观测、任务和状态，调用当前模型的 `predict_action_chunk`，按 `policy.num_inference_steps` 完成全部 flow-matching 迭代。真实 action 不作为模型输入。预测动作经过原有后处理，按每条样本的来源反归一化后，与原始标签比较。固定每个样本的初始推理噪声，并在评估结束后恢复训练模式与随机数状态。多进程下去掉末批为对齐而重复的样本，每条验证 chunk 只计一次。
 
-每臂约定为 6 维增量动作和 1 维夹爪，支持有效动作维度 7 或 14。混合 batch 中 LIBERO 补齐到 14 维的后半部分不计算指标。位姿部分使用增量动作；每个来源通过 `gripper_representation` 指定夹爪表示方式，省略时沿用离散 `{-1, +1}` 的评估。
+每臂约定为 6 维增量动作和 1 维夹爪，支持有效动作维度 7 或 14。混合 batch 中 LIBERO 补齐到 14 维的后半部分不计算指标。位姿部分使用增量动作；每个来源通过 `gripper_representation.type` 指定夹爪表示方式。显式离散映射的验证标签与反归一化预测均使用开=-1、闭=+1；省略时沿用旧离散评估。
 
 | 指标名称 | `discrete` | `continuous` |
 | --- | --- | --- |
@@ -201,7 +217,7 @@ PI05 和 PI05 LAP 的动作后训练使用现有 `eval_steps` 控制评估间隔
 | `gripper_accuracy` | 预测和标签均以 `>0` 为一类、`<=0` 为另一类；7 维用索引 6，14 维用 6、13，按 H 和夹爪数量平均。值域为 0～1。 | 不记录此分类指标。 |
 | `cumulative_action_error` | 每个有效位姿维度沿 H 求和，计算预测累计值与标签累计值之差的绝对值，再平均六维和有效臂。 | 同样沿 H 求和，夹爪也参与累计误差，再平均七维和有效臂。 |
 
-对于 14 维连续夹爪数据，在其 JSON 来源块中添加 `"gripper_representation": "continuous"` 即可；动作顺序应为 `[臂1位姿6维, 臂1夹爪, 臂2位姿6维, 臂2夹爪]`。该设置只选择评估维度，不改变模型、训练 loss、归一化或原始动作标签。
+对于 14 维连续夹爪数据，在其 JSON 来源块中添加 `"gripper_representation": {"type": "continuous"}` 即可；动作顺序应为 `[臂1位姿6维, 臂1夹爪, 臂2位姿6维, 臂2夹爪]`。连续模式只选择评估维度，不改变连续标签或其归一化统计量。
 
 先计算每条 chunk 的适用指标，再按 chunk 数量平均。单数据集时，SwanLab 和终端只记录总指标，例如 `eval/action_rmse`，以及 `eval/num_action_chunks`；不再记录数值相同的 `eval/libero/action_rmse` 等重复指标。多数据集时，同时记录总指标与分来源指标，例如 `eval/action_rmse`、`eval/libero/action_rmse`、`eval/aloha_boil/gripper_accuracy`，以及对应的 `num_action_chunks`。总体误差是所有验证 chunk 按各自表示方式计算后的平均，不使用训练抽样权重；总体 `gripper_accuracy` 仅统计离散来源的 chunk。全部来源均为连续夹爪时，不输出 `gripper_accuracy`，也不会向 SwanLab 写入无意义的零值或 NaN。
 

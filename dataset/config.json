@@ -14,7 +14,11 @@
       "weight": 1.0,
       "use_relative_actions": false,
       "image_augmentation": true,
-      "gripper_representation": "discrete",
+      "gripper_representation": {
+        "type": "discrete",
+        "open": -1,
+        "close": 1
+      },
       "action_fields": [
         {
           "key": "action"
@@ -38,7 +42,11 @@
       "weight": 1.0,
       "use_relative_actions": false,
       "image_augmentation": true,
-      "gripper_representation": "discrete",
+      "gripper_representation": {
+        "type": "discrete",
+        "open": -1,
+        "close": 1
+      },
       "action_fields": [
         {
           "key": "action"

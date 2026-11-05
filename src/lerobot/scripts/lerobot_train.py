@@ -764,7 +764,7 @@ def _train_with_logger(cfg: TrainPipelineConfig, accelerator: "Accelerator", exp
         if is_eval_step and action_chunk_eval:
             source_names = list(eval_dataset.sources) if cfg.dataset.datasets else [cfg.dataset.repo_id]
             gripper_representations = (
-                [cfg.dataset.datasets[name].gripper_representation for name in source_names]
+                [cfg.dataset.datasets[name].gripper_type for name in source_names]
                 if cfg.dataset.datasets
                 else None
             )

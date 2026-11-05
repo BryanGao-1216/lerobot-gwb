@@ -13,8 +13,11 @@ import torch
 from torch.utils.data import default_collate
 
 from lerobot.common.action_chunk_eval import full_horizon_indices
+from lerobot.configs.dataset_mixture import DatasetSourceConfig
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.configs.types import FeatureType, NormalizationMode
+from lerobot.datasets.configured_dataset import _gripper_indices, _map_discrete_gripper
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.dataset_reader import DatasetReader
 from lerobot.datasets.factory import make_train_eval_datasets
@@ -326,6 +329,59 @@ def test_per_source_normalization_and_checkpoint(source_payload, tmp_path):
     deployed(without_id)
 
 
+@pytest.mark.parametrize("mode", [NormalizationMode.QUANTILES, NormalizationMode.MEAN_STD])
+def test_discrete_gripper_sources_share_raw_and_normalized_commands(source_payload, mode):
+    payload = deepcopy(source_payload)
+    payload["datasets"]["source0"]["gripper_representation"] = {"type": "discrete", "open": "1", "close": "0"}
+    payload["datasets"]["source1"]["gripper_representation"] = {"type": "discrete", "open": 0, "close": 1}
+    cfg = config(payload, "post-training")
+    cfg.policy.normalization_mapping[FeatureType.ACTION.value] = mode
+    ds, _ = make_train_eval_datasets(cfg)
+    # Both examples are open at t and closed at t+1, despite opposite raw encodings.
+    batch = default_collate([ds[1], ds[8]])
+    expected = torch.tensor([-1.0, 1.0])
+    torch.testing.assert_close(batch["action"][0, :, 3], expected)
+    torch.testing.assert_close(batch["action"][1, :, 5], expected)
+    assert batch["observation.state"][0, :2].tolist() == [10, 11]
+    assert batch["action"][0, 0, :3].tolist() == [12, 11, 10]
+    assert batch["action"][0, :, 4:].count_nonzero() == 0
+    # Source metadata statistics stay untouched; only the mapped schema uses canonical stats.
+    assert ds.children[0][1].meta.stats["gripper"]["mean"][0] == 0.5
+    normalizer = NormalizerProcessorStep(
+        features=dataset_to_policy_features(ds.meta.features),
+        norm_map=cfg.policy.normalization_mapping,
+        stats=ds.meta.stats,
+    )
+    normalized = normalizer(batch_to_transition(batch))
+    action = transition_to_batch(normalized)["action"]
+    torch.testing.assert_close(action[0, :, 3], expected)
+    torch.testing.assert_close(action[1, :, 5], expected)
+    inverse = UnnormalizerProcessorStep(**normalizer.get_config(), stats=ds.meta.stats)
+    torch.testing.assert_close(transition_to_batch(inverse(normalized))["action"], batch["action"])
+
+
+@pytest.mark.parametrize("dimension", [7, 14])
+def test_arm_gripper_mapping_rejects_unknown_commands_and_leaves_continuous_values(dimension):
+    source = draccus.decode(
+        DatasetSourceConfig,
+        {"repo_id": "robot", "gripper_representation": {"type": "discrete", "open": "1", "close": "-1"}},
+    )
+    meta = SimpleNamespace(features={"action": {"shape": (dimension,)}})
+    indices = _gripper_indices(source, meta, [("action", list(range(dimension)))])
+    action = torch.full((2, dimension), 0.25)
+    action[0, indices], action[1, indices] = 1, -1
+    mapped = _map_discrete_gripper(action.clone(), source, indices)
+    assert (mapped[0, indices] == -1).all() and (mapped[1, indices] == 1).all()
+    assert (mapped[:, [i for i in range(dimension) if i not in indices]] == 0.25).all()
+    action[0, indices] = 0.5
+    with pytest.raises(ValueError, match="discrete gripper labels"):
+        _map_discrete_gripper(action.clone(), source, indices)
+    continuous = draccus.decode(
+        DatasetSourceConfig, {"repo_id": "robot", "gripper_representation": {"type": "continuous"}}
+    )
+    torch.testing.assert_close(_map_discrete_gripper(action.clone(), continuous, []), action)
+
+
 @pytest.mark.parametrize("policy_type", ["pi05", "pi05_lap"])
 def test_source_action_settings_survive_mixed_batches_and_reload(source_payload, tmp_path, policy_type):
     from lerobot.policies.factory import make_pre_post_processors
@@ -390,6 +446,13 @@ def test_relative_source_requires_matching_state(source_payload):
     payload["datasets"]["source1"]["use_relative_actions"] = True
     with pytest.raises(ValueError, match="matching state components"):
         make_train_eval_datasets(config(payload, "post-training"))
+    source = payload["datasets"]["source1"]
+    source["action_fields"][0]["indices"] = [0, 1, 2, 3]
+    source["relative_exclude_joints"] = []
+    source["gripper_representation"] = {"type": "discrete", "open": 0, "close": 1}
+    ds, _ = make_train_eval_datasets(config(payload, "post-training"))
+    # Canonical grippers are excluded even when the user converts every other action to relative.
+    assert ds.meta.relative_action_masks["1"] == [True, True, True, True, False]
 
 
 @pytest.mark.parametrize("training", [False, True])
@@ -473,14 +536,21 @@ def test_eval_interval_validates_effective_source_splits(source_payload, monkeyp
 
 def test_manifest_snapshot_and_reload(source_payload, tmp_path):
     source_payload = deepcopy(source_payload)
+    source_payload["datasets"]["source0"]["gripper_representation"] = {
+        "type": "discrete",
+        "open": "1",
+        "close": "0",
+    }
     source_payload["datasets"]["source1"]["gripper_representation"] = "continuous"
     path = tmp_path / "train.json"
     path.write_text(json.dumps(source_payload))
     loaded = DatasetConfig(config_path=str(path)).resolve_file()
     assert loaded.datasets["source1"].weight == 3
-    assert loaded.datasets["source0"].gripper_representation == "discrete"
+    assert loaded.datasets["source0"].gripper_type == "discrete"
     saved = draccus.decode(DatasetConfig, draccus.encode(loaded))
     assert saved.datasets["source1"].gripper_representation == "continuous"
+    assert saved.datasets["source0"].gripper_mapping.open == 1
+    assert saved.datasets["source0"].gripper_mapping.close == 0
     payload = deepcopy(source_payload)
     payload["datasets"]["source1"]["weight"] = 9
     path.write_text(json.dumps(payload))
@@ -795,6 +865,15 @@ def test_invalid_source_and_missing_field_errors(source_payload):
     payload["datasets"]["source0"]["weight"] = -1
     with pytest.raises(draccus.utils.ParsingError):
         config(payload)
+    for representation in (
+        {"type": "discrete", "open": -1},
+        {"type": "discrete", "open": 1, "close": 1},
+        {"type": "discrete", "open": "nan", "close": 1},
+    ):
+        payload = deepcopy(source_payload)
+        payload["datasets"]["source0"]["gripper_representation"] = representation
+        with pytest.raises(draccus.utils.ParsingError):
+            config(payload)
     payload = deepcopy(source_payload)
     payload["datasets"]["source0"]["gripper_representation"] = "binary"
     with pytest.raises(draccus.utils.ParsingError):
