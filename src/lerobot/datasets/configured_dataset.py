@@ -67,6 +67,32 @@ def _vector_stats(meta, fields, size: int, mode: NormalizationMode) -> dict:
     return result
 
 
+def _vector_names(feature: dict) -> list[str] | None:
+    """Resolve vector component names from the metadata's list or mapping layouts."""
+    names = feature.get("names")
+    dimension = feature["shape"][0]
+    if isinstance(names, dict):
+        values = list(names.values())
+        if values and all(isinstance(value, (list, tuple)) for value in values):
+            # Category -> component names, e.g. {"motors": ["x", "gripper"]}.
+            names = [name for group in values for name in group]
+        elif values and all(isinstance(value, int) and not isinstance(value, bool) for value in values):
+            # Component name -> index; dictionary insertion order is not the vector order.
+            if sorted(values) != list(range(dimension)):
+                return None
+            names = [name for name, _ in sorted(names.items(), key=lambda item: item[1])]
+        elif set(names) == {str(index) for index in range(dimension)}:
+            names = [names[str(index)] for index in range(dimension)]
+        else:
+            return None
+    if isinstance(names, (list, tuple)):
+        if len(names) == 1 and isinstance(names[0], (list, tuple)):
+            names = names[0]
+        if len(names) == dimension and all(isinstance(name, str) for name in names):
+            return list(names)
+    return None
+
+
 def _gripper_indices(source, meta, action_fields) -> list[int]:
     if source.gripper_mapping is None:
         return []
@@ -76,11 +102,9 @@ def _gripper_indices(source, meta, action_fields) -> list[int]:
     # Also support explicitly named gripper fields in other vector layouts.
     result, offset = [], 0
     for key, indices in action_fields:
-        names = meta.features[key].get("names")
-        if names and isinstance(names[0], list):
-            names = names[0]
+        names = _vector_names(meta.features[key])
         for index in indices:
-            name = names[index] if names and len(names) == meta.features[key]["shape"][0] else key
+            name = names[index] if names is not None else key
             if "gripper" in key.lower() or "gripper" in str(name).lower():
                 result.append(offset)
             offset += 1
@@ -113,11 +137,9 @@ def _relative_action_mask(source, meta, action_fields, state_fields, size, gripp
     mask = []
     excluded = [name.lower() for name in source.relative_exclude_joints if name]
     for key, indices in action_fields:
-        names = meta.features[key].get("names")
-        if names and isinstance(names[0], list):
-            names = names[0]
+        names = _vector_names(meta.features[key])
         for index in indices:
-            name = names[index] if names is not None and len(names) == meta.features[key]["shape"][0] else key
+            name = names[index] if names is not None else key
             mask.append(source.use_relative_actions and not any(token in name.lower() for token in excluded))
     # Canonical discrete commands must not be changed by action-state conversion.
     for index in gripper_indices:

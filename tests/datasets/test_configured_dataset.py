@@ -17,7 +17,7 @@ from lerobot.configs.dataset_mixture import DatasetSourceConfig
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.configs.types import FeatureType, NormalizationMode
-from lerobot.datasets.configured_dataset import _gripper_indices, _map_discrete_gripper
+from lerobot.datasets.configured_dataset import _gripper_indices, _map_discrete_gripper, _relative_action_mask
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.dataset_reader import DatasetReader
 from lerobot.datasets.factory import make_train_eval_datasets
@@ -380,6 +380,35 @@ def test_arm_gripper_mapping_rejects_unknown_commands_and_leaves_continuous_valu
         DatasetSourceConfig, {"repo_id": "robot", "gripper_representation": {"type": "continuous"}}
     )
     torch.testing.assert_close(_map_discrete_gripper(action.clone(), continuous, []), action)
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ["x", "y", "z", "gripper"],
+        [["x", "y", "z", "gripper"]],
+        {"motors": ["x", "y", "z", "gripper"]},
+        {"gripper": 3, "z": 2, "x": 0, "y": 1},
+        {"3": "gripper", "2": "z", "0": "x", "1": "y"},
+    ],
+    ids=["flat", "nested", "category", "name-to-index", "index-to-name"],
+)
+def test_metadata_names_preserve_gripper_and_relative_mask_after_reordering(names):
+    source = draccus.decode(
+        DatasetSourceConfig,
+        {
+            "repo_id": "robot",
+            "use_relative_actions": True,
+            "gripper_representation": {"type": "discrete", "open": 0, "close": 1},
+        },
+    )
+    meta = SimpleNamespace(features={"action": {"shape": (4,), "names": names}})
+    actions, states = [("action", [3, 2, 0])], [("observation.state", [0, 1, 2])]
+    assert _gripper_indices(source, meta, actions) == [0]
+    # Names must follow the selected components, not dictionary insertion order.
+    assert _relative_action_mask(source, meta, actions, states, 5) == [False, True, True, False, False]
+    source.use_relative_actions = False
+    assert _relative_action_mask(source, meta, actions, states, 5) == [False] * 5
 
 
 @pytest.mark.parametrize("policy_type", ["pi05", "pi05_lap"])

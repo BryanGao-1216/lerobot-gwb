@@ -44,8 +44,8 @@
       "image_augmentation": true,
       "gripper_representation": {
         "type": "discrete",
-        "open": -1,
-        "close": 1
+        "open": 1,
+        "close": 0
       },
       "action_fields": [
         {
