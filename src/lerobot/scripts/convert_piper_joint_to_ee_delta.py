@@ -15,10 +15,8 @@ Input order: [left joint1..joint6, gripper, right joint1..joint6, gripper].
 Input joint angles are radians. Output per arm is [dx, dy, dz, drx, dry, drz, gripper]:
   xyz = (p(action[t]) - p(observation.state[t])) / 0.05 metres;
   rotation = rotvec(R(action[t]) @ R(observation.state[t]).T) / 0.5 radians;
-  gripper = -1 (open) if the raw absolute target is > 0.01, otherwise +1 (closed).
-This default signed gripper encoding follows the LIBERO control interface. For
-LIBERO datasets stored as 1=open/0=closed, use --gripper-encoding zero-one. The
-same 0.01 threshold is applied before either encoding; equality means closed.
+  gripper = the original continuous absolute target, in its original units.
+Gripper values retain their recorded precision and small negative zero offsets.
 The six pose components are dimensionless: 1 means 0.05 m or 0.5 rad, respectively.
 The endpoint is link6 (flange), expressed in that arm's base frame. Pose values
 are scaled without clipping. The dataset FPS and action time span are preserved;
@@ -77,8 +75,6 @@ JOINT_COLUMNS = np.array([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12])
 COMPONENTS = ["delta_x", "delta_y", "delta_z", "delta_rx", "delta_ry", "delta_rz", "gripper"]
 POSITION_SCALE_M = 0.05
 ROTATION_SCALE_RAD = 0.5
-GRIPPER_OPEN_THRESHOLD = 0.01
-GRIPPER_ENCODINGS = {"signed": (-1.0, 1.0), "zero-one": (1.0, 0.0)}  # (open, closed)
 
 
 class PiperFK:
@@ -177,9 +173,8 @@ def repair_spikes(values, episodes, frames, limits, margin, feature):
     return repairs
 
 
-def delta_actions(state, action, fk, batch_size, gripper_encoding="signed"):
-    """Return both arms' scaled pose deltas and binary LIBERO gripper commands."""
-    open_value, closed_value = GRIPPER_ENCODINGS[gripper_encoding]
+def delta_actions(state, action, fk, batch_size):
+    """Return both arms' scaled pose deltas and original continuous gripper targets."""
     result = np.empty_like(action)
     for start in tqdm(range(0, len(action), batch_size), desc="Batched flange FK"):
         stop = min(start + batch_size, len(action))
@@ -193,9 +188,7 @@ def delta_actions(state, action, fk, batch_size, gripper_encoding="signed"):
             result[start:stop, offset + 3 : offset + 6] = (
                 fk.rotation.from_matrix(relative).as_rotvec() / ROTATION_SCALE_RAD
             )
-            result[start:stop, offset + 6] = np.where(
-                action[start:stop, offset + 6] > np.float32(GRIPPER_OPEN_THRESHOLD), open_value, closed_value
-            )
+            result[start:stop, offset + 6] = action[start:stop, offset + 6]
     if not np.isfinite(result).all():
         raise ValueError("FK produced non-finite actions.")
     return result
@@ -334,7 +327,6 @@ def convert_dataset(
     batch_size=16384,
     joint_limit_margin_deg=5.0,
     copy_videos=False,
-    gripper_encoding="signed",
 ):
     started = time.perf_counter()
     root, urdf = Path(root).expanduser().resolve(), Path(urdf).expanduser().resolve()
@@ -342,8 +334,6 @@ def convert_dataset(
         raise ValueError("batch_size must be positive and joint_limit_margin_deg finite and non-negative.")
     if in_place and output_dir is not None:
         raise ValueError("Choose either --in-place or --output-dir.")
-    if gripper_encoding not in GRIPPER_ENCODINGS:
-        raise ValueError(f"Unknown gripper encoding: {gripper_encoding}")
     destination = (
         root
         if in_place
@@ -413,13 +403,12 @@ def convert_dataset(
         repairs.extend(
             repair_spikes(values, episodes, frames, fk.limits, np.deg2rad(joint_limit_margin_deg), key)
         )
-    converted = delta_actions(state, action, fk, batch_size, gripper_encoding)
+    converted = delta_actions(state, action, fk, batch_size)
     del action
     info.features[ACTION] = {
         **info.features[ACTION],
         "names": [f"{side}_{component}" for side in ("left", "right") for component in COMPONENTS],
     }
-    open_value, closed_value = GRIPPER_ENCODINGS[gripper_encoding]
     report = {
         "converter": Path(__file__).name,
         "urdf": str(urdf),
@@ -428,7 +417,7 @@ def convert_dataset(
         "joint_units": "radians",
         "target_frame": "link6",
         "coordinate_frame": "per-arm base_link",
-        "action_representation": "libero_scaled_delta",
+        "action_representation": "libero_scaled_pose_delta_continuous_gripper",
         "position_delta": f"(p(action[t]) - p(observation.state[t])) / {POSITION_SCALE_M}; dimensionless",
         "rotation_delta": (
             f"rotvec(R(action[t]) @ R(observation.state[t]).T) / {ROTATION_SCALE_RAD}; dimensionless"
@@ -437,14 +426,8 @@ def convert_dataset(
         "rotation_scale_rad": ROTATION_SCALE_RAD,
         "pose_clipping": False,
         "fps": info.fps,
-        "gripper": (
-            f"raw absolute action value > {GRIPPER_OPEN_THRESHOLD}: {open_value} (open); "
-            f"otherwise {closed_value} (closed)"
-        ),
-        "gripper_encoding": gripper_encoding,
-        "gripper_open_threshold": GRIPPER_OPEN_THRESHOLD,
-        "gripper_open_value": open_value,
-        "gripper_closed_value": closed_value,
+        "gripper": "original continuous absolute action value preserved in source units",
+        "gripper_encoding": "continuous",
         "observation_state": "joint positions with spikes repaired; continuous gripper readings preserved",
         "joint_limit_margin_deg": joint_limit_margin_deg,
         "repairs": repairs,
@@ -506,12 +489,6 @@ def main():
         help="Margin beyond URDF limits for detecting bad joints (default: 5 degrees)",
     )
     parser.add_argument("--copy-videos", action="store_true", help="Copy videos instead of trying hard links")
-    parser.add_argument(
-        "--gripper-encoding",
-        choices=GRIPPER_ENCODINGS,
-        default="signed",
-        help="signed: -1=open/+1=closed; zero-one: 1=open/0=closed (default: signed)",
-    )
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
     convert_dataset(**vars(parser.parse_args()))
 
