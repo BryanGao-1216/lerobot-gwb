@@ -24,6 +24,7 @@ values) are replaced by the mean of their immediate good neighbours in the same
 episode, independently in action and observation.state. Boundary/consecutive bad
 samples raise an error. State otherwise stays in joint space; velocity/effort stay
 as recorded. Both episode and global statistics for the changed fields are rebuilt.
+Quantiles are computed directly from all samples, including exact zero-heavy data.
 Task text has underscores replaced with spaces in both the task table and episode
 summaries. Identical resulting tasks are merged and frame task indices are remapped.
 
@@ -54,7 +55,7 @@ try:
 except ImportError as exc:
     raise ImportError("Install dataset dependencies with: uv sync --locked --extra dataset") from exc
 
-from lerobot.datasets.compute_stats import get_feature_stats
+from lerobot.datasets.compute_stats import DEFAULT_QUANTILES
 from lerobot.datasets.io_utils import load_info, load_stats, load_tasks, write_info, write_stats, write_tasks
 from lerobot.utils.import_utils import require_package
 from lerobot.utils.io_utils import write_json
@@ -192,10 +193,17 @@ def feature_stats(values):
     values = values.astype(np.float64)
     if values.ndim == 1:
         values = values[:, None]
-    stats = get_feature_stats(values, axis=0, keepdims=False)
-    # E[x**2] - E[x]**2 loses precision for nearly stationary joints.
-    stats["std"] = values.std(axis=0)
-    return stats
+    # Histogram interpolation smears a point mass at zero across its bin. All
+    # numeric samples are already in memory, so use exact global/episode quantiles.
+    quantiles = np.quantile(values, DEFAULT_QUANTILES, axis=0)
+    return {
+        "min": values.min(axis=0),
+        "max": values.max(axis=0),
+        "mean": values.mean(axis=0),
+        "std": values.std(axis=0),
+        "count": np.array([len(values)]),
+        **{f"q{int(q * 100):02d}": value for q, value in zip(DEFAULT_QUANTILES, quantiles, strict=True)},
+    }
 
 
 def normalize_tasks(root):
