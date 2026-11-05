@@ -472,11 +472,15 @@ def test_eval_interval_validates_effective_source_splits(source_payload, monkeyp
 
 
 def test_manifest_snapshot_and_reload(source_payload, tmp_path):
+    source_payload = deepcopy(source_payload)
+    source_payload["datasets"]["source1"]["gripper_representation"] = "continuous"
     path = tmp_path / "train.json"
     path.write_text(json.dumps(source_payload))
     loaded = DatasetConfig(config_path=str(path)).resolve_file()
     assert loaded.datasets["source1"].weight == 3
+    assert loaded.datasets["source0"].gripper_representation == "discrete"
     saved = draccus.decode(DatasetConfig, draccus.encode(loaded))
+    assert saved.datasets["source1"].gripper_representation == "continuous"
     payload = deepcopy(source_payload)
     payload["datasets"]["source1"]["weight"] = 9
     path.write_text(json.dumps(payload))
@@ -789,6 +793,10 @@ def test_json_cli_and_resume_snapshot(source_payload, tmp_path, monkeypatch):
 def test_invalid_source_and_missing_field_errors(source_payload):
     payload = deepcopy(source_payload)
     payload["datasets"]["source0"]["weight"] = -1
+    with pytest.raises(draccus.utils.ParsingError):
+        config(payload)
+    payload = deepcopy(source_payload)
+    payload["datasets"]["source0"]["gripper_representation"] = "binary"
     with pytest.raises(draccus.utils.ParsingError):
         config(payload)
     cfg = config(source_payload)

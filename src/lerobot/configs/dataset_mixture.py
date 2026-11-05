@@ -31,6 +31,8 @@ class DatasetSourceConfig:
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
     # Policy-owned OpenPI image augmentation, applied only during training.
     image_augmentation: bool = True
+    # Evaluation uses pose-only errors for discrete grippers, all action dimensions for continuous ones.
+    gripper_representation: str = "discrete"  # "discrete" or "continuous"
     action_fields: list[VectorFieldConfig] = field(default_factory=lambda: [VectorFieldConfig("action")])
     state_fields: list[VectorFieldConfig] = field(
         default_factory=lambda: [VectorFieldConfig("observation.state")]
@@ -52,6 +54,8 @@ class DatasetSourceConfig:
             raise ValueError(f"{self.repo_id}: weight must be finite and positive.")
         if not isinstance(self.use_relative_actions, bool) or not isinstance(self.image_augmentation, bool):
             raise ValueError("use_relative_actions and image_augmentation must be booleans.")
+        if self.gripper_representation not in ("discrete", "continuous"):
+            raise ValueError("gripper_representation must be 'discrete' or 'continuous'.")
         if not self.action_fields or not self.state_fields:
             raise ValueError("Each dataset needs action_fields and state_fields.")
         if any(

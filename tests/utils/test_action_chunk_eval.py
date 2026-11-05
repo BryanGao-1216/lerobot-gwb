@@ -43,6 +43,27 @@ def test_cumulative_error_sums_before_taking_absolute_value():
     torch.testing.assert_close(actual, torch.tensor([[2.0, 1.0, 0.0]]))
 
 
+def test_continuous_grippers_include_all_real_dimensions_and_can_mix_with_discrete():
+    target = torch.zeros(2, 2, 14)
+    prediction = target.clone()
+    prediction[0, :, 6] = torch.tensor([1.0, 3.0])
+    prediction[0, :, 7:] = target[0, :, 7:] = float("nan")
+    prediction[1, :, 6], prediction[1, :, 13] = 2, 4
+    padding = torch.tensor([[False] * 7 + [True] * 7, [False] * 14])
+    expected = torch.tensor([[(5 / 7) ** 0.5, float("nan"), 4 / 7], [3 / 7**0.5, float("nan"), 6 / 7]])
+    torch.testing.assert_close(
+        action_chunk_metrics(prediction, target, padding, continuous_gripper=True),
+        expected,
+        equal_nan=True,
+    )
+    expected[0] = torch.tensor([0.0, 0.0, 0.0])
+    torch.testing.assert_close(
+        action_chunk_metrics(prediction, target, padding, continuous_gripper=torch.tensor([False, True])),
+        expected,
+        equal_nan=True,
+    )
+
+
 def test_metrics_reject_unsupported_or_noncontiguous_dimensions():
     with pytest.raises(ValueError, match="7 or 14"):
         action_chunk_metrics(torch.zeros(1, 2, 8), torch.zeros(1, 2, 8))
@@ -176,6 +197,39 @@ def test_single_source_evaluation_does_not_duplicate_overall_metrics():
         "cumulative_action_error": 4,
         "num_action_chunks": 1,
     }
+
+
+@pytest.mark.parametrize("representations", [["discrete", "continuous"], ["continuous", "continuous"]])
+def test_evaluation_logs_only_applicable_gripper_metrics_per_source(representations):
+    from accelerate import Accelerator
+
+    accelerator = Accelerator(cpu=True)
+    normalized, rows, preprocessor, postprocessor = inference_fixture()
+    loader = accelerator.prepare(DataLoader(rows, batch_size=2))
+    result = evaluate_action_chunks(
+        InferencePolicy(normalized),
+        preprocessor,
+        postprocessor,
+        loader,
+        accelerator,
+        ["single", "dual"],
+        gripper_representations=representations,
+    )
+    single_rmse = 2 if representations[0] == "discrete" else (24 / 7) ** 0.5
+    single_cumulative = 4 if representations[0] == "discrete" else 24 / 7
+    dual_rmse = ((24 / 7) ** 0.5 + (100 / 7) ** 0.5) / 2
+    assert result["dual/action_rmse"] == pytest.approx(dual_rmse)
+    assert result["dual/cumulative_action_error"] == pytest.approx(38 / 7)
+    assert result["action_rmse"] == pytest.approx((single_rmse + dual_rmse) / 2)
+    assert result["cumulative_action_error"] == pytest.approx((single_cumulative + 38 / 7) / 2)
+    assert result["num_action_chunks"] == 2
+    assert "dual/gripper_accuracy" not in result
+    if representations[0] == "discrete":
+        # The continuous source must not dilute the discrete accuracy denominator.
+        assert result["gripper_accuracy"] == result["single/gripper_accuracy"] == 1
+    else:
+        assert not any("gripper_accuracy" in key for key in result)
+    assert all(torch.isfinite(torch.tensor(value)) for value in result.values())
 
 
 def test_evaluation_restores_mode_and_rng_after_failure():

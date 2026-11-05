@@ -763,6 +763,11 @@ def _train_with_logger(cfg: TrainPipelineConfig, accelerator: "Accelerator", exp
 
         if is_eval_step and action_chunk_eval:
             source_names = list(eval_dataset.sources) if cfg.dataset.datasets else [cfg.dataset.repo_id]
+            gripper_representations = (
+                [cfg.dataset.datasets[name].gripper_representation for name in source_names]
+                if cfg.dataset.datasets
+                else None
+            )
             eval_metrics = evaluate_action_chunks(
                 policy,
                 preprocessor,
@@ -771,6 +776,7 @@ def _train_with_logger(cfg: TrainPipelineConfig, accelerator: "Accelerator", exp
                 accelerator,
                 source_names,
                 seed=cfg.seed or 0,
+                gripper_representations=gripper_representations,
             )
             if is_main_process:
                 logging.info("step %d: action evaluation %s", step, eval_metrics)

@@ -44,10 +44,14 @@ def action_chunk_metrics(
     predicted: torch.Tensor,
     target: torch.Tensor,
     dim_is_pad: torch.Tensor | None = None,
+    *,
+    continuous_gripper: bool | torch.Tensor = False,
 ) -> torch.Tensor:
     """Return [RMSE, gripper accuracy, cumulative MAE] per chunk, averaging arms equally.
 
-    Each arm is six incremental action coordinates followed by a {-1, +1} gripper.
+    Each arm is six incremental action coordinates followed by a gripper.
+    Continuous grippers participate in both error metrics and have NaN accuracy
+    (not applicable); discrete grippers keep the original pose-only errors.
     Padding is a contiguous suffix, so a mixed 14-D batch may contain 7-D samples.
     """
     if predicted.ndim != 3 or predicted.shape != target.shape or target.shape[1] < 1:
@@ -56,6 +60,11 @@ def action_chunk_metrics(
         )
     predicted, target = predicted.float(), target.to(predicted.device, dtype=torch.float32)
     batch_size, _, width = target.shape
+    continuous = torch.as_tensor(continuous_gripper, device=target.device, dtype=torch.bool)
+    if continuous.ndim == 0:
+        continuous = continuous.expand(batch_size)
+    if continuous.shape != (batch_size,):
+        raise ValueError("continuous_gripper must be a boolean or have shape [batch].")
     padding = (
         torch.zeros(batch_size, width, dtype=torch.bool, device=target.device)
         if dim_is_pad is None
@@ -78,10 +87,16 @@ def action_chunk_metrics(
         truth = target[selected, :, :dimension].reshape_as(pred)
         if not torch.isfinite(pred).all() or not torch.isfinite(truth).all():
             raise ValueError("Action evaluation encountered non-finite valid action coordinates.")
-        error = pred[..., :6] - truth[..., :6]
-        result[selected, 0] = error.square().mean(dim=(1, 3)).sqrt().mean(dim=1)
-        result[selected, 1] = ((pred[..., 6] > 0) == (truth[..., 6] > 0)).float().mean(dim=(1, 2))
-        result[selected, 2] = error.sum(dim=1).abs().mean(dim=(1, 2))
+        error = pred - truth
+        for is_continuous, coordinates in ((False, 6), (True, 7)):
+            # Select the metric dimensions per sample, including in a mixed-source batch.
+            rows = continuous[selected] == is_continuous
+            action_error = error[rows, ..., :coordinates]
+            indices = selected.nonzero().flatten()[rows]
+            result[indices, 0] = action_error.square().mean(dim=(1, 3)).sqrt().mean(dim=1)
+            result[indices, 2] = action_error.sum(dim=1).abs().mean(dim=(1, 2))
+        accuracy = ((pred[..., 6] > 0) == (truth[..., 6] > 0)).float().mean(dim=(1, 2))
+        result[selected, 1] = torch.where(continuous[selected], float("nan"), accuracy)
     return result
 
 
@@ -95,6 +110,7 @@ def evaluate_action_chunks(
     source_names: list[str],
     *,
     seed: int = 0,
+    gripper_representations: list[str] | None = None,
 ) -> dict[str, float]:
     """Run complete inference, unnormalize per source, and gather unpadded sample metrics.
 
@@ -102,11 +118,22 @@ def evaluate_action_chunks(
     The action postprocessor receives dataset_index as well as the predicted action;
     calling a tensor-only postprocessor would lose the source normalization selection.
     """
+    if gripper_representations is None:
+        gripper_representations = ["discrete"] * len(source_names)
+    if len(gripper_representations) != len(source_names) or any(
+        value not in ("discrete", "continuous") for value in gripper_representations
+    ):
+        raise ValueError("Provide one 'discrete' or 'continuous' gripper representation per source.")
     config = accelerator.unwrap_model(policy).config
     # Share the real postprocessor steps/hooks, adapting only the input converter.
     action_postprocessor = replace(postprocessor, to_transition=batch_to_transition)
-    totals = torch.zeros(len(source_names), len(METRIC_NAMES) + 1, dtype=torch.float64)
+    totals = torch.zeros(len(source_names), len(METRIC_NAMES), dtype=torch.float64)
+    metric_counts = torch.zeros_like(totals)
+    chunk_counts = torch.zeros(len(source_names), dtype=torch.int64)
     device = accelerator.device
+    continuous_sources = torch.tensor(
+        [value == "continuous" for value in gripper_representations], device=device, dtype=torch.bool
+    )
     cuda_devices = (
         [device.index if device.index is not None else torch.cuda.current_device()]
         if device.type == "cuda"
@@ -151,7 +178,12 @@ def evaluate_action_chunks(
                 with accelerator.autocast():
                     prediction = policy(model_batch, action_inference=True, noise=torch.stack(noise))
                 prediction = action_postprocessor({ACTION: prediction, "dataset_index": source_ids})
-                metrics = action_chunk_metrics(prediction, target, batch.get("action_dim_is_pad"))
+                metrics = action_chunk_metrics(
+                    prediction,
+                    target,
+                    batch.get("action_dim_is_pad"),
+                    continuous_gripper=continuous_sources[source_ids.to(device=device, dtype=torch.long)],
+                )
                 # Accelerate removes samples duplicated to equalize distributed final batches.
                 metrics, source_ids = accelerator.gather_for_metrics(
                     (metrics.to(device), source_ids.to(device))
@@ -159,28 +191,31 @@ def evaluate_action_chunks(
                 metrics, source_ids = metrics.cpu().double(), source_ids.cpu()
                 for source_id in source_ids.unique().tolist():
                     rows = source_ids == source_id
-                    totals[source_id, :-1] += metrics[rows].sum(0)
-                    totals[source_id, -1] += rows.sum()
+                    values = metrics[rows]
+                    valid = ~values.isnan()
+                    totals[source_id] += torch.where(valid, values, 0.0).sum(0)
+                    metric_counts[source_id] += valid.sum(0)
+                    chunk_counts[source_id] += rows.sum()
     finally:
         policy.train(was_training)
     output = {}
-    overall = totals.sum(0)
-    if overall[-1] == 0:
+    if chunk_counts.sum() == 0:
         raise ValueError("No complete action chunks are available for evaluation.")
-    summaries = [("", overall)]
+    summaries = [("", totals.sum(0), metric_counts.sum(0), chunk_counts.sum())]
     # A single source is identical to the overall result. Logging both would
     # create duplicate charts for every metric in SwanLab/W&B.
     if len(source_names) > 1:
-        summaries.extend(zip(source_names, totals, strict=True))
-    for name, values in summaries:
-        if values[-1] == 0:
+        summaries.extend(zip(source_names, totals, metric_counts, chunk_counts, strict=True))
+    for name, values, counts, chunks in summaries:
+        if chunks == 0:
             continue
         prefix = f"{name}/" if name else ""
-        output[f"{prefix}num_action_chunks"] = int(values[-1])
+        output[f"{prefix}num_action_chunks"] = int(chunks)
         output.update(
             {
-                f"{prefix}{key}": float(value / values[-1])
-                for key, value in zip(METRIC_NAMES, values[:-1], strict=True)
+                f"{prefix}{key}": float(value / count)
+                for key, value, count in zip(METRIC_NAMES, values, counts, strict=True)
+                if count > 0
             }
         )
     return output
