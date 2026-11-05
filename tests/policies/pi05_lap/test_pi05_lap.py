@@ -417,7 +417,9 @@ def test_pretrain_gradients_and_native_action_loss(tiny_policy, gradient_checkpo
     )
     policy._lam_encoder = teacher
     data = batch()
-    loss, _ = policy(data)
+    loss, metrics = policy(data)
+    assert all(isinstance(value, torch.Tensor) and not value.requires_grad for value in metrics.values())
+    assert all(value.device == loss.device for value in metrics.values())
     loss.backward()
     vlm = policy.model.paligemma_with_expert.paligemma
     assert vlm.get_input_embeddings().weight is vlm.lm_head.weight
@@ -557,6 +559,8 @@ def test_libero_seven_dim_loss_gradients_and_inference_match_openpi(tiny_policy,
     expected = reference(observation, functional.pad(data[ACTION], (0, 25)), noise=noise, time=time).mean()
     actual, metrics = policy(data)
     assert len(metrics["loss_per_dim"]) == 32
+    assert all(isinstance(value, torch.Tensor) and not value.requires_grad for value in metrics.values())
+    assert all(value.device == actual.device for value in metrics.values())
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
     actual.backward()
     expected.backward()

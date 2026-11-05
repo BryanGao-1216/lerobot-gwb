@@ -74,6 +74,30 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 
+def _metrics_to_python(values: list[Any]) -> list[Any]:
+    """Read floating-point metric tensors together after the optimizer update.
+
+    Only detached scalar/vector statistics reach this boundary, never model
+    activations. Packing them avoids a separate CUDA synchronization per metric.
+    Non-tensor outputs retain their existing types.
+    """
+    tensors = [value for value in values if isinstance(value, torch.Tensor) and value.is_floating_point()]
+    if not tensors:
+        return values
+    device = tensors[0].device
+    dtype = torch.float32 if device.type == "mps" else torch.float64
+    packed = torch.cat([value.detach().to(device=device, dtype=dtype).reshape(-1) for value in tensors]).cpu()
+    result, offset = [], 0
+    for value in values:
+        if isinstance(value, torch.Tensor) and value.is_floating_point():
+            size = value.numel()
+            result.append(packed[offset : offset + size].reshape(value.shape).to(dtype=value.dtype).tolist())
+            offset += size
+        else:
+            result.append(value)
+    return result
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -90,6 +114,7 @@ def update_policy(
     N is accelerator.gradient_accumulation_steps. Only the final micro-batch
     synchronizes, clips and updates weights. Logged losses are sample-weighted
     window means, including when the dataloader ends with a smaller batch.
+    Detached statistics stay on-device until this optimizer update completes.
     """
     from accelerate.utils import find_batch_size
 
@@ -97,7 +122,7 @@ def update_policy(
     if accumulation > 1 and not isinstance(batch, Iterator):
         raise ValueError("Gradient accumulation requires a lazy iterator of micro-batches.")
     batches = batch if isinstance(batch, Iterator) else iter([batch])
-    update_s, loss_sum, sample_count = 0.0, 0.0, 0
+    update_s, loss_sum, sample_count = 0.0, None, 0
     scalar_sums, output_dict = {}, {}
     reference_batch_size = None
     policy.train()
@@ -158,16 +183,34 @@ def update_policy(
                         unwrapped.update()
             elif micro_step == accumulation - 1:
                 raise RuntimeError("The final micro-batch did not synchronize gradients.")
-        loss_sum += loss.detach().item() * batch_size
-        output_dict.update(micro_output)
+        # Match the old Python-float sum without reading each micro-loss on the CPU.
+        metric_dtype = torch.float32 if loss.device.type == "mps" else torch.float64
+        detached_loss = loss.detach().to(dtype=metric_dtype)
+        if loss_sum is None:
+            loss_sum = torch.zeros_like(detached_loss)
+        loss_sum.add_(detached_loss, alpha=batch_size)
         for key, value in micro_output.items():
-            if not isinstance(value, bool) and isinstance(value, (int, float)):
+            if isinstance(value, torch.Tensor):
+                value = value.detach()
+                if value.ndim == 0 and value.is_floating_point():
+                    value = value.to(device=loss.device, dtype=metric_dtype)
+                    scalar_sums[key] = scalar_sums.get(key, 0.0) + value * batch_size
+            elif not isinstance(value, bool) and isinstance(value, (int, float)):
                 scalar_sums[key] = scalar_sums.get(key, 0.0) + value * batch_size
+            # Non-scalars keep the previous last-micro-batch behavior.
+            output_dict[key] = value
         update_s += time.perf_counter() - start_time
 
     output_dict.update({key: value / sample_count for key, value in scalar_sums.items()})
-    train_metrics.loss = loss_sum / sample_count
-    train_metrics.grad_norm = grad_norm.item()
+    # One host read for loss, gradient norm and policy metrics, outside the micro-loop.
+    start_time = time.perf_counter()
+    loss_value, grad_norm_value, *output_values = _metrics_to_python(
+        [loss_sum / sample_count, grad_norm, *output_dict.values()]
+    )
+    output_dict = dict(zip(output_dict, output_values, strict=True))
+    update_s += time.perf_counter() - start_time
+    train_metrics.loss = loss_value
+    train_metrics.grad_norm = grad_norm_value
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = update_s
     if torch.cuda.is_available():

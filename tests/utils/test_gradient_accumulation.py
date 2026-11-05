@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 
 from lerobot.common.train_utils import (
     load_training_data_batches_seen,
+    load_training_state,
     save_training_state,
     save_training_step,
 )
@@ -37,7 +38,7 @@ class TinyPolicy(torch.nn.Module):
         self.weights_seen.append(self.linear.weight.detach().clone())
         self.sync_seen.append(self.on_forward())
         loss = (self.linear(batch["x"]) - batch["y"]).square().mean()
-        return loss, {"action_loss": loss.detach().item()}
+        return loss, {"action_loss": loss.detach()}
 
     def update(self):
         self.update_count += 1
@@ -204,3 +205,121 @@ def test_resume_uses_consumed_batches_when_accumulation_changes(tmp_path):
         "epoch": 1,
         "start_index": 2,
     }
+
+
+@pytest.mark.parametrize("micro_steps", [1, 3, 8])
+def test_metric_readback_happens_once_after_update_without_retaining_graphs(micro_steps, monkeypatch):
+    import lerobot.scripts.lerobot_train as training
+
+    class MetricPolicy(TinyPolicy):
+        def forward(self, batch):
+            loss, metrics = super().forward(batch)
+            metrics.update(
+                {
+                    "loss_per_dim": self.linear.weight.square().flatten(),
+                    "python_metric": 1.5,
+                    "enabled": True,
+                    "label": "diagnostic",
+                }
+            )
+            return loss, metrics
+
+    accelerator = accelerator_with_accumulation(micro_steps)
+    model = MetricPolicy()
+    expected_per_dim = model.linear.weight.detach().square().flatten().tolist()
+    model, optimizer = accelerator.prepare(model, torch.optim.SGD(model.parameters(), lr=0.1))
+    x, y = data()
+    batches = ({"x": x[:2], "y": y[:2]} for _ in range(micro_steps))
+    readbacks, cpu_calls = [], []
+    materialize = training._metrics_to_python
+    original_cpu = torch.Tensor.cpu
+
+    def snapshot(values):
+        assert len(model.weights_seen) == micro_steps
+        assert model.update_count == 1
+        tensors = [value for value in values if isinstance(value, torch.Tensor)]
+        assert all(not value.requires_grad and value.grad_fn is None for value in tensors)
+        # Statistics occupy the same fixed-size buffers, regardless of accumulation length.
+        readbacks.append(sum(value.numel() for value in tensors))
+        return materialize(values)
+
+    def cpu(tensor, *args, **kwargs):
+        cpu_calls.append(len(model.weights_seen))
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(training, "_metrics_to_python", snapshot)
+    monkeypatch.setattr(torch.Tensor, "cpu", cpu)
+    # Scalar reads inside forward/backward or the accumulation loop must not be needed.
+    monkeypatch.setattr(torch.Tensor, "item", lambda *args: pytest.fail("unexpected scalar readback"))
+    metrics, output = update_policy(
+        tracker(accelerator, micro_steps * 2), model, batches, optimizer, 0, accelerator
+    )
+    assert readbacks == [5]  # optimized loss, gradient norm, action loss and two per-dimension values
+    assert cpu_calls == [micro_steps]
+    assert output["loss_per_dim"] == pytest.approx(expected_per_dim)
+    assert isinstance(output["action_loss"], float)
+    assert output["action_loss"] == metrics.loss.val
+    assert output["python_metric"] == 1.5
+    assert output["enabled"] is True and output["label"] == "diagnostic"
+
+
+def test_legacy_python_scalar_policy_metrics_still_work():
+    class LegacyPolicy(TinyPolicy):
+        def forward(self, batch):
+            loss, metrics = super().forward(batch)
+            return loss, {key: value.item() for key, value in metrics.items()}
+
+    accelerator = accelerator_with_accumulation(3)
+    model = LegacyPolicy()
+    model, optimizer = accelerator.prepare(model, torch.optim.SGD(model.parameters(), lr=0.1))
+    x, y = data()
+    batches = ({"x": x[i : i + 2], "y": y[i : i + 2]} for i in range(0, 6, 2))
+    metrics, output = update_policy(tracker(accelerator, 6), model, batches, optimizer, 0, accelerator)
+    assert output["action_loss"] == pytest.approx(metrics.loss.val)
+
+
+def test_existing_adamw_checkpoint_resumes_to_same_weights_and_optimizer_state(tmp_path):
+    from safetensors.torch import load_file, save_file
+
+    # Produce a checkpoint with the previous scalar-logging behavior and unchanged
+    # weights/optimizer/scheduler layout, then continue it through update_policy.
+    reference = TinyPolicy()
+    reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.03)
+    reference_scheduler = torch.optim.lr_scheduler.StepLR(reference_optimizer, step_size=1, gamma=0.9)
+    x, y = data()
+
+    def reference_update():
+        loss, _ = reference({"x": x, "y": y})
+        _ = loss.detach().item()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.25)
+        reference_optimizer.step()
+        reference_optimizer.zero_grad()
+        reference_scheduler.step()
+
+    reference_update()
+    save_file(reference.state_dict(), tmp_path / "model.safetensors")
+    save_training_state(
+        tmp_path,
+        1,
+        reference_optimizer,
+        reference_scheduler,
+        num_processes=1,
+        batch_size=2,
+        data_batches_seen=3,
+    )
+    reference_update()
+
+    model = TinyPolicy()
+    model.load_state_dict(load_file(tmp_path / "model.safetensors"), strict=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.03)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+    step, optimizer, scheduler = load_training_state(tmp_path, optimizer, scheduler)
+    assert step == 1 and load_training_data_batches_seen(tmp_path) == 3
+    accelerator = accelerator_with_accumulation(3)
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    batches = iter([{"x": x[:2], "y": y[:2]}, {"x": x[2:3], "y": y[2:3]}, {"x": x[3:], "y": y[3:]}])
+    update_policy(tracker(accelerator, 6), model, batches, optimizer, 0.25, accelerator, scheduler)
+    torch.testing.assert_close(model.state_dict(), reference.state_dict(), atol=1e-7, rtol=1e-6)
+    torch.testing.assert_close(optimizer.state_dict(), reference_optimizer.state_dict(), atol=1e-7, rtol=1e-6)
+    assert scheduler.state_dict() == reference_scheduler.state_dict()
