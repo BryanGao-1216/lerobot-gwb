@@ -609,13 +609,35 @@ def test_native_checkpoint_expands_only_new_rows(tiny_policy, tmp_path):
 
 
 @pytest.mark.parametrize("source_type", ["pi05", "pi05_lap"])
-def test_tied_checkpoint_rejects_different_head_weights(tiny_policy, tmp_path, source_type):
-    policy = tiny_policy()
+@pytest.mark.parametrize("stage", ["pre-training", "post-training"])
+def test_checkpoint_preserves_independent_head_weights(tiny_policy, tmp_path, source_type, stage):
+    policy = tiny_policy(stage)
     state = {key: value.clone() for key, value in policy.state_dict().items()}
     state[HEAD_KEY].add_(1)
     save_file(state, tmp_path / "model.safetensors")
-    with pytest.raises(ValueError, match="requires tied weights"):
-        load_student_state(policy, tmp_path, source_type=source_type)
+    load_student_state(policy, tmp_path, source_type=source_type)
+    vlm = policy.model.paligemma_with_expert.paligemma
+    assert vlm.get_input_embeddings().weight is not vlm.lm_head.weight
+    assert vlm.get_input_embeddings().weight.requires_grad
+    assert vlm.lm_head.weight.requires_grad == (stage == "pre-training")
+    vlm.tie_weights()
+    assert vlm.get_input_embeddings().weight is not vlm.lm_head.weight
+    for key, value in policy.state_dict().items():
+        torch.testing.assert_close(value, state[key], rtol=0, atol=0)
+
+    # The regular save/from_pretrained path must also preserve the independent tensors.
+    policy.save_pretrained(tmp_path)
+    restored = lap.PI05LAPPolicy.from_pretrained(tmp_path, local_files_only=True)
+    restored_vlm = restored.model.paligemma_with_expert.paligemma
+    assert restored_vlm.get_input_embeddings().weight is not restored_vlm.lm_head.weight
+    assert restored_vlm.lm_head.weight.requires_grad == (stage == "pre-training")
+    for key, value in restored.state_dict().items():
+        torch.testing.assert_close(value, state[key], rtol=0, atol=0)
+    if stage == "post-training":
+        data, noise = batch(), torch.randn(2, 3, 7)
+        expected = policy.predict_action_chunk(data, noise=noise.clone())
+        actual = restored.predict_action_chunk(data, noise=noise.clone())
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _flatten_vision_wrapper(policy):

@@ -72,8 +72,8 @@ def load_student_state(policy, source, *, source_type: str, **hub_args):
     if source_type == "pi05":
         # Native PI05-base can use SigLIP's outer vision_model wrapper.
         state = _remap_vision_tower_keys(state, expected)
-    # safetensors omits one copy of a tied input/output tensor. Only this known alias
-    # may be absent; all other missing or unexpected tensors are fatal.
+    # Older policies saved independent input embeddings and LM heads. Restore that
+    # layout before strict loading so neither learned tensor overwrites the other.
     vlm = policy.model.paligemma_with_expert.paligemma
     tied = vlm.get_input_embeddings().weight is vlm.get_output_embeddings().weight
     if (
@@ -82,10 +82,17 @@ def load_student_state(policy, source, *, source_type: str, **hub_args):
         and HEAD_KEY in state
         and not torch.equal(state[EMBEDDING_KEY], state[HEAD_KEY])
     ):
-        raise ValueError(
-            "Checkpoint embedding and LM head differ, but the model requires tied weights. "
-            "Restart from PI05-base instead of an untied LAP checkpoint."
+        head = vlm.get_output_embeddings()
+        head.weight = torch.nn.Parameter(
+            head.weight.detach().clone(),
+            requires_grad=head.weight.requires_grad and policy.config.training_stage == "pre-training",
         )
+        vlm.config.tie_word_embeddings = False
+        vlm.config.text_config.tie_word_embeddings = False
+        tied = False
+        logger.info("Restoring independent checkpoint embeddings and LM head; preserving both weights.")
+    # safetensors omits one copy of a tied input/output tensor. Only this known alias
+    # may be absent; all other missing or unexpected tensors are fatal.
     if source_type == "pi05" or tied:
         for key, alias in ((EMBEDDING_KEY, HEAD_KEY), (HEAD_KEY, EMBEDDING_KEY)):
             if key not in state and alias in state:

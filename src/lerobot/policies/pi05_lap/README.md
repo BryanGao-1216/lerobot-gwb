@@ -39,10 +39,12 @@ flow matching 学习真实动作。PI05 与 LAP 共用对齐 OpenPI 的输入输
 保存时复制为 checkpoint 内的 `openpi_tokenizer.model`，迁移机器后优先读取这个文件。
 文本输入不再依赖 HF tokenizer 的 regex 行为。
 
-本轮实验从 PI05-base 重新训练，不支持此前实现生成的旧 LAP 模型，也不进行旧 embedding
-权重换算。当前实现保存的 LAP checkpoint 可用于阶段二初始化或正常断点续训。
-共享权重在扩词表、参数更新和保存重载后均保持绑定。若 checkpoint 中的 embedding 与
-LM head 数值不一致，加载会报错；此前未绑定版本的第一阶段需从 PI05-base 重新训练。
+当前实现保存的 LAP checkpoint 可用于阶段二初始化或正常断点续训。
+新模型的共享权重在扩词表、参数更新和保存重载后均保持绑定。加载旧 checkpoint 时，若
+embedding 与 LM head 分别保存且数值不同，会恢复为独立参数并完整保留两份权重，可直接
+进行动作评估；无需为此从 PI05-base 重新训练。独立 LM head 只在预训练阶段参与优化，
+动作后训练阶段冻结它，输入 embedding 仍按训练配置更新。保存重载后保持独立结构；不进行
+旧 embedding 数值换算，也不回退到旧版图像或文本预处理。
 
 ## 配置
 
