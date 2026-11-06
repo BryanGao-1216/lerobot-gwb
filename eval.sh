@@ -10,6 +10,6 @@ lerobot-eval \
   --env.task=libero_object,libero_spatial,libero_goal,libero_10,libero_90 \
   --env.control_mode=relative \
   --env.max_parallel_tasks=1 \
-  --eval.batch_size=4 \
+  --eval.batch_size=1 \
   --eval.n_episodes=1 \
   --policy.n_action_steps=12
