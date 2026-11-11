@@ -640,51 +640,65 @@ def test_checkpoint_preserves_independent_head_weights(tiny_policy, tmp_path, so
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def _flatten_vision_wrapper(policy):
-    # Reproduce the server's expected ...vision_tower.embeddings.* structure,
-    # regardless of whether the local transformers build retains the wrapper.
+def _set_vision_wrapper(policy, wrapped=False):
+    # Exercise either server layout regardless of the local transformers version.
     paligemma = policy.model.paligemma_with_expert.paligemma
-    if hasattr(paligemma.model.vision_tower, "vision_model"):
-        paligemma.model.vision_tower = paligemma.model.vision_tower.vision_model
+    tower = paligemma.model.vision_tower
+    if hasattr(tower, "vision_model"):
+        tower = tower.vision_model
+    if wrapped:
+        wrapper = nn.Module()
+        wrapper.vision_model = tower
+        tower = wrapper
+    paligemma.model.vision_tower = tower
     return policy
 
 
 @pytest.mark.parametrize("outer_prefix", [True, False])
-def test_native_pi05_vision_wrapper_loads_all_weights(tiny_policy, tmp_path, outer_prefix):
-    source = _flatten_vision_wrapper(tiny_policy())
+@pytest.mark.parametrize("source_type", ["pi05", "pi05_lap"])
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_vision_wrapper_loads_all_weights(tiny_policy, tmp_path, outer_prefix, source_type, wrapped):
+    source = _set_vision_wrapper(tiny_policy(), wrapped)
     expected = {key: value.clone() for key, value in source.state_dict().items()}
+    if source_type == "pi05_lap":
+        # Reproduce the reported LAP checkpoint: independent head plus a different vision layout.
+        expected[HEAD_KEY].add_(1)
     state = {}
     for key, value in expected.items():
-        legacy = (
-            VISION_PREFIX + "vision_model." + key.removeprefix(VISION_PREFIX)
-            if key.startswith(VISION_PREFIX)
-            else key
-        )
-        state[legacy if outer_prefix else legacy.removeprefix("model.")] = value
+        alternate = key
+        if key.startswith(VISION_PREFIX):
+            suffix = key.removeprefix(VISION_PREFIX)
+            suffix = suffix.removeprefix("vision_model.") if wrapped else "vision_model." + suffix
+            alternate = VISION_PREFIX + suffix
+        state[alternate if outer_prefix else alternate.removeprefix("model.")] = value
     save_file(state, tmp_path / "model.safetensors")
-    restored = _flatten_vision_wrapper(tiny_policy())
-    load_student_state(restored, tmp_path, source_type="pi05")
+    restored = _set_vision_wrapper(tiny_policy(), wrapped)
+    load_student_state(restored, tmp_path, source_type=source_type)
     for key, value in restored.state_dict().items():
         torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("source_type", ["pi05", "pi05_lap"])
+@pytest.mark.parametrize("wrapped", [True, False])
 @pytest.mark.parametrize("invalid", ["missing", "unknown", "shape", "collision"])
-def test_vision_compatibility_keeps_strict_validation(tiny_policy, tmp_path, invalid):
-    policy = _flatten_vision_wrapper(tiny_policy())
+def test_vision_compatibility_keeps_strict_validation(tiny_policy, tmp_path, invalid, wrapped, source_type):
+    policy = _set_vision_wrapper(tiny_policy(), wrapped)
     state = {key: value.clone() for key, value in policy.state_dict().items()}
-    current = VISION_PREFIX + "embeddings.patch_embedding.weight"
-    legacy = VISION_PREFIX + "vision_model.embeddings.patch_embedding.weight"
+    current_prefix = VISION_PREFIX + "vision_model." if wrapped else VISION_PREFIX
+    alternate_prefix = VISION_PREFIX if wrapped else VISION_PREFIX + "vision_model."
+    current = current_prefix + "embeddings.patch_embedding.weight"
+    alternate = alternate_prefix + "embeddings.patch_embedding.weight"
     if invalid == "missing":
         del state[current]
     elif invalid == "unknown":
-        state[VISION_PREFIX + "vision_model.unknown.weight"] = torch.ones(1)
+        state[alternate_prefix + "unknown.weight"] = torch.ones(1)
     elif invalid == "shape":
-        state[legacy] = state.pop(current)[:1]
+        state[alternate] = state.pop(current)[:1]
     else:
-        state[legacy] = state[current].clone()
+        state[alternate] = state[current].clone()
     save_file(state, tmp_path / "model.safetensors")
     with pytest.raises(ValueError if invalid == "collision" else RuntimeError):
-        load_student_state(policy, tmp_path, source_type="pi05")
+        load_student_state(policy, tmp_path, source_type=source_type)
 
 
 def test_local_tokenizer_used_for_initialization_and_saved_processor(tiny_policy, tmp_path):

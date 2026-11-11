@@ -14,20 +14,24 @@ logger = logging.getLogger(__name__)
 
 
 def _remap_vision_tower_keys(state: dict, expected: dict) -> dict:
-    """Remove a legacy SigLIP wrapper only where the current model expects its contents.
+    """Match SigLIP's optional vision_model wrapper to the destination model.
 
-    Some PI05 checkpoints saved SiglipVisionModel's `vision_model` submodule,
-    while the current PaliGemma registers that submodule directly as vision_tower.
+    PI05 and LAP checkpoints may store either the outer SiglipVisionModel or its
+    inner vision_model, depending on the transformers version used to build them.
     Match actual destination keys instead of applying a global string replacement.
     """
-    legacy_prefix = VISION_PREFIX + "vision_model."
     remapped = {}
     sources = {}
     count = 0
     for key, value in state.items():
         target = key
-        if key.startswith(legacy_prefix) and key not in expected:
-            candidate = VISION_PREFIX + key.removeprefix(legacy_prefix)
+        if key.startswith(VISION_PREFIX) and key not in expected:
+            suffix = key.removeprefix(VISION_PREFIX)
+            candidate = VISION_PREFIX + (
+                suffix.removeprefix("vision_model.")
+                if suffix.startswith("vision_model.")
+                else "vision_model." + suffix
+            )
             if candidate in expected:
                 target = candidate
                 count += 1
@@ -39,7 +43,7 @@ def _remap_vision_tower_keys(state: dict, expected: dict) -> dict:
         remapped[target] = value
         sources[target] = key
     if count:
-        logger.info("Mapped %d legacy PI05 vision_tower.vision_model keys to vision_tower.", count)
+        logger.info("Mapped %d vision tower checkpoint keys to the current SigLIP wrapper layout.", count)
     return remapped
 
 
@@ -69,9 +73,7 @@ def load_student_state(policy, source, *, source_type: str, **hub_args):
         state = policy._fix_pytorch_state_dict_keys(state, policy.config)
     state = {k if k.startswith("model.") else f"model.{k}": v for k, v in state.items()}
     expected = policy.state_dict()
-    if source_type == "pi05":
-        # Native PI05-base can use SigLIP's outer vision_model wrapper.
-        state = _remap_vision_tower_keys(state, expected)
+    state = _remap_vision_tower_keys(state, expected)
     # Older policies saved independent input embeddings and LM heads. Restore that
     # layout before strict loading so neither learned tensor overwrites the other.
     vlm = policy.model.paligemma_with_expert.paligemma

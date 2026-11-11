@@ -46,6 +46,10 @@ embedding 与 LM head 分别保存且数值不同，会恢复为独立参数并�
 动作后训练阶段冻结它，输入 embedding 仍按训练配置更新。保存重载后保持独立结构；不进行
 旧 embedding 数值换算，也不回退到旧版图像或文本预处理。
 
+训练和评估使用不同版本的 transformers 时，视觉塔权重路径可能为 `vision_tower.*`
+或 `vision_tower.vision_model.*`。原始 PI05 和 LAP checkpoint 均支持按目标模型双向映射，
+只调整参数路径，权重数值不变；仍严格检查缺失、多余、形状不匹配及重名冲突。
+
 ## 配置
 
 阶段、LAM 与 tokenizer 的配置字段：
