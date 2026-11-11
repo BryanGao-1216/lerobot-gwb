@@ -9,7 +9,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 args=(
   --policy.type=pi05_lap
-  --policy.path=/tmp/gmodels/PI05-base
+  --policy.path=/gaowenbin/models/trained_models/PI05-lap-pretrain/checkpoints/020000/pretrained_model
   --policy.training_stage=post-training
   --policy.tokenizer_path=/gaowenbin/models/tokenizers/paligemma-tokenizer
   --policy.push_to_hub=false
@@ -31,16 +31,16 @@ args=(
   --eval_steps=500
   --steps=30000
   --save_freq=10000
-  --batch_size=4
-  --policy.gradient_accumulation=8
+  --batch_size=2
+  --policy.gradient_accumulation=16
   --resume=false
-  --output_dir=/gaowenbin/models/trained_models/PI05-lap-baseline
+  --output_dir=/gaowenbin/models/trained_models/PI05-lap-posttraining-20klaq
   --dataset.config_path=dataset/config.json
   --wandb.enable=false
   --swanlab.enable=true
   --swanlab.project=pi05-lap
   --swanlab.mode=online
-  --job_name=pi05-lap-baseline-openpi
+  --job_name=pi05-lap-posttraining-20klaq
   --log_freq=10
 )
 
