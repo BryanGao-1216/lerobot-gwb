@@ -11,5 +11,5 @@ lerobot-eval \
   --env.control_mode=relative \
   --env.max_parallel_tasks=1 \
   --eval.batch_size=1 \
-  --eval.n_episodes=1 \
+  --eval.n_episodes=10 \
   --policy.n_action_steps=12
