@@ -1,6 +1,6 @@
 # 用 LeRobot checkpoint 评估 LIBERO-Long++
 
-在 LeRobot 仓库根目录，激活你的 LeRobot 训练环境再运行。脚本按环境名自动找到仿真 Python。默认使用 `libero-long-plus-plus`，其他环境名用 `--benchmark-env 环境名` 指定。LiLo-VLA 默认从仓库的 `vendor/benchmark/LiLo-VLA` 读取，其他位置用 `--benchmark-root` 指定。
+在 LeRobot 仓库根目录，激活你的 LeRobot 训练环境再运行。脚本默认从 `libero-long-plus-plus` 环境加载仿真 Python。`--benchmark-env` 接受环境名或完整的 Conda 环境路径，例如 `--benchmark-env eval-libero-long`。LiLo-VLA 默认从仓库的 `vendor/benchmark/LiLo-VLA` 读取，其他位置用 `--benchmark-root` 指定。
 
 ```bash
 # 列出默认套件的任务编号

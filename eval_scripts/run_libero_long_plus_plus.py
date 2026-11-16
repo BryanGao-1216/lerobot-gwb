@@ -31,18 +31,22 @@ def positive_int(value):
     return result
 
 
-def conda_python(parser, env_name):
+def conda_python(parser, environment):
     conda = os.environ.get("CONDA_EXE") or which("conda")
     if conda is None:
         parser.error("Conda was not found. See README.libero-long-plus-plus.md for simulator setup.")
+    if os.sep in environment:
+        selection = ["--prefix", str(Path(environment).expanduser().absolute())]
+    else:
+        selection = ["--name", environment]
     process = subprocess.run(
-        [conda, "run", "-n", env_name, "python", "-c", "import os; print(os.environ['CONDA_PREFIX'])"],
+        [conda, "run", *selection, "python", "-c", "import os; print(os.environ['CONDA_PREFIX'])"],
         capture_output=True,
         text=True,
     )
     prefixes = process.stdout.strip().splitlines()
     if process.returncode or not prefixes:
-        parser.error(f"Cannot use Conda environment {env_name!r}. {process.stderr.strip()}")
+        parser.error(f"Cannot use Conda environment {environment!r}. {process.stderr.strip()}")
     return Path(prefixes[-1]) / "bin" / "python"
 
 
@@ -52,7 +56,8 @@ def parse_args():
     parser.add_argument("--benchmark-root", type=Path, default=BENCHMARK_ROOT, help="LiLo-VLA checkout")
     simulator = parser.add_mutually_exclusive_group()
     simulator.add_argument(
-        "--benchmark-env", help=f"simulator Conda environment (default: {DEFAULT_BENCHMARK_ENV})"
+        "--benchmark-env",
+        help=f"simulator Conda environment name or prefix (default: {DEFAULT_BENCHMARK_ENV})",
     )
     simulator.add_argument("--benchmark-python", type=Path, help="explicit simulator interpreter")
     parser.add_argument(
