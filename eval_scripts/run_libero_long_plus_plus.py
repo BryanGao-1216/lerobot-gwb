@@ -15,7 +15,7 @@ from statistics import mean
 
 from libero_long_plus_plus_worker import CAMERAS, CONTROL_FREQ, WARMUP_STEPS
 
-BENCHMARK_ROOT = Path(__file__).resolve().parents[2] / "benchmarks" / "LiLo-VLA"
+BENCHMARK_ROOT = Path(__file__).resolve().parents[1] / "vendor" / "benchmark" / "LiLo-VLA"
 ORIGINAL = "libero_long_plus_plus"
 SUITES = (f"{ORIGINAL}_all", ORIGINAL, f"{ORIGINAL}_variant")
 
@@ -31,7 +31,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", help="LeRobot pretrained_model directory or Hugging Face repo ID")
     parser.add_argument("--benchmark-root", type=Path, default=BENCHMARK_ROOT, help="LiLo-VLA checkout")
-    parser.add_argument("--benchmark-python", type=Path, help="defaults to the LiLo-VLA .venv/bin/python")
+    parser.add_argument(
+        "--benchmark-python", type=Path, help="simulator interpreter (defaults to current Python)"
+    )
+    parser.add_argument(
+        "--libero-root", type=Path, help="LIBERO f78abd6 source checkout if needed for imports"
+    )
     parser.add_argument("--suite", choices=SUITES, default=SUITES[0])
     parser.add_argument(
         "--list-tasks", action="store_true", help="print suite indices without loading a policy"
@@ -61,12 +66,16 @@ def parse_args():
     args.benchmark_root = args.benchmark_root.expanduser().resolve()
     if not (args.benchmark_root / "lilo_vla" / "benchmark" / "__init__.py").is_file():
         parser.error(f"LiLo-VLA checkout not found at {args.benchmark_root}")
-    args.benchmark_python = args.benchmark_python or args.benchmark_root / ".venv/bin/python"
+    args.benchmark_python = args.benchmark_python or Path(sys.executable)
     args.benchmark_python = args.benchmark_python.expanduser().absolute()
     if not args.benchmark_python.is_file():
         parser.error(
             f"Simulator Python not found at {args.benchmark_python}. See README.libero-long-plus-plus.md."
         )
+    if args.libero_root is not None:
+        args.libero_root = args.libero_root.expanduser().resolve()
+        if not (args.libero_root / "libero/libero/__init__.py").is_file():
+            parser.error(f"LIBERO source checkout not found at {args.libero_root}")
     return parser, args
 
 
@@ -81,11 +90,12 @@ def open_simulator(args):
         worker = subprocess.Popen(
             [
                 str(args.benchmark_python),
-                "-I",
+                "-E",
                 str(Path(__file__).resolve().with_name("libero_long_plus_plus_worker.py")),
                 str(child.fileno()),
                 args.suite,
                 args.control_mode,
+                str(args.libero_root) if args.libero_root is not None else "",
             ],
             cwd=args.benchmark_root,
             env=worker_env,

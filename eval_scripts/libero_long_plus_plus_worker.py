@@ -2,6 +2,7 @@
 
 import json
 import sys
+from importlib.util import find_spec
 from multiprocessing.connection import Connection
 from pathlib import Path
 
@@ -79,11 +80,19 @@ def pack_observation(env, obs):
     }
 
 
-def serve(connection, suite, control_mode):
+def serve(connection, suite, control_mode, libero_root):
     import numpy as np
 
     # Prefer the checkout passed as the worker's cwd.
     sys.path.insert(0, str(Path.cwd()))
+    if libero_root:
+        sys.path.insert(0, libero_root)
+        package = find_spec("libero.libero")
+        expected = Path(libero_root) / "libero/libero/__init__.py"
+        if package is None or package.origin is None or Path(package.origin).resolve() != expected.resolve():
+            raise ImportError(
+                f"The installed LIBERO shadows --libero-root {libero_root}. Check the simulator Python."
+            )
     import lilo_vla.benchmark  # noqa: F401  # Registers suites and applies the benchmark patches.
     from libero.libero.benchmark import get_benchmark
     from lilo_vla import CONFIGS_DIR
@@ -142,6 +151,6 @@ def serve(connection, suite, control_mode):
 
 
 if __name__ == "__main__":
-    fd, suite, control_mode = sys.argv[1:]
+    fd, suite, control_mode, libero_root = sys.argv[1:]
     with Connection(int(fd)) as connection:
-        serve(connection, suite, control_mode)
+        serve(connection, suite, control_mode, libero_root)
