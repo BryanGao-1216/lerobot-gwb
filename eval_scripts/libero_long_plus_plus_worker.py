@@ -93,6 +93,11 @@ def serve(connection, suite, control_mode, libero_root):
             raise ImportError(
                 f"The installed LIBERO shadows --libero-root {libero_root}. Check the simulator Python."
             )
+    elif find_spec("libero") is None:
+        raise ModuleNotFoundError(
+            "LIBERO is unavailable in the simulator environment. Pass --libero-root to the directory "
+            "containing libero/libero/__init__.py, or follow README.libero-long-plus-plus.md."
+        )
     import lilo_vla.benchmark  # noqa: F401  # Registers suites and applies the benchmark patches.
     from libero.libero.benchmark import get_benchmark
     from lilo_vla import CONFIGS_DIR

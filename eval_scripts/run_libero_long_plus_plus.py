@@ -11,11 +11,15 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from multiprocessing.connection import Connection
 from pathlib import Path
+from shutil import which
 from statistics import mean
 
 from libero_long_plus_plus_worker import CAMERAS, CONTROL_FREQ, WARMUP_STEPS
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1] / "vendor" / "benchmark" / "LiLo-VLA"
+DEFAULT_BENCHMARK_ENV = "libero-long-plus-plus"
+LIBERO_REVISION = "f78abd68ee283de9f9be3c8f7e2a9ad60246e95c"
+DEFAULT_LIBERO_ROOT = Path.home() / "simulators" / f"LIBERO-{LIBERO_REVISION}"
 ORIGINAL = "libero_long_plus_plus"
 SUITES = (f"{ORIGINAL}_all", ORIGINAL, f"{ORIGINAL}_variant")
 
@@ -27,15 +31,32 @@ def positive_int(value):
     return result
 
 
+def conda_python(parser, env_name):
+    conda = os.environ.get("CONDA_EXE") or which("conda")
+    if conda is None:
+        parser.error("Conda was not found. See README.libero-long-plus-plus.md for simulator setup.")
+    process = subprocess.run(
+        [conda, "run", "-n", env_name, "python", "-c", "import os; print(os.environ['CONDA_PREFIX'])"],
+        capture_output=True,
+        text=True,
+    )
+    prefixes = process.stdout.strip().splitlines()
+    if process.returncode or not prefixes:
+        parser.error(f"Cannot use Conda environment {env_name!r}. {process.stderr.strip()}")
+    return Path(prefixes[-1]) / "bin" / "python"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", help="LeRobot pretrained_model directory or Hugging Face repo ID")
     parser.add_argument("--benchmark-root", type=Path, default=BENCHMARK_ROOT, help="LiLo-VLA checkout")
-    parser.add_argument(
-        "--benchmark-python", type=Path, help="simulator interpreter (defaults to current Python)"
+    simulator = parser.add_mutually_exclusive_group()
+    simulator.add_argument(
+        "--benchmark-env", help=f"simulator Conda environment (default: {DEFAULT_BENCHMARK_ENV})"
     )
+    simulator.add_argument("--benchmark-python", type=Path, help="explicit simulator interpreter")
     parser.add_argument(
-        "--libero-root", type=Path, help="LIBERO f78abd6 source checkout if needed for imports"
+        "--libero-root", type=Path, help="LIBERO f78abd6 source checkout (auto-detected under ~/simulators)"
     )
     parser.add_argument("--suite", choices=SUITES, default=SUITES[0])
     parser.add_argument(
@@ -66,7 +87,9 @@ def parse_args():
     args.benchmark_root = args.benchmark_root.expanduser().resolve()
     if not (args.benchmark_root / "lilo_vla" / "benchmark" / "__init__.py").is_file():
         parser.error(f"LiLo-VLA checkout not found at {args.benchmark_root}")
-    args.benchmark_python = args.benchmark_python or Path(sys.executable)
+    args.benchmark_python = args.benchmark_python or conda_python(
+        parser, args.benchmark_env or DEFAULT_BENCHMARK_ENV
+    )
     args.benchmark_python = args.benchmark_python.expanduser().absolute()
     if not args.benchmark_python.is_file():
         parser.error(
@@ -76,6 +99,8 @@ def parse_args():
         args.libero_root = args.libero_root.expanduser().resolve()
         if not (args.libero_root / "libero/libero/__init__.py").is_file():
             parser.error(f"LIBERO source checkout not found at {args.libero_root}")
+    elif (DEFAULT_LIBERO_ROOT / "libero/libero/__init__.py").is_file():
+        args.libero_root = DEFAULT_LIBERO_ROOT
     return parser, args
 
 
