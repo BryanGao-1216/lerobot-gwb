@@ -11,9 +11,9 @@ python eval_scripts/run_libero_long_plus_plus.py \
   --checkpoint /path/to/pretrained_model --device cuda \
   --task-id 0 --episodes 1 --max-steps 20
 
-# 完整评估，默认 12 个任务配置 × 10 个 episode
+# 完整评估并录像，默认 12 个任务配置 × 10 个 episode
 python eval_scripts/run_libero_long_plus_plus.py \
-  --checkpoint /path/to/pretrained_model --device cuda
+  --checkpoint /path/to/pretrained_model --device cuda --save-videos
 ```
 
 `--checkpoint` 也接受包含 `pretrained_model` 的训练 checkpoint 目录或 Hugging Face repo ID。使用训练该模型时的 LeRobot 环境和模型依赖。脚本读取 checkpoint 的预处理、后处理和动作块配置，自动识别 `image` / `image2` 和 `base_0_rgb` / `left_wrist_0_rgb` 两套相机命名。其他命名可用 `--agent-camera` 和 `--wrist-camera` 指定。动作控制默认 `relative`，也支持 `--control-mode absolute`。PI05-LAP 需要能预测机器人动作的 post-training checkpoint。
@@ -21,6 +21,8 @@ python eval_scripts/run_libero_long_plus_plus.py \
 `--libero-root` 填上游 LIBERO `f78abd6` 的源码根目录，目录里能找到 `libero/libero/__init__.py` 和 `libero/libero/assets/`。按下面的步骤解压到 `~/simulators/` 后，脚本会自动找到对应目录。若仿真环境已经能导入固定版本的 `libero.libero`，也可省略该参数。
 
 默认每个 episode 最多执行 520 步模型动作，控制频率为 20 Hz。策略在整个 episode 接收同一条完整任务指令。每局通过 LiLo-VLA 随机 reset，沿用其 20 步仿真稳定阶段，之后逐步检查技能谓词。首次乱序时结束该局。同一步触发的连续技能按目标顺序计入。`eval_info.json` 每局更新，包含逐局结果、逐任务和总体的成功率（SR）与平均进度（AP）。SR 同时要求按序完成技能且最终 BDDL 目标成立，AP 是乱序或超时前已按序完成的技能比例。默认输出到 `outputs/eval/libero_long_plus_plus/` 下的时间戳目录。
+
+`--save-videos` 为每局保存一段 20 FPS 场景相机 MP4，覆盖仿真稳定后的首帧到该局的最后一步。视频保存在评估输出目录的 `videos/` 下，例如 `videos/task_00_trial_01.mp4`。对应的相对路径写入 `eval_info.json` 的 `video_path` 字段。`eval_scripts/eval-libero-long++.sh` 已开启录像。若 LeRobot 推理环境缺少 PyAV，在该环境执行 `python -m pip install 'av>=15,<16'`。
 
 ## 首次安装仿真环境
 
