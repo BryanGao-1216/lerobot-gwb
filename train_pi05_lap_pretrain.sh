@@ -19,7 +19,7 @@ args=(
   --policy.gradient_checkpointing=false
   --policy.push_to_hub=false
   --policy.chunk_size=12
-  --policy.n_action_steps=12
+  --policy.n_action_steps=6
   --policy.optimizer_lr=1e-5
   --policy.scheduler_warmup_steps=1000
   --policy.scheduler_decay_steps=30000
@@ -30,13 +30,13 @@ args=(
   --batch_size=4
   --policy.gradient_accumulation=8
   --resume=false
-  --output_dir=/gaowenbin/models/trained_models/PI05-lap-pretrain
-  --dataset.config_path=dataset/config.json
+  --output_dir=/gaowenbin/models/trained_models/PI05-lap-pretrain-long
+  --dataset.config_path=dataset/config-libero.json
   --wandb.enable=false
   --swanlab.enable=true
   --swanlab.project=pi05-lap
   --swanlab.mode=online
-  --job_name=pi05-lap-pretrain
+  --job_name=pi05-lap-pretrain-long
   --log_freq=10
 )
 

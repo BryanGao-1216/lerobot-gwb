@@ -63,6 +63,34 @@
         "observation.images.right_wrist_0_rgb": null
       },
       "lam_camera_key": "observation.images.image"
+    },
+    "libero_longplusplus": {
+      "repo_id": "libero_longplusplus",
+      "root": "/gaowenbin/datasets/libero_long_plusplus",
+      "weight": 1.0,
+      "use_relative_actions": false,
+      "image_augmentation": true,
+      "gripper_representation": {
+        "type": "discrete",
+        "open": 1,
+        "close": 0
+      },
+      "action_fields": [
+        {
+          "key": "action"
+        }
+      ],
+      "state_fields": [
+        {
+          "key": "observation.state"
+        }
+      ],
+      "camera_fields": {
+        "observation.images.base_0_rgb": "observation.images.image",
+        "observation.images.left_wrist_0_rgb": "observation.images.wrist_image",
+        "observation.images.right_wrist_0_rgb": null
+      },
+      "lam_camera_key": "observation.images.image"
     }
   }
 }
