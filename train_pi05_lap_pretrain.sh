@@ -28,6 +28,7 @@ args=(
   --steps=100000
   --save_freq=10000
   --batch_size=4
+  --num_workers=16
   --policy.gradient_accumulation=8
   --resume=false
   --output_dir=/gaowenbin/models/trained_models/PI05-lap-pretrain-long
