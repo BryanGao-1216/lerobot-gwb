@@ -82,7 +82,8 @@ def parse_args():
         "--wrist-camera", help="checkpoint feature suffix for the wrist camera (auto-detected)"
     )
     parser.add_argument("--control-mode", choices=("relative", "absolute"), default="relative")
-    parser.add_argument("--output-dir", type=Path, help="new directory for eval_info.json")
+    parser.add_argument("--output-dir", type=Path, help="new directory for evaluation outputs")
+    parser.add_argument("--save-videos", action="store_true", help="save one scene camera MP4 per episode")
     args = parser.parse_args()
     if not args.list_tasks and not args.checkpoint:
         parser.error("--checkpoint is required for evaluation")
@@ -242,6 +243,17 @@ def summarize(episodes):
 def run(args, connection, tasks):
     import torch
 
+    if args.save_videos:
+        from lerobot.utils.import_utils import require_package
+        from lerobot.utils.io_utils import write_video
+
+        try:
+            require_package("av", extra="evaluation")
+        except ImportError as error:
+            raise SystemExit(
+                "Video recording requires PyAV in the LeRobot environment. Run: python -m pip install 'av>=15,<16'"
+            ) from error
+
     print(f"Loading LeRobot policy {args.checkpoint}", flush=True)
     policy = LeRobotPolicy(args)
     config = policy.policy.config
@@ -251,6 +263,9 @@ def run(args, connection, tasks):
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
     result_path = output_dir / "eval_info.json"
+    videos_dir = output_dir / "videos"
+    if args.save_videos:
+        videos_dir.mkdir()
     result = {
         "suite": args.suite,
         "checkpoint": policy.checkpoint,
@@ -278,13 +293,17 @@ def run(args, connection, tasks):
                 policy.reset()
                 connection.send(("reset", task["index"]))
                 observation = connection.recv()
+                # Raw LIBERO camera frames are upside down, as in LiberoEnv.render().
+                frames = [observation["pixels"][CAMERAS[0]][::-1, ::-1].copy()] if args.save_videos else None
                 steps = 0
                 for _ in range(args.max_steps):
                     action = policy.action(observation, task["instruction"])
                     connection.send(("step", action))
                     observation, metrics = connection.recv()
                     steps += 1
-                    if observation is None:
+                    if frames is not None:
+                        frames.append(observation["pixels"][CAMERAS[0]][::-1, ::-1].copy())
+                    if metrics["success"] or metrics["out_of_order_skills"]:
                         break
                 episode = {
                     **metrics,
@@ -292,6 +311,15 @@ def run(args, connection, tasks):
                     "steps": steps,
                     "progress": metrics["completed_skills"] / len(task["skills"]),
                 }
+                if frames is not None:
+                    video_path = videos_dir / f"task_{task['index']:02d}_trial_{trial:02d}.mp4"
+                    temporary_video = video_path.with_suffix(".tmp.mp4")
+                    try:
+                        write_video(temporary_video, frames, fps=CONTROL_FREQ)
+                        temporary_video.replace(video_path)
+                    finally:
+                        temporary_video.unlink(missing_ok=True)
+                    episode["video_path"] = video_path.relative_to(output_dir).as_posix()
                 episodes.append(episode)
                 all_episodes.append(episode)
                 task_result["metrics"] = summarize(episodes)

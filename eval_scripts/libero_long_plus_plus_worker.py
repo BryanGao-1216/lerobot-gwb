@@ -137,7 +137,7 @@ def serve(connection, suite, control_mode, libero_root):
                 success = progress.completed == len(skills) and bddl_success
                 connection.send(
                     (
-                        None if success or out_of_order else pack_observation(env, obs),
+                        pack_observation(env, obs),
                         {
                             "success": success,
                             "bddl_success": bddl_success,
