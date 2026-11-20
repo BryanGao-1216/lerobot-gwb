@@ -31,13 +31,13 @@ args=(
   --num_workers=16
   --policy.gradient_accumulation=8
   --resume=false
-  --output_dir=/gaowenbin/models/trained_models/PI05-lap-pretrain-long
-  --dataset.config_path=dataset/config-libero.json
+  --output_dir=/gaowenbin/models/trained_models/PI05-lap-pretrain-labutopia
+  --dataset.config_path=dataset/config-lab.json
   --wandb.enable=false
   --swanlab.enable=true
-  --swanlab.project=pi05-lap
+  --swanlab.project=pi05-lap-lab
   --swanlab.mode=online
-  --job_name=pi05-lap-pretrain-long
+  --job_name=pi05-lap-pretrain
   --log_freq=10
 )
 
@@ -45,6 +45,6 @@ accelerate launch \
   --num_processes=1 \
   --num_machines=1 \
   --mixed_precision=bf16 \
-  --main_process_port="${MAIN_PROCESS_PORT:-29501}" \
+  --main_process_port="${MAIN_PROCESS_PORT:-29216}" \
   -m lerobot.scripts.lerobot_train \
   "${args[@]}" "$@"
